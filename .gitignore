@@ -1,0 +1,18 @@
+node_modules
+dist
+uploads
+
+# Env files
+.env*
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# Editor/OS
+.DS_Store
+.vscode
+*.swp
+
