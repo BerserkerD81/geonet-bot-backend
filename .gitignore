@@ -16,3 +16,5 @@ yarn-error.log*
 .vscode
 *.swp
 
+docker-compose.dev.yml
+docker-compose.prod.yml
