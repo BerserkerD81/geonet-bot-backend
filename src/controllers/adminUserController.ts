@@ -1,6 +1,7 @@
 import { AppDataSource } from '../datasource';
 import { User } from '../models/User';
 import bcrypt from 'bcryptjs';
+import { sendPasswordChanged, sendWelcomeWithPassword } from '../services/emailService';
 
 export async function listUsers(req: any, res: any) {
   const repo = AppDataSource.getRepository(User);
@@ -22,6 +23,12 @@ export async function createUser(req: any, res: any) {
   const { name } = req.body; // New line to extract name
   const user = repo.create({ email, passwordHash: hash, role, isTwoFactorEnabled: false, name }); // Include name in user creation
   await repo.save(user);
+  try {
+    await sendWelcomeWithPassword(email, password, name);
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn('Failed to send welcome email (admin create):', e);
+  }
   res.json({ ok: true, id: user.id, requires2fa: true });
 }
 
@@ -46,6 +53,12 @@ export async function updateUser(req: any, res: any) {
     // reset 2FA if password is reset by admin
     user.twoFactorSecret = null as any;
     user.isTwoFactorEnabled = false;
+    try {
+      if (user.email) await sendPasswordChanged(user.email, password, user.name);
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.warn('Failed to send password changed email:', e);
+    }
   }
   if (req.body.name) user.name = req.body.name; // New line to update name
   await repo.save(user);

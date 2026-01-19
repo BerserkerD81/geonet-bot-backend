@@ -13,3 +13,24 @@ export const MYSQL = {
   password: process.env.MYSQL_PASSWORD || ''
 };
 export const VLLM_URL = process.env.VLLM_URL || 'http://localhost:8000';
+
+export const SMTP = {
+  host: process.env.SMTP_HOST || '',
+  port: Number(process.env.SMTP_PORT) || 587,
+  secure: (process.env.SMTP_SECURE || 'false').toLowerCase() === 'true',
+  user: process.env.SMTP_USER || '',
+  pass: process.env.SMTP_PASS || '',
+  from: process.env.SMTP_FROM || 'no-reply@geonet.local',
+  appName: process.env.APP_NAME || 'GeoNet'
+};
+
+export const APP_URL = process.env.APP_URL || '';
+export const BRAND = {
+  primary: process.env.BRAND_PRIMARY || '#0B1C72', // Navy-like
+  accent: process.env.BRAND_ACCENT || '#FF8A00', // Orange CTA
+  background: '#F6F8FB',
+  surface: '#FFFFFF',
+  border: '#E5EAF2',
+  textPrimary: '#0B1C72',
+  textSecondary: '#46526B'
+};

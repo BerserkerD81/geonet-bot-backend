@@ -10,6 +10,7 @@ import authRoutes from './routes/auth';
 import adminRoutes from './routes/admin';
 import chatRoutes from './routes/chat';
 import { ensureDefaultAdmin } from './services/adminBootstrap';
+import { verifyTransport } from './services/emailService';
 
 dotenv.config();
 
@@ -34,6 +35,11 @@ app.use('/auth', authRoutes);
 app.use('/chat', chatRoutes);
 
 app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health/email', async (req, res) => {
+  const result = await verifyTransport();
+  if ((result as any).ok) return res.json({ ok: true });
+  return res.status(500).json(result);
+});
 
 const port = Number(process.env.PORT) || 3000;
 
