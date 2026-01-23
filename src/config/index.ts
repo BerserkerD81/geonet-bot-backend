@@ -34,3 +34,13 @@ export const BRAND = {
   textPrimary: '#0B1C72',
   textSecondary: '#46526B'
 };
+
+export const WISPHUB = {
+  baseUrl: process.env.WISPHUB_BASE_URL || 'https://api.wisphub.net',
+  apiKey: process.env.WISPHUB_API_KEY || ''
+};
+
+export const SMARTOLT = {
+  baseUrl: process.env.SMARTOLT_BASE_URL || '',
+  apiKey: process.env.SMARTOLT_API_KEY || ''
+};

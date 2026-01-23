@@ -15,6 +15,19 @@ export class ChatMessage {
   @Column('text')
   content!: string;
 
+  @Column('simple-json', { nullable: true })
+  actions?: Array<{
+    id: string;
+    type: 'button' | 'input';
+    label: string;
+    payload?: string;
+    placeholder?: string;
+    helperText?: string;
+  }> | null;
+
+  @Column('simple-json', { nullable: true })
+  metadata?: Record<string, any> | null;
+
   @Column('varchar', { length: 255, nullable: true })
   imageUrl?: string | null;
 
