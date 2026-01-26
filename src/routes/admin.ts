@@ -1,7 +1,7 @@
 import express from 'express';
 import { requireAdmin } from '../middlewares/auth';
 import * as adminUsers from '../controllers/adminUserController';
-import { listUserMessages } from '../controllers/chatController';
+import { listUserMessages } from '../controllers/chatStorageController';
 
 const router = express.Router();
 

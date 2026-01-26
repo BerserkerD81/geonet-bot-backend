@@ -44,3 +44,10 @@ export const SMARTOLT = {
   baseUrl: process.env.SMARTOLT_BASE_URL || '',
   apiKey: process.env.SMARTOLT_API_KEY || ''
 };
+
+export const N8N = {
+  baseUrl: process.env.N8N_BASE_URL || '',
+  chatWebhook: process.env.N8N_CHAT_WEBHOOK_URL || '',
+  saveToken: process.env.N8N_SAVE_TOKEN || '',
+  apiToken: process.env.N8N_API_TOKEN || process.env.API_TOKEN || ''
+};

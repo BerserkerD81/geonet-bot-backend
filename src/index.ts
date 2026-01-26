@@ -62,11 +62,11 @@ AppDataSource.initialize()
       const { fullSyncClients } = await import('./services/wisphubClient');
       const { fullSyncInstallations } = await import('./services/wisphubInstallations');
       const syncRawToColumns = (await import('./scripts/syncRawToColumns')).default;
-      // Cachear zonas/ODBs al arrancar para tener las listas listas antes de autorizar
-      await refreshZoneOdbCache().catch((e) => console.error('Cache zonas/ODB falló al iniciar', e));
-      // Semanal
+      // Cachear zonas/ODBs/OLTs/VLANs al arrancar para tener las listas listas antes de autorizar
+      await refreshZoneOdbCache().catch((e) => console.error('Cache zonas/ODB/OLT/VLAN falló al iniciar', e));
+      // Semanal: refrescar zonas/ODBs/OLTs/VLANs
       setInterval(() => {
-        refreshZoneOdbCache().catch((e) => console.error('Cache semanal zonas/ODB falló', e));
+        refreshZoneOdbCache().catch((e) => console.error('Cache semanal zonas/ODB/OLT/VLAN falló', e));
       }, 7 * 24 * 60 * 60 * 1000);
       // Initial sync in background
       setTimeout(() => { fullSyncClients().catch(() => {}); }, 1000);

@@ -8,6 +8,7 @@ import {
   getServiceById,
   getOdbs
 } from '../services/smartoltClient';
+import { listGlobalUnconfiguredOnus } from '../services/smartoltClient';
 import { AppDataSource } from '../datasource';
 import { SmartoltZone } from '../models/SmartoltZone';
 import { SmartoltOdb } from '../models/SmartoltOdb';
@@ -212,6 +213,18 @@ export async function listOdbsByZone(req: Request, res: Response) {
     });
   } catch (err: any) {
     const msg = err?.response?.data || { error: err?.message || 'Failed to fetch ODBs by zone' };
+    return res.status(500).json(msg);
+  }
+}
+
+export async function listUnconfiguredOnus(req: Request, res: Response) {
+  try {
+    // Prevent caching for dynamic SmartOLT data
+    res.setHeader('Cache-Control', 'no-store');
+    const data = await listGlobalUnconfiguredOnus();
+    return res.json({ ok: true, data });
+  } catch (err: any) {
+    const msg = err?.response?.data || { error: err?.message || 'Failed to fetch unconfigured ONUs' };
     return res.status(500).json(msg);
   }
 }

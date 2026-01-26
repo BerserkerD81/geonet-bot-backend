@@ -1,7 +1,9 @@
 import { AppDataSource } from '../datasource';
 import { SmartoltZone } from '../models/SmartoltZone';
 import { SmartoltOdb } from '../models/SmartoltOdb';
-import { getOdbs, getZones } from './smartoltClient';
+import { SmartoltOlt } from '../models/SmartoltOlt';
+import { SmartoltVlan } from '../models/SmartoltVlan';
+import { getOdbs, getZones, listOlts, getOltVlans } from './smartoltClient';
 
 /**
  * Fetch zones and ODBs from SmartOLT and store them in the cache tables.
@@ -11,10 +13,16 @@ import { getOdbs, getZones } from './smartoltClient';
 export async function refreshZoneOdbCache() {
   const zoneRepo = AppDataSource.getRepository(SmartoltZone);
   const odbRepo = AppDataSource.getRepository(SmartoltOdb);
+  const oltRepo = AppDataSource.getRepository(SmartoltOlt);
+  const vlanRepo = AppDataSource.getRepository(SmartoltVlan);
   const collectedAt = new Date();
   const normalize = (v: string) => (v || '').toString().trim().toLowerCase();
 
-  const [zones, odbs] = await Promise.all([getZones().catch(() => []), getOdbs().catch(() => [])]);
+  const [zones, odbs, olts] = await Promise.all([
+    getZones().catch(() => []),
+    getOdbs().catch(() => []),
+    listOlts().catch(() => [])
+  ]);
 
   // Upsert zonas basadas en externalId (preferente) y nombre como respaldo
   const existingZones = await zoneRepo.find();
@@ -91,5 +99,80 @@ export async function refreshZoneOdbCache() {
 
   if (odbEntities.length) {
     await odbRepo.save(odbEntities);
+  }
+
+  // --- OLTs: upsert and save ---
+  try {
+    const existingOlts = await oltRepo.find();
+    const oltByExternalId = new Map<string, SmartoltOlt>();
+    const oltByName = new Map<string, SmartoltOlt>();
+    existingOlts.forEach((o) => {
+      if (o.externalId) oltByExternalId.set(o.externalId, o);
+      oltByName.set(normalize(o.name), o);
+    });
+
+    const toSaveOlts: SmartoltOlt[] = [];
+    if (Array.isArray(olts)) {
+      olts.forEach((o: any) => {
+        const extId = o?.id ? String(o.id) : undefined;
+        const name = (o?.name || o?.id || o?.ip || '').toString().trim();
+        if (!name) return;
+
+        let existing: SmartoltOlt | undefined;
+        if (extId) existing = oltByExternalId.get(extId);
+        if (!existing) existing = oltByName.get(normalize(name));
+
+        if (existing) {
+          existing.name = name;
+          existing.externalId = extId || existing.externalId || null;
+          existing.collectedAt = collectedAt;
+          toSaveOlts.push(existing);
+        } else {
+          const created = oltRepo.create({ name, externalId: extId || null, collectedAt });
+          toSaveOlts.push(created);
+        }
+      });
+    }
+
+    const savedOlts = await oltRepo.save(toSaveOlts);
+
+    // Remove existing VLANs for these OLTs before repopulating
+    const oltIds = savedOlts.map((o) => o.id);
+    if (oltIds.length) {
+      await vlanRepo
+        .createQueryBuilder()
+        .delete()
+        .where('olt_id IN (:...oltIds)', { oltIds })
+        .execute();
+    }
+
+    // Fetch VLANs per saved OLT and create entities
+    const vlanEntities: SmartoltVlan[] = [];
+    await Promise.all(
+      savedOlts.map(async (savedOlt) => {
+        const oltExtId = savedOlt.externalId;
+        if (!oltExtId) return;
+        let vlans: Array<any> = [];
+        try {
+          vlans = await getOltVlans(oltExtId).catch(() => []);
+        } catch (e) {
+          // ignore per-OLT failure
+          vlans = [];
+        }
+        if (!Array.isArray(vlans)) return;
+        vlans.forEach((v) => {
+          const vlanId = v?.vlan_id ?? v?.vlan ?? v?.id ?? v;
+          const name = (v?.name || v?.description || v?.label || '').toString().trim();
+          if (!vlanId) return;
+          vlanEntities.push(
+            vlanRepo.create({ externalId: String(vlanId), name: name || null, collectedAt, olt: savedOlt })
+          );
+        });
+      })
+    );
+
+    if (vlanEntities.length) await vlanRepo.save(vlanEntities);
+  } catch (err) {
+    console.warn('refreshZoneOdbCache: OLT/VLAN refresh failed', (err as any)?.message || err);
   }
 }

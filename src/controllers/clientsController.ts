@@ -1,7 +1,7 @@
 import { Request, Response } from 'express';
 import { AppDataSource } from '../datasource';
 import { Client } from '../models/Client';
-import { fullSyncClients, refreshClientsByTerm, searchLocal } from '../services/wisphubClient';
+import { fullSyncClients, refreshClientsByTerm, searchLocal, listClientsPage } from '../services/wisphubClient';
 
 function pickFromRaw(raw: any, key: string) {
   if (!raw) return null;
@@ -68,6 +68,19 @@ export async function searchClients(req: Request, res: Response) {
     return res.json({ results: results.map(enrichClientEntity), refreshed: true });
   } catch (err: any) {
     return res.status(500).json({ error: err?.message || 'Search failed' });
+  }
+}
+
+// GET /clients/wisphub - query Wisphub API directly (limit, offset optional)
+export async function listClientsFromWisphub(req: Request, res: Response) {
+  try {
+    const limit = Math.min(Number(req.query.limit || 50), 1000);
+    const offset = Math.max(Number(req.query.offset || 0), 0);
+    const data = await listClientsPage({ limit, offset });
+    return res.json(data);
+  } catch (err: any) {
+    console.error('listClientsFromWisphub failed', err?.message || err);
+    return res.status(500).json({ error: err?.message || 'failed to fetch from wisphub' });
   }
 }
 
