@@ -28,8 +28,12 @@ export type WisphubInstallationItem = {
   [key: string]: any;
 };
 
-export async function listInstallationsPage(params: Record<string, any> = {}) {
-  const res = await http.get('/api/instalaciones/', { params });
+export async function listInstallationsPage(params: Record<string, any> = {}, apiKey?: string) {
+  const opts: any = { params };
+  if (apiKey) {
+    opts.headers = { Authorization: `Api-Key ${apiKey}` };
+  }
+  const res = await http.get('/api/instalaciones/', opts);
   return res.data as { count: number; next: string | null; previous: string | null; results: WisphubInstallationItem[] };
 }
 

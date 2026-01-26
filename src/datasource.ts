@@ -7,6 +7,8 @@ import { Installation } from './models/Installation';
 import { MYSQL } from './config';
 import { SmartoltZone } from './models/SmartoltZone';
 import { SmartoltOdb } from './models/SmartoltOdb';
+import { SmartoltOlt } from './models/SmartoltOlt';
+import { SmartoltVlan } from './models/SmartoltVlan';
 
 export const AppDataSource = new DataSource({
   type: 'mysql',
@@ -15,6 +17,6 @@ export const AppDataSource = new DataSource({
   username: MYSQL.user,
   password: MYSQL.password,
   database: MYSQL.database,
-  entities: [User, ChatMessage, Client, Installation, SmartoltZone, SmartoltOdb],
+  entities: [User, ChatMessage, Client, Installation, SmartoltZone, SmartoltOdb, SmartoltOlt, SmartoltVlan],
   synchronize: true
 });

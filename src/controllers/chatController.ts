@@ -1,3 +1,96 @@
+
+
+export async function handleChatMessage(req: any, res: any) {
+  const session = req.session as any;
+  let userId = session?.userId;
+  // If no session, allow machine-to-machine (n8n) requests authenticated by API token.
+  if (!userId) {
+    const headerToken = (req.get('x-api-token') || req.get('x-n8n-token') || '').trim();
+    const expected = (process.env.N8N_API_TOKEN || process.env.API_TOKEN || process.env.N8N_SAVE_TOKEN || '').trim();
+    if (expected && headerToken && headerToken === expected) {
+      const bodyUserId = req.body && (req.body.userId ?? req.body.userId === 0 ? req.body.userId : undefined);
+      if (bodyUserId === undefined || bodyUserId === null) {
+        return res.status(400).json({ error: 'userId required for system requests' });
+      }
+      const parsed = Number(bodyUserId);
+      if (!Number.isInteger(parsed) || parsed <= 0) return res.status(400).json({ error: 'invalid userId' });
+      userId = parsed;
+    } else {
+      return res.status(401).json({ error: 'unauthenticated' });
+    }
+  }
+
+  const { content, imageUrl, metadata } = req.body || {};
+  if (!content && !imageUrl) return res.status(400).json({ error: 'content_required' });
+
+  const repo = AppDataSource.getRepository(ChatMessage);
+  // Obtener últimos 10 mensajes para contexto
+  const prev = await repo.find({ where: { userId: Number(userId) }, order: { createdAt: 'ASC' }, take: 10 });
+  const messages = prev.map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content, imageUrl: m.imageUrl ?? null }));
+
+  // Determine sessionId coming from body/header/session
+  const incomingSessionId = (req.body && (req.body.sessionId || req.body.key)) || req.get('Key') || req.get('X-Session-Id') || session?.n8nSessionId;
+  // Guardar mensaje de usuario
+  const userMsg = repo.create({
+    userId: Number(userId),
+    role: 'user',
+    content: typeof content === 'string' ? content : '',
+    imageUrl: typeof imageUrl === 'string' ? imageUrl : undefined,
+    metadata: (() => {
+      const m = metadata && typeof metadata === 'object' ? { ...metadata } : {};
+      if (incomingSessionId) m.sessionId = String(incomingSessionId);
+      return Object.keys(m).length ? m : undefined;
+    })(),
+  });
+  await repo.save(userMsg);
+
+  // Llamar a n8n para obtener respuesta
+  let assistantMsg;
+  try {
+    // Ensure a per-session n8n session id exists so n8n can keep context across messages
+    if (session && !session.n8nSessionId) session.n8nSessionId = randomUUID();
+    const effectiveSessionId = session?.n8nSessionId || incomingSessionId;
+    const out = await runChatWorkflow({ userId: Number(userId), content, imageUrl, messages, sessionId: effectiveSessionId });
+    assistantMsg = repo.create({
+      userId: Number(userId),
+      role: 'assistant',
+      content: out.content || '',
+      actions: Array.isArray(out.actions) ? out.actions : undefined,
+      metadata: (() => {
+        const m = out.metadata && typeof out.metadata === 'object' ? { ...out.metadata } : {};
+        if (effectiveSessionId) m.sessionId = String(effectiveSessionId);
+        return Object.keys(m).length ? m : undefined;
+      })(),
+    });
+    await repo.save(assistantMsg);
+  } catch (e: any) {
+    assistantMsg = repo.create({
+      userId: Number(userId),
+      role: 'assistant',
+      content: 'Ocurrió un error al procesar tu mensaje. Intenta nuevamente.',
+    });
+    await repo.save(assistantMsg);
+  }
+
+  return res.json({
+    ok: true,
+    userMessage: {
+      id: userMsg.id,
+      role: userMsg.role,
+      content: userMsg.content,
+      imageUrl: userMsg.imageUrl ?? null,
+      createdAt: userMsg.createdAt,
+    },
+    assistantMessage: {
+      id: assistantMsg.id,
+      role: assistantMsg.role,
+      content: assistantMsg.content,
+      actions: assistantMsg.actions ?? [],
+      createdAt: assistantMsg.createdAt,
+      metadata: assistantMsg.metadata ?? null,
+    },
+  });
+}
 function buildAuthActions(state: any) {
   const defaults = state.defaults || {};
   const collected = state.collected || {};
@@ -65,7 +158,10 @@ import { SmartoltZone } from '../models/SmartoltZone';
 import { SmartoltOdb } from '../models/SmartoltOdb';
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'crypto';
 import { buildStructuredResponse } from '../services/simpleBot';
+import { runChatWorkflow } from '../services/n8nClient';
+import { N8N } from '../config';
 import { searchLocal, refreshClientsByTerm, fullSyncClients } from '../services/wisphubClient';
 import { searchLocalInstallations, refreshInstallationsByTerm, listPendingLocalInstallations, fullSyncInstallations } from '../services/wisphubInstallations';
 import { authorizeOnu, listOlts, type OltInfo, getZones, getOltVlans, listOnusByOlt, listUnconfiguredOnusByOlt, listGlobalUnconfiguredOnus, getOdbs, getOnuTypesByPonType, type SmartOltOnu, updateOnuLocation, setOnuWanModeStaticIp } from '../services/smartoltClient';
@@ -203,6 +299,85 @@ async function applyOltAndNetworkToState(state: any, serviceIdOrTerm?: number | 
   state.smartoltOnuTypes = section.onuTypesByPon;
   await hydrateZonesAndOdbs(state, state.collected.zone);
   return section;
+}
+
+// Build WAN configuration actions based on collected data
+function buildWanActions(collected: Record<string, any>): any[] {
+  const ipCandidates = [collected.ipv4_address, collected.ipv4, collected.ip, collected.client_ip, collected.cliente_ip, collected.customer_ip, collected.service_ip];
+  const ipRaw = ipCandidates.find((v) => v !== undefined && v !== null && String(v).trim() !== '');
+  const ip = ipRaw ? String(ipRaw).trim() : '';
+
+  const actions: any[] = [];
+  actions.push({ id: 'wan-sn', type: 'input', label: `SN/MAC`, placeholder: collected.sn || '', payload: 'wan set sn {input}' });
+  actions.push({ id: 'wan-onu_external_id', type: 'input', label: `ONU External ID`, placeholder: collected.onu_external_id ? String(collected.onu_external_id) : '', payload: 'wan set onu_external_id {input}' });
+  actions.push({ id: 'wan-ipv4', type: 'input', label: `WAN IPv4`, placeholder: ip || 'Ej: 10.100.0.11', payload: 'wan set ipv4_address {input}' });
+  actions.push({ id: 'wan-subnet', type: 'input', label: `WAN Subnet Mask`, placeholder: collected.subnet_mask || '255.255.255.0', payload: 'wan set subnet_mask {input}' });
+  let gatewayPlaceholder = collected.gateway || '';
+  if (!gatewayPlaceholder && ip) {
+    const ipParts = ip.split('.');
+    if (ipParts.length === 4) {
+      gatewayPlaceholder = `${ipParts[0]}.${ipParts[1]}.${ipParts[2]}.254`;
+    }
+  }
+  actions.push({ id: 'wan-gateway', type: 'input', label: `WAN Gateway`, placeholder: gatewayPlaceholder || 'Ej: 10.100.0.254', payload: 'wan set gateway {input}' });
+  actions.push({ id: 'wan-dns1', type: 'input', label: `WAN DNS1`, placeholder: collected.dns1 || '8.8.8.8', payload: 'wan set dns1 {input}' });
+  actions.push({ id: 'wan-dns2', type: 'input', label: `WAN DNS2`, placeholder: collected.dns2 || '8.8.4.4', payload: 'wan set dns2 {input}' });
+  actions.push({ id: 'wan-apply', type: 'button', label: 'Autorizar WAN estático ahora', payload: 'wan apply' });
+  return actions;
+}
+
+// Endpoint: iniciar autorización SmartOLT (devuelve formulario con acciones)
+export async function initiateAuth(req: any, res: any) {
+  const session = req.session as any;
+  const userId = session?.userId;
+  if (!userId) return res.status(401).json({ error: 'unauthenticated' });
+
+  try {
+    const defaults = (req.body?.defaults && typeof req.body.defaults === 'object') ? req.body.defaults : {};
+    const serviceIdOrTerm = req.body?.serviceIdOrTerm;
+
+    const state = {
+      defaults,
+      collected: buildPrefilledAuth(defaults),
+    } as any;
+
+    const section = await applyOltAndNetworkToState(state, serviceIdOrTerm);
+    const actions = buildAuthActions(state);
+    const assistantMetadata = {
+      smartoltAvailability: {
+        olts: section.oltAvailability || [],
+        suggestedVlan: section.suggestedVlan,
+        suggestedZone: section.suggestedZone,
+        suggestedDownload: section.suggestedDownload,
+        suggestedUpload: section.suggestedUpload
+      },
+      smartoltOdbs: section.odbs,
+      smartoltZones: section.zones
+    };
+
+    session.pendingAuth = state;
+    return res.json({ ok: true, message: section.text, actions, metadata: assistantMetadata });
+  } catch (e: any) {
+    const errMsg = e?.message || 'Failed to initiate auth';
+    return res.status(500).json({ ok: false, error: errMsg });
+  }
+}
+
+// Endpoint: iniciar seteo de WAN estático (devuelve formulario con acciones)
+export async function initiateWan(req: any, res: any) {
+  const session = req.session as any;
+  const userId = session?.userId;
+  if (!userId) return res.status(401).json({ error: 'unauthenticated' });
+
+  try {
+    const collected = { ...(session?.pendingAuth?.collected || {}), ...(req.body || {}) } as Record<string, any>;
+    const actions = buildWanActions(collected);
+    session.pendingWan = collected;
+    return res.json({ ok: true, message: 'Completa los datos para configurar WAN estático.', actions });
+  } catch (e: any) {
+    const errMsg = e?.message || 'Failed to initiate WAN';
+    return res.status(500).json({ ok: false, error: errMsg });
+  }
 }
 
 async function ensurePendingAuthFromInstallation(session: any, inst: any): Promise<{ text: string; actions: any[]; assistantMetadata: Record<string, any> }>
@@ -710,18 +885,80 @@ export async function respond(req: any, res: any) {
   const imageUrl: string | null = saveImageDataUrl(imageDataUrl);
 
   // Store user message
+  // Ensure session n8n id exists and store it in message metadata
+  if (session && !session.n8nSessionId) session.n8nSessionId = randomUUID();
   const userMsg = repo.create({
     userId: Number(userId),
     role: 'user',
     content: content ?? (imageUrl ? '[Imagen enviada]' : ''),
     imageUrl: imageUrl ?? undefined,
+    metadata: { ...(undefined as any), ...(session?.n8nSessionId ? { sessionId: String(session.n8nSessionId) } : {}) } as any,
   });
   await repo.save(userMsg);
 
   // Build assistant response
   const prompt = content || (imageUrl ? 'Foto enviada' : '');
-  const structured = buildStructuredResponse(prompt);
-  let actionsOut: any[] = structured.actions as any[];
+  const promptText = content || (imageUrl ? 'Foto enviada' : '');
+  let finalContent = '';
+  let actionsOut: any[] = [];
+  let assistantMetadata: Record<string, any> | null = null;
+
+  // Prefer n8n workflow if configured; fallback to local simpleBot
+  if (N8N.chatWebhook || N8N.baseUrl) {
+    try {
+      const prev = await repo.find({ where: { userId: Number(userId) }, order: { createdAt: 'ASC' }, take: 10 });
+      const messages = prev.map((m) => ({ role: m.role as 'user' | 'assistant', content: m.content, imageUrl: m.imageUrl ?? null }));
+      if (session && !session.n8nSessionId) session.n8nSessionId = randomUUID();
+      const out = await runChatWorkflow({ userId: Number(userId), content: promptText, imageUrl, messages, sessionId: session?.n8nSessionId });
+      finalContent = out.content || '';
+      actionsOut = Array.isArray(out.actions) ? out.actions : [];
+      assistantMetadata = out.metadata ?? null;
+    } catch (e: any) {
+      // Fallback on error
+      const structured = buildStructuredResponse(promptText);
+      finalContent = structured.content;
+      actionsOut = structured.actions as any[];
+    }
+  } else {
+    const structured = buildStructuredResponse(promptText);
+    finalContent = structured.content;
+    actionsOut = structured.actions as any[];
+  }
+  // Persist assistant message and return
+  const assistantMsg = repo.create({
+    userId: Number(userId),
+    role: 'assistant',
+    content: finalContent,
+    actions: actionsOut,
+    metadata: (() => {
+      const m = assistantMetadata && typeof assistantMetadata === 'object' ? { ...assistantMetadata } : {};
+      if (session?.n8nSessionId) m.sessionId = String(session.n8nSessionId);
+      return Object.keys(m).length ? m : undefined;
+    })(),
+  });
+  await repo.save(assistantMsg);
+
+  return res.json({
+    ok: true,
+    userMessage: {
+      id: userMsg.id,
+      role: userMsg.role,
+      content: userMsg.content,
+      imageUrl: userMsg.imageUrl ?? null,
+      createdAt: userMsg.createdAt,
+    },
+    assistantMessage: {
+      id: assistantMsg.id,
+      role: assistantMsg.role,
+      content: assistantMsg.content,
+      actions: assistantMsg.actions ?? [],
+      createdAt: assistantMsg.createdAt,
+      metadata: assistantMsg.metadata ?? null,
+    },
+  });
+}
+
+/* Legacy chat logic below is disabled when n8n is enabled
   let assistantMetadata: Record<string, any> | null = null;
 
   const setSmartoltMetadata = (metadata: any) => {
@@ -1029,55 +1266,7 @@ export async function respond(req: any, res: any) {
       if (!state) {
         finalContent = 'No hay una autorización en progreso. Primero selecciona una instalación.';
       } else {
-        if (key === 'sn') {
-          finalContent = 'El SN no se puede modificar; se usa el de la ONU seleccionada.';
-          actionsOut = buildAuthActions(state);
-          return;
-        }
-        if (key === 'download_speed_profile_name' || key === 'upload_speed_profile_name') {
-          state.collected[key] = normalizeSpeedProfileName(value) || value;
-        } else {
-          state.collected[key] = value;
-        }
-        if (key === 'zone') {
-          await hydrateZonesAndOdbs(state, value);
-        }
-        finalContent = `Campo actualizado: ${key} = ${value}. Puedes completar otros campos o presionar "Autorizar SmartOLT ahora".`;
-        actionsOut = buildAuthActions(state);
-      }
-    } else if (/^(seleccionar|select)\s+onu/i.test(lower)) {
-      const state = (req.session as any).pendingAuth;
-      if (!state) {
-        finalContent = 'No hay una autorización en progreso. Primero selecciona una instalación o cliente.';
-      } else {
-        const snMatch = prompt.match(/onu\s+(\S+)/i);
-        const oltMatch = prompt.match(/olt\s+(\d+)/i);
-        const ponMatch = prompt.match(/pon\s+([a-z0-9]+)/i);
-        const portMatch = prompt.match(/port\s+([\w.-]+)/i);
-        const boardMatch = prompt.match(/board\s+(\d+)/i);
-        const modelMatch = prompt.match(/model\s+([\w.-]+)/i);
-        if (snMatch) state.collected.sn = snMatch[1];
-        if (oltMatch) state.collected.olt_id = oltMatch[1];
-        if (ponMatch) state.collected.pon_type = ponMatch[1];
-        if (portMatch) state.collected.port = portMatch[1];
-        if (boardMatch) state.collected.board = boardMatch[1];
-        if (modelMatch && !state.collected.onu_type) state.collected.onu_type = modelMatch[1];
-        state.collected.onu_mode = state.collected.onu_mode || 'Routing';
-
-        // Enriquecer con datos reales de SmartOLT para la ONU elegida, incluyendo onu_external_id si está disponible
-        const selectedId = snMatch ? snMatch[1].toLowerCase() : undefined;
-        const oltIdForOnu = state.collected.olt_id || (oltMatch ? oltMatch[1] : undefined);
-        if (selectedId && oltIdForOnu) {
-          try {
-            let onus = await listUnconfiguredOnusByOlt(oltIdForOnu);
-            if (!onus || onus.length === 0) {
-              onus = await listOnusByOlt(oltIdForOnu);
-            }
-            const found = (onus || []).find((o: any) => {
-              const keys = [o.sn, o.serial, o.onu_sn, o.mac, o.mac_address]
-                .map((v: any) => (v ? String(v).toLowerCase() : ''));
-              return keys.some((k: string) => k && k === selectedId);
-            });
+        // When delegating to n8n, skip backend pre-search/SmartOLT branching here.
             if (found) {
               state.collected.sn = pickFirstString([found.sn, found.serial, found.onu_sn, found.mac, found.mac_address]) || state.collected.sn;
               state.collected.onu_type =
@@ -1400,6 +1589,7 @@ export async function respond(req: any, res: any) {
 }
 
 // New endpoint: submit all collected auth fields in one request (preferred)
+*/
 export async function submitAuth(req: any, res: any) {
   const session = req.session as any;
   const userId = session?.userId;
