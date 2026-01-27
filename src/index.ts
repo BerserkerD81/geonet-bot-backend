@@ -9,14 +9,8 @@ import { AppDataSource } from './datasource';
 import authRoutes from './routes/auth';
 import adminRoutes from './routes/admin';
 import chatRoutes from './routes/chat';
-import clientsRoutes from './routes/clients';
-import integrationsRoutes from './routes/integrations';
-import installationsRoutes from './routes/installations';
-import smartoltRoutes from './routes/smartolt';
-import odbRoutes from './routes/odb';
 import { ensureDefaultAdmin } from './services/adminBootstrap';
 import { verifyTransport } from './services/emailService';
-import { refreshZoneOdbCache } from './services/zoneOdbCache';
 
 dotenv.config();
 
@@ -39,11 +33,6 @@ app.use('/uploads', express.static(path.join(process.cwd(), 'uploads')));
 
 app.use('/auth', authRoutes);
 app.use('/chat', chatRoutes);
-app.use('/clients', clientsRoutes);
-app.use('/integrations', integrationsRoutes);
-
-app.use('/smartolt', smartoltRoutes);
-app.use('/api', odbRoutes); // Expose ODB available ports endpoint at /api/odbs/:externalId/ports
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 app.get('/health/email', async (req, res) => {
@@ -57,6 +46,7 @@ const port = Number(process.env.PORT) || 3000;
 AppDataSource.initialize()
   .then(async () => {
     await ensureDefaultAdmin();
+<<<<<<< HEAD
     // Schedule hourly clients sync from WispHub
     try {
       const { fullSyncClients } = await import('./services/wisphubClient');
@@ -85,6 +75,8 @@ AppDataSource.initialize()
     } catch (e) {
       console.warn('WispHub sync scheduler not started:', (e as any)?.message);
     }
+=======
+>>>>>>> parent of d0c9887 (feat: add Wisphub client and installation services with full sync capabilities)
     app.listen(port, () => console.log(`Server listening on ${port}`));
   })
   .catch((err) => {
@@ -93,4 +85,3 @@ AppDataSource.initialize()
   });
 
 app.use('/admin', adminRoutes);
-app.use('/installations', installationsRoutes);

@@ -97,35 +97,6 @@ export async function sendFailedLoginAlert(to: string, name?: string, meta?: { i
   await sendMail(to, title, html);
 }
 
-export async function sendSuccessfulLoginNotice(to: string, name?: string, meta?: { ip?: string; userAgent?: string }) {
-  const title = `${SMTP.appName} • Inicio de sesión exitoso`;
-  const ip = meta?.ip || 'desconocida';
-  const ua = meta?.userAgent || 'desconocido';
-  const preheader = 'Tu cuenta se usó para iniciar sesión correctamente.';
-  const body = `
-    <p style="margin:0 0 16px;color:${BRAND.textSecondary}">Hola ${name ? `<strong>${name}</strong>` : ''},</p>
-    <p style="margin:0 0 16px;color:${BRAND.textSecondary}">Se acaba de iniciar sesión correctamente en tu cuenta.</p>
-    <table role="presentation" cellspacing="0" cellpadding="0" style="width:100%;margin:8px 0 20px;border-collapse:separate;border-spacing:0;">
-      <tr>
-        <td style="padding:10px 12px;border:1px solid ${BRAND.border};border-right:none;border-radius:8px 0 0 8px;background:${BRAND.surface};color:${BRAND.textSecondary};width:140px;font-weight:600">IP</td>
-        <td style="padding:10px 12px;border:1px solid ${BRAND.border};border-radius:0 8px 8px 0;background:${BRAND.surface};color:${BRAND.textPrimary}">${ip}</td>
-      </tr>
-      <tr>
-        <td style="padding:10px 12px;border:1px solid ${BRAND.border};border-right:none;border-radius:8px 0 0 8px;background:${BRAND.surface};color:${BRAND.textSecondary};font-weight:600">Navegador</td>
-        <td style="padding:10px 12px;border:1px solid ${BRAND.border};border-radius:0 8px 8px 0;background:${BRAND.surface};color:${BRAND.textPrimary}">${ua}</td>
-      </tr>
-      <tr>
-        <td style="padding:10px 12px;border:1px solid ${BRAND.border};border-right:none;border-radius:8px 0 0 8px;background:${BRAND.surface};color:${BRAND.textSecondary};font-weight:600">Fecha</td>
-        <td style="padding:10px 12px;border:1px solid ${BRAND.border};border-radius:0 8px 8px 0;background:${BRAND.surface};color:${BRAND.textPrimary}">${new Date().toLocaleString()}</td>
-      </tr>
-    </table>
-    <p style="margin:0 0 16px;color:${BRAND.textSecondary}">Si no reconoces este inicio, cambia tu contraseña y revisa tus dispositivos.</p>
-  `;
-  const cta = APP_URL ? { label: 'Gestionar cuenta', url: APP_URL } : undefined;
-  const html = renderBaseTemplate({ title, preheader, bodyHtml: body, cta });
-  await sendMail(to, title, html);
-}
-
 export async function verifyTransport(): Promise<{ ok: true } | { ok: false; error: string } | { ok: false; reason: 'not_configured' }> {
   const t = getTransporter();
   if (!t) return { ok: false, reason: 'not_configured' };

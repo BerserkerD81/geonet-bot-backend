@@ -3,21 +3,8 @@ import { User } from '../models/User';
 import bcrypt from 'bcryptjs';
 import speakeasy from 'speakeasy';
 import QRCode from 'qrcode';
-import { sendFailedLoginAlert, sendWelcomeWithPassword, sendSuccessfulLoginNotice } from '../services/emailService';
+import { sendFailedLoginAlert, sendWelcomeWithPassword } from '../services/emailService';
 import { sendPasswordChanged } from '../services/emailService';
-
-function extractIPv4(req: any): string {
-  const xff = (req.headers?.['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim();
-  const raw = xff || req.ip || '';
-  if (!raw) return 'desconocida';
-  if (raw.startsWith('::ffff:')) return raw.replace('::ffff:', '');
-  // If it's an IPv6 with embedded IPv4, try to grab trailing part
-  if (raw.includes(':') && raw.match(/\d+\.\d+\.\d+\.\d+/)) {
-    const match = raw.match(/(\d+\.\d+\.\d+\.\d+)/);
-    if (match) return match[1];
-  }
-  return raw;
-}
 
 export async function register(req: any, res: any) {
   const { email, password, name } = req.body;
@@ -55,7 +42,7 @@ export async function login(req: any, res: any) {
   const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) {
     try {
-      await sendFailedLoginAlert(user.email!, user.name, { ip: extractIPv4(req), userAgent: req.get('user-agent') });
+      await sendFailedLoginAlert(user.email!, user.name, { ip: req.ip, userAgent: req.get('user-agent') });
     } catch (e) {
       // eslint-disable-next-line no-console
       console.warn('Failed to send failed login alert:', e);
@@ -95,16 +82,6 @@ export async function login2fa(req: any, res: any) {
   }
   (req.session as any).userId = user.id;
   delete (req.session as any).pendingUserId;
-
-  try {
-    if (user.email) {
-      await sendSuccessfulLoginNotice(user.email, user.name, { ip: extractIPv4(req), userAgent: req.get('user-agent') });
-    }
-  } catch (e) {
-    // eslint-disable-next-line no-console
-    console.warn('Failed to send successful login email:', e);
-  }
-
   res.json({ ok: true });
 }
 

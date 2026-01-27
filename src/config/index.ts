@@ -34,6 +34,7 @@ export const BRAND = {
   textPrimary: '#0B1C72',
   textSecondary: '#46526B'
 };
+<<<<<<< HEAD
 
 export const WISPHUB = {
   baseUrl: process.env.WISPHUB_BASE_URL || 'https://api.wisphub.net',
@@ -51,3 +52,5 @@ export const N8N = {
   saveToken: process.env.N8N_SAVE_TOKEN || '',
   apiToken: process.env.N8N_API_TOKEN || process.env.API_TOKEN || ''
 };
+=======
+>>>>>>> parent of d0c9887 (feat: add Wisphub client and installation services with full sync capabilities)

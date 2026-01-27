@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 
 
 export async function handleChatMessage(req: any, res: any) {
@@ -152,12 +153,13 @@ function buildAuthActions(state: any) {
   actions.push({ id: 'auth-submit', type: 'button', label: 'Autorizar SmartOLT ahora', payload: 'auth submit' });
   return actions;
 }
+=======
+>>>>>>> parent of d0c9887 (feat: add Wisphub client and installation services with full sync capabilities)
 import { AppDataSource } from '../datasource';
 import { ChatMessage } from '../models/ChatMessage';
-import { SmartoltZone } from '../models/SmartoltZone';
-import { SmartoltOdb } from '../models/SmartoltOdb';
 import fs from 'fs';
 import path from 'path';
+<<<<<<< HEAD
 import { randomUUID } from 'crypto';
 import { buildStructuredResponse } from '../services/simpleBot';
 import { runChatWorkflow } from '../services/n8nClient';
@@ -823,6 +825,8 @@ async function buildOltAndNetworkSection(serviceId?: number | string, opts?: { s
     oltAvailability
   };
 }
+=======
+>>>>>>> parent of d0c9887 (feat: add Wisphub client and installation services with full sync capabilities)
 
 export async function addMessage(req: any, res: any) {
   const session = req.session as any;
@@ -841,7 +845,29 @@ export async function addMessage(req: any, res: any) {
   }
 
   const repo = AppDataSource.getRepository(ChatMessage);
-  const imageUrl: string | null = saveImageDataUrl(imageDataUrl);
+  let imageUrl: string | null = null;
+
+  if (imageDataUrl && typeof imageDataUrl === 'string') {
+    try {
+      const matches = imageDataUrl.match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.+)$/);
+      if (matches) {
+        const mimeType = matches[1];
+        const base64Data = matches[2];
+
+        const ext = mimeType.split('/')[1] || 'png';
+        const fileName = `chat_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+        const uploadDir = path.join(process.cwd(), 'uploads', 'chat');
+
+        fs.mkdirSync(uploadDir, { recursive: true });
+        const filePath = path.join(uploadDir, fileName);
+        fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
+
+        imageUrl = `/uploads/chat/${fileName}`;
+      }
+    } catch (err) {
+      console.error('Failed to store chat image', err);
+    }
+  }
 
   const message = repo.create({
     userId: Number(userId),
@@ -866,6 +892,7 @@ export async function listUserMessages(req: any, res: any) {
 
   return res.json({ messages });
 }
+<<<<<<< HEAD
 
 export async function respond(req: any, res: any) {
   const session = req.session as any;
@@ -1836,3 +1863,5 @@ export async function applyPendingWan(req: any, res: any) {
     return res.status(500).json({ ok: false, error: errMsg });
   }
 }
+=======
+>>>>>>> parent of d0c9887 (feat: add Wisphub client and installation services with full sync capabilities)
