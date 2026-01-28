@@ -562,7 +562,7 @@ export async function respond(req: any, res: any) {
       if (targetId) {
           finalContent = `📄 Generando contrato para ID **${targetId}**...`;
           const contractUrl = `/chat/downloads/contract/${targetId}`;
-          processContractUpdate(targetId).catch(err => {
+          await processContractUpdate(targetId).catch(err => {
               console.error('Error generating contract:', err);
           });
           const baseName = session.lastAuthNameUsed || targetId;
@@ -784,15 +784,56 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
     } else {
         messages.push('⚠️ Falta IP para WAN.');
     }
-    await registrarOnuGeonet(data.onu_type, onuId);
+    
+    // --- LÓGICA DE VERIFICACIÓN EN TABLA INSTALLATION ---
+    
+    // A) Resolvemos el ID
     let clientid = targetId;
+    const session = data._session || {};
     if (!clientid) {
-        const session = data._session || {};
         clientid = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
     }
-    console.log('Client ID for adding article:', clientid);
-    if (clientid !== undefined) {
-        await agregarArticuloACliente(clientid, `${data.name}@geonet` || '', onuId); 
+
+    let skipGeonetRegistration = false;
+
+    // B) Consultamos la tabla Installation si tenemos un ID
+    if (clientid) {
+        try {
+            const instRepo = AppDataSource.getRepository(Installation);
+            
+            // Buscamos si existe una instalación por ID o por ID de servicio que coincida
+            const installation = await instRepo.findOne({ 
+                where: [
+                    { id: Number(clientid) },
+                    { id_servicio: Number(clientid) }
+                ]
+            });
+
+            if (installation && installation.sn_onu) {
+                // Comparamos SNs normalizados
+                const storedSn = String(installation.sn_onu).trim().toUpperCase();
+                const newSn = String(onuId).trim().toUpperCase();
+
+                if (storedSn === newSn) {
+                    console.log(`ℹ️ El SN ${newSn} ya existe en la tabla Installation (ID: ${installation.id}). Saltando registros.`);
+                    skipGeonetRegistration = true;
+                }
+            }
+        } catch (err) {
+            console.error('⚠️ Error consultando tabla Installation:', err);
+        }
+    }
+
+    // C) Ejecutamos Geonet y Artículos SOLO si no se debe saltar
+    if (!skipGeonetRegistration) {
+        await registrarOnuGeonet(data.onu_type, onuId);
+        
+        console.log('Client ID for adding article:', clientid);
+        if (clientid !== undefined) {
+            await agregarArticuloACliente(clientid, `${data.name}@geonet` || '', onuId); 
+        }
+    } else {
+        messages.push('ℹ️ ONU ya registrada en BD (SN coincidente).');
     }
 
     // --- 3. LOGICA CONDICIONAL (WIFI vs BOTONES DIRECTOS) ---
@@ -877,7 +918,7 @@ export async function submitAuth(req: any, res: any) {
         // 2. PASAMOS targetId A LA FUNCIÓN DE POST-PROCESO
         const postResult = await processPostAuthActions({
             ...merged, onu_external_id: explicitSn, vlan: cleanVlan, address_or_comment: finalAddress, odb_port: cleanOdbPort
-        ,onu_type: merged.onu_type}, targetId);
+        ,onu_type: merged.onu_type, _session: session }, targetId);
 
         cacheDelete('listOlts');
         if (merged.olt_id) cacheDelete(`onus:${merged.olt_id}`);
