@@ -1,10 +1,22 @@
 import axios, { AxiosHeaders } from 'axios';
 import { wrapper } from 'axios-cookiejar-support';
+import { randomUUID } from 'crypto'; // <--- AGREGADO AQUÍ
 import { CookieJar } from 'tough-cookie';
+import FormData from 'form-data'; // <--- ASEGURATE DE TENER ESTA LIBRERÍA INSTALADA: npm install form-data
 import { AppDataSource } from '../datasource';
 import { Client } from '../models/Client';
 import { WISPHUB } from '../config';
 import { parseRaw, asString, asDateString, stripHtml } from './rawParser';
+
+// --- UTILIDADES DE FECHA ---
+
+/** Formatea una fecha JS a DD/MM/YYYY (Formato requerido por Geonet) */
+function formatDateCL(date: Date): string {
+  const day = String(date.getDate()).padStart(2, '0');
+  const month = String(date.getMonth() + 1).padStart(2, '0'); // Los meses en JS son 0-11
+  const year = date.getFullYear();
+  return `${day}/${month}/${year}`;
+}
 
 // --- CONFIGURACIÓN WISPHUB (API REST) ---
 
@@ -39,7 +51,7 @@ const geonetHttp = wrapper(axios.create({
   baseURL: 'https://admin.geonet.cl',
   jar,
   withCredentials: true,
-  timeout: 20000,
+  timeout: 60000, // Timeout extendido para manejar payloads grandes HTML
   headers: {
     'Referer': 'https://admin.geonet.cl/accounts/login/?next=/panel/',
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -66,6 +78,12 @@ export type WisphubClientListItem = {
   [key: string]: any;
 };
 
+// Tipo para devolver los datos extraídos del contrato
+export type ContractData = {
+  csrfToken: string;
+  htmlContent: string;
+};
+
 let lastFullSyncAt: Date | null = null;
 
 export function getLastFullSyncAt() {
@@ -73,6 +91,20 @@ export function getLastFullSyncAt() {
 }
 
 // --- FUNCIONES GEONET ---
+
+/** Helper para extraer token CSRF del HTML */
+function extractCsrfToken(html: string): string | null {
+  const match = html.match(/name=['"]csrfmiddlewaretoken['"]\s+value=['"]([^'"]+)['"]/);
+  return match ? match[1] : null;
+}
+
+/** Helper para extraer el contenido HTML del Textarea del contrato */
+function extractContractHtml(html: string): string | null {
+  // Busca el contenido entre <textarea ... name="contrato-contenido" ...> y </textarea>
+  // [\s\S]*? captura todo (incluyendo saltos de linea) de forma no codiciosa
+  const match = html.match(/<textarea[^>]*name="contrato-contenido"[^>]*>([\s\S]*?)<\/textarea>/i);
+  return match ? match[1] : null;
+}
 
 /**
  * Realiza el login en Geonet gestionando CSRF y Cookies automáticamente
@@ -108,7 +140,133 @@ export async function authenticateGeonet(): Promise<boolean> {
 }
 
 /**
- * Descarga el contrato de una instalación específica
+ * 1. Obtiene el HTML de la página, extrae el CSRF Token y el HTML actual del contrato.
+ */
+export async function getContractDataGeonet(instalacionId: number | string): Promise<ContractData | null> {
+  try {
+    const url = `/instalaciones/agregar-contrato/${instalacionId}/`;
+    const response = await geonetHttp.get(url);
+    const html = response.data;
+
+    let csrfToken = extractCsrfToken(html);
+    
+    // Fallback: si no está en el HTML, buscar en las cookies de la sesión
+    if (!csrfToken) {
+      const cookies = await jar.getCookies('https://admin.geonet.cl');
+      csrfToken = cookies.find(c => c.key === 'csrftoken')?.value || null;
+    }
+
+    const htmlContent = extractContractHtml(html);
+
+    if (!csrfToken) {
+        console.error(`No se encontró token CSRF para instalación ${instalacionId}`);
+        return null;
+    }
+
+    if (!htmlContent) {
+        console.error(`No se encontró contenido HTML del contrato para instalación ${instalacionId}`);
+        return null;
+    }
+
+    return { csrfToken, htmlContent };
+
+  } catch (error: any) {
+    console.error(`Error obteniendo datos del contrato ${instalacionId}:`, error.message);
+    return null;
+  }
+}
+
+/**
+ * 2. Guarda el contrato usando las fechas dinámicas (Hoy -> 1 Año) y el HTML extraído.
+ */
+export async function saveContractGeonet(
+  instalacionId: number | string,
+  csrfToken: string,
+  contractHtml: string
+): Promise<boolean> {
+  try {
+    // Calcular fechas dinámicas
+    const now = new Date();
+    const nextYear = new Date();
+    nextYear.setFullYear(now.getFullYear() + 1);
+
+    const fechaInicio = formatDateCL(now);      // Ej: 28/01/2026
+    const fechaFinal = formatDateCL(nextYear);  // Ej: 28/01/2027
+
+    console.log(`Guardando contrato ID: ${instalacionId} | Inicio: ${fechaInicio} | Fin: ${fechaFinal}`);
+
+    const url = `/instalaciones/agregar-contrato/${instalacionId}/`;
+    const form = new FormData();
+
+    // Campos de texto y HTML
+    form.append('csrfmiddlewaretoken', csrfToken);
+    form.append('contrato-fecha_inicio', fechaInicio);
+    form.append('contrato-fecha_final', fechaFinal);
+    form.append('contrato-contenido', contractHtml); // HTML original extraído
+    form.append('contrato-firma', '');
+    
+    // Campos ocultos requeridos por Django Formsets
+    form.append('form-TOTAL_FORMS', '1');
+    form.append('form-INITIAL_FORMS', '0');
+    form.append('form-MIN_NUM_FORMS', '0');
+    form.append('form-MAX_NUM_FORMS', '1000');
+    form.append('form-0-titulo', '');
+    form.append('form-0-descripcion', '');
+    form.append('guardar_contrato', ''); 
+
+    // Simulación de archivos vacíos requeridos para Multipart
+    // Django espera un archivo o un campo vacío pero con estructura de archivo
+    const emptyFileOptions = { filename: '', contentType: 'application/octet-stream' };
+    form.append('archivo', '', emptyFileOptions);
+    form.append('form-0-archivo', '', emptyFileOptions);
+
+    // Envío del POST
+    const response = await geonetHttp.post(url, form, {
+      headers: {
+        ...form.getHeaders(), // Genera headers multipart/form-data con boundary correctos
+        'Referer': `https://admin.geonet.cl${url}`
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity
+    });
+
+    // Django redirige (302) al éxito, Axios sigue la redirección y devuelve 200 de la página destino
+    if (response.status === 200 || response.status === 302) {
+      console.log(`✅ Contrato guardado exitosamente para instalación ${instalacionId}`);
+      return true;
+    }
+    
+    console.warn(`⚠️ Guardado de contrato respondió status: ${response.status}`);
+    return false;
+
+  } catch (error: any) {
+    console.error(`❌ Error guardando contrato para ${instalacionId}:`, error.message);
+    if (axios.isAxiosError(error) && error.response) {
+      console.error('Detalle error servidor:', error.response.status);
+    }
+    return false;
+  }
+}
+
+/**
+ * Función Principal Wrapper: Ejecuta todo el flujo (Auth -> Get -> Post)
+ */
+export async function processContractUpdate(instalacionId: number | string): Promise<boolean> {
+    console.log(`Iniciando proceso de renovación de contrato para: ${instalacionId}`);
+    
+    const auth = await authenticateGeonet();
+    if (!auth) return false;
+
+    // Obtener HTML actual y Token
+    const contractData = await getContractDataGeonet(instalacionId);
+    if (!contractData) return false;
+
+    // Guardar con nuevas fechas
+    return await saveContractGeonet(instalacionId, contractData.csrfToken, contractData.htmlContent);
+}
+
+/**
+ * Descarga el contrato de una instalación específica (PDF)
  */
 export async function downloadContratoGeonet(instalacionId: number | string): Promise<Buffer> {
   try {
@@ -124,16 +282,13 @@ export async function downloadContratoGeonet(instalacionId: number | string): Pr
 }
 
 /**
- * Activa una instalación específica mediante una petición POST
- * @param instalacionId ID numérico de la instalación (ej: 1179)
- * @param usuarioInstalacion El string del usuario (ej: '1179@geonet')
+ * Activa una instalación específica
  */
 export async function activarInstalacionGeonet(
   instalacionId: number | string, 
   usuarioInstalacion: string
 ): Promise<boolean> {
   try {
-    // Obtenemos el token CSRF actual de la jarra de cookies
     const cookies = await jar.getCookies('https://admin.geonet.cl');
     const csrfToken = cookies.find(c => c.key === 'csrftoken')?.value;
 
@@ -275,7 +430,309 @@ export async function refreshClientsByTerm(term: string): Promise<number> {
   }
   return upsertClients([...seen.values()]);
 }
+/**
+ * Obtiene el link de autologin para el contrato desde el panel de clientes.
+ * Scrapea el href del botón con id="auto-login".
+ * * @param usuarioInstalacion El nombre de usuario técnico (ej: "1193_jorge@geonet")
+ * @param instalacionId El ID numérico de la instalación (ej: 1193)
+ */
+/**
+ * Obtiene el enlace "Ir al link del contrato" (Auto-Login) del panel de clientes.
+ * Busca específicamente el href del botón con id='auto-login'.
+ */
+export async function getAutoLoginContractLink(
+  usuarioInstalacion: string, 
+  instalacionId: number | string
+): Promise<string | null> {
+  try {
+    // 1. URL donde está el botón (Petición GET)
+    const url = `/clientes/generar-link-contrato/${usuarioInstalacion}/${instalacionId}/`;
+    
+    // 2. Realizamos el GET (Cookies de sesión se envían solas)
+    const response = await geonetHttp.get(url);
+    const html = response.data;
 
+    // 3. EXTRACCIÓN CON REGEX
+    // Explicación del Regex: /href="([^"]+)"\s+id='auto-login'/
+    // - href="        : Busca literalmente el texto href="
+    // - ([^"]+)       : Captura todo lo que NO sea comillas dobles (aquí está tu URL larga)
+    // - "\s+          : Busca el cierre de comillas y un espacio
+    // - id='auto-login': Se asegura que sea ESTE botón y no otro
+  const regex = /<a\b[^>]*?href="([^"]+)"[^>]*?id=['"]auto-login['"]/;
+    const match = html.match(regex);
+
+    if (match && match[1]) {
+      const link = match[1];
+      console.log(`✅ Link de contrato extraído exitosamente para ${usuarioInstalacion}`);
+      return link; // Retorna la URL larga (https://clientes.portalinternet.app/login-panel/...)
+    }
+
+    console.warn(`⚠️ No se encontró el botón 'auto-login' para ${usuarioInstalacion}`);
+    return null;
+
+  } catch (error: any) {
+    console.error(`❌ Error obteniendo link contrato ${usuarioInstalacion}:`, error.message);
+    return null;
+  }
+}
+
+// --- CONFIGURACIÓN DE MODELOS ONU ---
+
+// Mapeo de 'Nombre Modelo' -> 'ID Producto Geonet (dwifi-producto)'
+// Actualiza estos IDs según los que tengas en tu sistema Geonet (Inspeccionar elemento en el <select> del HTML)
+const MODEL_MAP: Record<string, string> = {
+  'ZXHN F600P': '10008',       // ID extraído de tu ejemplo curl
+  'ZK9014W': '33070',    // Ejemplo: ajusta esto con el ID real
+  'RX8414C6E': '31162',
+  'HG15 AX1500': '29374',
+  'ZX8404DW': '13899',
+  'ZX8202DW': '9723',
+  'DEFAULT': '10008'    // Fallback por defecto
+};
+/**
+ * Registra una nueva ONU en el inventario de Geonet.
+ * Si no hay sesión activa, intenta loguearse automáticamente.
+ * * @param model - El modelo de la ONU (ej: 'ZTE', 'Huawei'). Debe existir en MODEL_MAP.
+ * @param sn - El número de serie (ej: 'ZTEGDACC6FF4').
+ * @param mac - (Opcional) La dirección MAC. Si no se envía, se manda vacía.
+ */
+export async function registrarOnuGeonet(model: string, sn: string, mac: string = ''): Promise<boolean> {
+  const BASE_URL = 'https://admin.geonet.cl';
+
+  // --- HELPER PARA OBTENER TOKEN ---
+  const getLocalToken = async () => {
+    const cookies = await jar.getCookies(BASE_URL);
+    return cookies.find(c => c.key === 'csrftoken')?.value;
+  };
+
+  try {
+    // 1. INTENTO DE OBTENER TOKEN
+    let csrfToken = await getLocalToken();
+
+    // 2. SI NO HAY TOKEN, AUTENTICARSE
+    if (!csrfToken) {
+      console.log('⚠️ No se detectó sesión activa. Iniciando auto-login en Geonet...');
+      const loggedIn = await authenticateGeonet();
+      
+      if (!loggedIn) {
+        console.error('❌ Falló el auto-login. No se puede registrar la ONU.');
+        return false;
+      }
+
+      // Re-intentar obtener el token después del login
+      csrfToken = await getLocalToken();
+    }
+
+    // Si aún así no hay token, abortar
+    if (!csrfToken) {
+      console.error('❌ Error crítico: Se realizó login pero no se obtuvo CSRF Token.');
+      return false;
+    }
+
+    // 3. PREPARAR DATOS
+    const productId = MODEL_MAP[model.toUpperCase()] || MODEL_MAP['DEFAULT'];
+    console.log(`Registrando ONU | Modelo: ${model} (ID: ${productId}) | SN: ${sn}`);
+
+    const params = new URLSearchParams();
+    params.append('csrfmiddlewaretoken', csrfToken);
+    params.append('dwifi-producto', productId); 
+    params.append('dwifi-sucursal', '607');
+    params.append('dwifi-proveedor', '1944');
+    params.append('form-TOTAL_FORMS', '1');
+    params.append('form-INITIAL_FORMS', '0');
+    params.append('form-MIN_NUM_FORMS', '1');
+    params.append('form-MAX_NUM_FORMS', '1000');
+    params.append('form-0-num_serie', sn);
+    params.append('form-0-mac', mac);
+
+    // 4. ENVIAR PETICIÓN
+    const response = await geonetHttp.post(
+      '/productos-wifi/agregar/', 
+      params, 
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Referer': `${BASE_URL}/productos-wifi/agregar/`,
+          'X-CSRFToken': csrfToken
+        }
+      }
+    );
+
+    // 5. VERIFICAR SI LA SESIÓN EXPIRÓ DURANTE EL POST
+    // A veces tenemos token, pero es viejo. Geonet redirige al login (status 200, pero URL cambia a /login/)
+    const finalUrl = response.request.res.responseUrl || '';
+    if (finalUrl.includes('/accounts/login/')) {
+       console.warn('⚠️ La sesión expiró durante la petición. Re-intentando operación una vez más...');
+       
+       // Forzamos re-login
+       await authenticateGeonet(); 
+       
+       // Llamada recursiva (solo un nivel de profundidad para evitar bucles infinitos)
+       // Nota: Esto es seguro porque authenticateGeonet renueva las cookies en el 'jar' global
+       return await registrarOnuGeonet(model, sn, mac);
+    }
+
+    // 6. VALIDAR ÉXITO
+    if (response.status === 200 && !finalUrl.includes('agregar')) {
+        console.log(`✅ ONU Registrada exitosamente: ${sn}`);
+        return true;
+    } else if (response.status === 200 && finalUrl.includes('agregar')) {
+        console.warn(`⚠️ Posible error de validación (SN duplicado o datos incorrectos) para ${sn}.`);
+        return false;
+    }
+
+    return true;
+
+  } catch (error: any) {
+    console.error(`❌ Error registrando ONU ${sn}:`, error.message);
+    return false;
+  }
+}
+
+
+/**
+ * Asigna un artículo (ONU/Equipo) directamente a la ficha de un cliente en Geonet.
+ * URL Base: /clientes/agregar-articulos/{slug}/{id}/
+ * * @param clienteId - El ID numérico del cliente (ej: 1195)
+ * @param clienteUsuario - El usuario del cliente (ej: "jorge@geonet") para construir el slug.
+ * @param numSerie - El número de serie del equipo.
+ * @param mac - (Opcional) La MAC del equipo.
+ */
+// Definimos una interfaz básica para la respuesta del inventario
+interface ArticuloInventario {
+  value: string;      // Este es el UUID
+  label: string;      // Nombre del producto
+  num_serie: string;  // Número de serie
+  mac?: string;       // MAC address (a veces viene nula)
+  categoria: string;
+}
+
+export async function agregarArticuloACliente(
+  clienteId: number | string,
+  clienteUsuario: string,
+  numSerie: string,
+  mac: string = '',
+  categoria: string = 'Productos Wifi'
+): Promise<boolean> {
+  
+  console.log(`Iniciando proceso para agregar artículo a cliente ${clienteId}... Usuario: ${clienteUsuario} | Serie: ${numSerie}`);
+  
+  const targetUrl = `/clientes/agregar-articulos/${clienteUsuario}/${clienteId}/`;
+  const inventoryUrl = '/autocomplete-almacen/?exclude_services'; // URL para buscar el UUID
+  const refererUrl = `https://admin.geonet.cl${targetUrl}`;
+
+  try {
+    // --------------------------------------------------------------------------------
+    // 1. y 2. GESTIÓN DE AUTENTICACIÓN Y CSRF (Igual que tu código original)
+    // --------------------------------------------------------------------------------
+    const cookies = await jar.getCookies('https://admin.geonet.cl');
+    let csrfToken = cookies.find(c => c.key === 'csrftoken')?.value;
+
+    if (!csrfToken) {
+      console.log('⚠️ Sin sesión para agregar artículo. Intentando login...');
+      const logged = await authenticateGeonet(); // Asumo que esta función existe en tu entorno
+      if (!logged) return false;
+      const newCookies = await jar.getCookies('https://admin.geonet.cl');
+      csrfToken = newCookies.find(c => c.key === 'csrftoken')?.value;
+    }
+
+    if (!csrfToken) {
+      console.error('❌ Error: No se pudo obtener CSRF Token.');
+      return false;
+    }
+
+    // --------------------------------------------------------------------------------
+    // 2.5. OBTENER EL UUID REAL DEL ALMACÉN (NUEVO PASO CRÍTICO)
+    // --------------------------------------------------------------------------------
+    console.log(`🔍 Buscando UUID para el número de serie: ${numSerie}...`);
+    
+    // Hacemos la petición GET al inventario
+    const inventoryResponse = await geonetHttp.get<ArticuloInventario[]>(inventoryUrl, {
+      headers: {
+        'Referer': refererUrl, // Importante para que el servidor sepa de dónde venimos
+        'X-CSRFToken': csrfToken
+      }
+    });
+
+    // Buscamos el objeto que coincida con el número de serie
+    const articuloEncontrado = inventoryResponse.data.find(
+      (item) => item.num_serie && item.num_serie.trim() === numSerie.trim()
+    );
+
+    if (!articuloEncontrado) {
+      console.error(`❌ Error: El equipo con serie "${numSerie}" no se encuentra en el Almacén (o ya fue asignado).`);
+      return false; 
+    }
+
+    const uuidReal = articuloEncontrado.value; // 'value' contiene el UUID en la respuesta de Geonet
+    console.log(`✅ Equipo encontrado. UUID: ${uuidReal}`);
+
+    // --------------------------------------------------------------------------------
+    // 3. PREPARAR EL PAYLOAD (Formulario)
+    // --------------------------------------------------------------------------------
+    const form = new URLSearchParams();
+    form.append('csrfmiddlewaretoken', csrfToken);
+    
+    form.append('form-TOTAL_FORMS', '1');
+    form.append('form-INITIAL_FORMS', '0');
+    form.append('form-MIN_NUM_FORMS', '1');
+    form.append('form-MAX_NUM_FORMS', '1000');
+    
+    // DATOS DINÁMICOS OBTENIDOS
+    form.append('form-0-uuid', uuidReal); // <--- AQUI USAMOS EL UUID REAL
+    form.append('form-0-categoria', categoria);
+    form.append('form-0-num_serie', numSerie);
+    
+    // Si no pasaste MAC en la función, intentamos usar la que viene del inventario, o vacía.
+    const macFinal = mac || articuloEncontrado.mac || ''; 
+    form.append('form-0-mac', macFinal);
+    
+    form.append('form-0-cantidad', '1');
+    form.append('form-0-accion_equipo', '0'); 
+    form.append('form-0-comentario', 'Asignado via Bot');
+
+    // --------------------------------------------------------------------------------
+    // 4. ENVIAR PETICIÓN POST
+    // --------------------------------------------------------------------------------
+    console.log(`🚀 Asignando artículo ${numSerie} (UUID: ${uuidReal}) a cliente...`);
+
+    const response = await geonetHttp.post(targetUrl, form, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': refererUrl,
+        'X-CSRFToken': csrfToken,
+        'Origin': 'https://admin.geonet.cl'
+      },
+      // Evitamos que axios siga el redirect automáticamente para poder analizar la URL de respuesta
+      maxRedirects: 5 
+    });
+
+    // --------------------------------------------------------------------------------
+    // 5. VALIDAR RESPUESTA
+    // --------------------------------------------------------------------------------
+    const finalUrl = response.request.res.responseUrl || '';
+    
+    // En Django/WispHub, si hay éxito suele redirigir a la lista de clientes o al perfil (/clientes/1195/...)
+    // Si falla, suele devolver 200 OK pero manteniéndose en la misma URL de 'agregar-articulos' pintando el error en HTML.
+    
+    if (response.status === 200 && !finalUrl.includes('agregar-articulos')) {
+      console.log(`✅ ÉXITO: Artículo agregado. Redirigido a: ${finalUrl}`);
+      return true;
+    } else {
+      // Si quieres depurar, podrías imprimir response.data para ver qué error muestra el HTML
+      console.warn(`⚠️ FALLO: El servidor no realizó la asignación. URL final: ${finalUrl}`);
+      return false;
+    }
+
+  } catch (error: any) {
+    console.error(`❌ Excepción crítica al agregar artículo:`, error.message);
+    if (error.response) {
+        console.error('Status:', error.response.status);
+        console.error('Data:', error.response.data); // Útil para ver si el servidor devolvió un error específico
+    }
+    return false;
+  }
+}
 export async function searchLocal(term: string, limit = 50) {
   const repo = AppDataSource.getRepository(Client);
   return repo.createQueryBuilder('c')
@@ -293,3 +750,5 @@ export async function searchLocal(term: string, limit = 50) {
     .limit(limit)
     .getMany();
 }
+
+

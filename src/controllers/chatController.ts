@@ -11,7 +11,11 @@ import {
   searchLocal, 
   refreshClientsByTerm, 
   fullSyncClients, 
-  activarInstalacionGeonet // <--- 1. NUEVA IMPORTACIÓN
+  activarInstalacionGeonet,
+  processContractUpdate,
+  getAutoLoginContractLink,
+  registrarOnuGeonet,
+  agregarArticuloACliente
 } from '../services/wisphubClient';
 import { searchLocalInstallations, refreshInstallationsByTerm, listPendingLocalInstallations, fullSyncInstallations } from '../services/wisphubInstallations';
 import {
@@ -22,6 +26,7 @@ import {
   updateOnuWifi,
   getInternalOnuIdBySn
 } from '../services/smartoltClient';
+import { url } from 'inspector';
 
 // --- HELPERS: Caching & Utils ---
 
@@ -91,7 +96,7 @@ function pickFirstString(values: Array<any>): string | undefined {
 function defaultsFromEntity(entity: any, type: 'client' | 'installation'): Record<string, any> {
     const isInst = type === 'installation';
     
-    // CAMBIO SOLICITADO: Priorizar 'servicio' (nombre del plan) para el campo name
+    // Priorizar 'servicio' (nombre del plan) para el campo name
     const plan = entity.servicio || entity.plan_internet;
     const clientName = `${entity.nombre || ''} ${entity.apellidos || ''}`.trim();
 
@@ -461,7 +466,7 @@ export async function respond(req: any, res: any) {
     // 1. PRIORIDAD ALTA: Comandos Específicos (WiFi, Auth)
     // ------------------------------------------------------------------
 
-    // --- 2. LÓGICA ACTIVAR WISPHUB (NUEVO) ---
+    // --- 2. LÓGICA ACTIVAR WISPHUB ---
     if (lower.startsWith('wisphub activate')) {
       const idMatch = prompt.match(/activate\s+(\d+)/i);
       const targetId = idMatch ? idMatch[1] : null;
@@ -514,7 +519,7 @@ export async function respond(req: any, res: any) {
                     }
                     // 5GHz
                     try {
-                        await updateOnuWifi(internalId, '5GHz', ssid, pass, true);
+                        await updateOnuWifi(internalId, '5GHz', `${ssid}_5G`, pass, true);
                         results.push('✅ 5GHz Configurado');
                     } catch (e: any) {
                         results.push(`⚠️ 5GHz: ${e.message || 'No disponible'}`);
@@ -532,16 +537,11 @@ export async function respond(req: any, res: any) {
                         actionsOut.push(
                             { 
                                 id: 'btn-contrato', 
-                                type: 'link', 
-                                label: '📄 Descargar Contrato', 
-                                url: `/chat/downloads/contract/${targetId}` 
-                            },
-                            { 
-                                id: 'btn-activar-wisphub', // <--- BOTÓN ACTIVAR
                                 type: 'button', 
-                                label: '🚀 Activar en WispHub', 
-                                payload: `wisphub activate ${targetId}` 
-                            }
+                                label: '📄 Generar Contrato', 
+                                payload: `generar contrato ${targetId}` 
+                            },
+
                         );
                         finalContent += `\n\n👇 Acciones post-instalación para ID ${targetId}:`;
                     } else {
@@ -556,6 +556,43 @@ export async function respond(req: any, res: any) {
             finalContent = '⚠️ Error de formato WiFi. Intente de nuevo.';
         }
     }
+    else if (lower.startsWith('generar contrato')) {
+      const idMatch = prompt.match(/generar contrato\s+(\d+)/i);
+      const targetId = idMatch ? idMatch[1] : null;
+      if (targetId) {
+          finalContent = `📄 Generando contrato para ID **${targetId}**...`;
+          const contractUrl = `/chat/downloads/contract/${targetId}`;
+          processContractUpdate(targetId).catch(err => {
+              console.error('Error generating contract:', err);
+          });
+          const baseName = session.lastAuthNameUsed || targetId;
+
+          let contratourl=  await getAutoLoginContractLink(`${baseName}@geonet`, targetId);
+
+          
+          finalContent = `✅ Contrato generado:`;
+          const directActions: any[] = [];
+             directActions.push(
+                { 
+                    id: 'btn-contrato', 
+                    type: 'link', 
+                    label: '📄 copiar Contrato', 
+                    url: `${contratourl}` 
+                },
+                { 
+                    id: 'btn-activar-wisphub', 
+                    type: 'button', 
+                    label: '🚀 Activar en WispHub', 
+                    payload: `wisphub activate ${targetId}` 
+                });
+          actionsOut = directActions;
+      } else {
+          finalContent = '⚠️ Error: No se detectó ID para generar contrato.';
+      }
+
+
+    }
+ 
     // --- LÓGICA AUTH SUBMIT ---
     else if (lower === 'auth submit') {
         if (!session.pendingAuth) finalContent = 'No hay autorización en curso.';
@@ -714,7 +751,7 @@ export async function respond(req: any, res: any) {
 
 // --- LOGIC: Post-Auth Actions (Location + WAN + WiFi Form) ---
 
-async function processPostAuthActions(data: any) {
+async function processPostAuthActions(data: any, targetId?: string | number) {
     const messages = ['✅ ONU Autorizada.'];
     const onuId = data.onu_external_id;
 
@@ -747,15 +784,49 @@ async function processPostAuthActions(data: any) {
     } else {
         messages.push('⚠️ Falta IP para WAN.');
     }
+    await registrarOnuGeonet(data.onu_type, onuId);
+    let clientid = targetId;
+    if (!clientid) {
+        const session = data._session || {};
+        clientid = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
+    }
+    console.log('Client ID for adding article:', clientid);
+    if (clientid !== undefined) {
+        await agregarArticuloACliente(clientid, `${data.name}@geonet` || '', onuId); 
+    }
 
-    // 3. WIFI FORM
-    const wifiActions = [
-        { id: 'wifi_ssid', type: 'input', label: 'Nombre WiFi (SSID)', placeholder: 'Nuevo Nombre', payload: 'wifi set ssid {input}' },
-        { id: 'wifi_pass', type: 'input', label: 'Contraseña WiFi', placeholder: 'Nueva Clave (min 8)', payload: 'wifi set pass {input}' },
-        { id: 'wifi_submit', type: 'button', label: 'Aplicar Cambios WiFi', payload: `wifi apply sn ${onuId} ssid {wifi_ssid} pass {wifi_pass}` }
-    ];
+    // --- 3. LOGICA CONDICIONAL (WIFI vs BOTONES DIRECTOS) ---
+    const rawType = String(data.onu_type || '').toUpperCase().replace(/[- ]/g, '');
+    const wifiModels = ['ZTEF6600P', 'ZXHNF600P']; // Modelos que SÍ requieren WiFi manual
 
-    return { message: messages.join(' '), actions: wifiActions };
+    // Si ES uno de los modelos WiFi, mostramos el formulario
+    if (wifiModels.includes(rawType)) {
+        const wifiActions = [
+            { id: 'wifi_ssid', type: 'input', label: 'Nombre WiFi (SSID)', placeholder: 'Nuevo Nombre', payload: 'wifi set ssid {input}' },
+            { id: 'wifi_pass', type: 'input', label: 'Contraseña WiFi', placeholder: 'Nueva Clave (min 8)', payload: 'wifi set pass {input}' },
+            { id: 'wifi_submit', type: 'button', label: 'Aplicar Cambios WiFi', payload: `wifi apply sn ${onuId} ssid {wifi_ssid} pass {wifi_pass}` }
+        ];
+        return { message: messages.join(' '), actions: wifiActions };
+    } 
+    // Si NO es de esos modelos, vamos directo a Contrato y Activar
+    else {
+        const directActions: any[] = [];
+        if (targetId) {
+             directActions.push(
+                { 
+                    id: 'btn-contrato', 
+                    type: 'button', 
+                    label: '📄 Generar Contrato', 
+                    payload: `generar contrato ${targetId}` 
+                },
+            );
+            messages.push(`\n\n👇 **Proceso finalizado.** Selecciona una acción:`);
+        } else {
+            messages.push('\n(⚠️ No se detectó ID asociado para generar contrato)');
+        }
+        
+        return { message: messages.join(' '), actions: directActions };
+    }
 }
 
 export async function submitAuth(req: any, res: any) {
@@ -766,10 +837,11 @@ export async function submitAuth(req: any, res: any) {
     const merged = { ...state.defaults, ...state.collected, ...req.body, ...req.body.collected };
 
     // --- 4. CAMBIO CRÍTICO: GUARDAR EL NOMBRE PARA GEONET ---
-    // Guardamos el nombre (ej: 1193_jorge) para usarlo luego en Geonet
     session.lastAuthNameUsed = merged.name || state.defaults?.name;
-    // --------------------------------------------------------
     
+    // Recuperamos el ID del cliente/instalación de la sesión para pasarlo a processPostAuthActions
+    const targetId = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
+
     const finalAddress = req.body.address || req.body.collected?.address || merged.address || merged.address_or_comment || merged.direccion || 'Sin dirección';
     let cleanVlan = merged.vlan;
     if (cleanVlan && String(cleanVlan).includes('-')) cleanVlan = String(cleanVlan).split('-')[0].trim();
@@ -802,9 +874,10 @@ export async function submitAuth(req: any, res: any) {
 
         if (!success) throw new Error(result?.error || result?.message || 'SmartOLT rechazó la solicitud.');
 
+        // 2. PASAMOS targetId A LA FUNCIÓN DE POST-PROCESO
         const postResult = await processPostAuthActions({
             ...merged, onu_external_id: explicitSn, vlan: cleanVlan, address_or_comment: finalAddress, odb_port: cleanOdbPort
-        });
+        ,onu_type: merged.onu_type}, targetId);
 
         cacheDelete('listOlts');
         if (merged.olt_id) cacheDelete(`onus:${merged.olt_id}`);

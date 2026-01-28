@@ -27,7 +27,8 @@
     "reflect-metadata": "^0.1.13",
     "speakeasy": "^2.0.0",
     "tough-cookie": "^6.0.0",
-    "typeorm": "^0.3.28"
+    "typeorm": "^0.3.28",
+    "uuid": "^13.0.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
@@ -35,6 +36,7 @@
     "@types/express-session": "^1.17.10",
     "@types/node": "^22.9.0",
     "@types/nodemailer": "^7.0.5",
+    "@types/uuid": "^11.0.0",
     "tsx": "^4.7.1",
     "typescript": "^5.6.3"
   }
