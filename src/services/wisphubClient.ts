@@ -1,8 +1,12 @@
 import axios, { AxiosHeaders } from 'axios';
+import { wrapper } from 'axios-cookiejar-support';
+import { CookieJar } from 'tough-cookie';
 import { AppDataSource } from '../datasource';
 import { Client } from '../models/Client';
 import { WISPHUB } from '../config';
 import { parseRaw, asString, asDateString, stripHtml } from './rawParser';
+
+// --- CONFIGURACIÓN WISPHUB (API REST) ---
 
 const CLIENT_FIELD_BLACKLIST = new Set([
   'estado_instalacion','is_preinstallation','descuento','saldo','notificacion_sms','aviso_pantalla',
@@ -28,6 +32,22 @@ http.interceptors.request.use((config) => {
   return config;
 });
 
+// --- CONFIGURACIÓN GEONET (Web Scraping / Session) ---
+
+const jar = new CookieJar();
+const geonetHttp = wrapper(axios.create({
+  baseURL: 'https://admin.geonet.cl',
+  jar,
+  withCredentials: true,
+  timeout: 20000,
+  headers: {
+    'Referer': 'https://admin.geonet.cl/accounts/login/?next=/panel/',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+  }
+}));
+
+// --- TIPOS Y ESTADO ---
+
 export type WisphubClientListItem = {
   id_servicio: number;
   usuario?: string;
@@ -52,10 +72,99 @@ export function getLastFullSyncAt() {
   return lastFullSyncAt;
 }
 
+// --- FUNCIONES GEONET ---
+
+/**
+ * Realiza el login en Geonet gestionando CSRF y Cookies automáticamente
+ */
+export async function authenticateGeonet(): Promise<boolean> {
+  try {
+    // 1. Obtener cookie inicial CSRF visitando el login
+    await geonetHttp.get('/accounts/login/');
+
+    const cookies = await jar.getCookies('https://admin.geonet.cl');
+    const csrfToken = cookies.find(c => c.key === 'csrftoken')?.value;
+
+    if (!csrfToken) {
+      throw new Error('No se pudo obtener el token CSRF de Geonet');
+    }
+
+    // 2. Enviar credenciales
+    const params = new URLSearchParams();
+    params.append('csrfmiddlewaretoken', csrfToken);
+    params.append('login', 'Jorgeprac@geonet'); 
+    params.append('password', 'JorgePrac');      
+    params.append('next', '/panel/');
+    params.append('remember', '1');
+
+    await geonetHttp.post('/accounts/login/', params);
+    
+    console.log('Autenticación exitosa en Geonet');
+    return true;
+  } catch (error: any) {
+    console.error('Error autenticando en Geonet:', error.message);
+    return false;
+  }
+}
+
+/**
+ * Descarga el contrato de una instalación específica
+ */
+export async function downloadContratoGeonet(instalacionId: number | string): Promise<Buffer> {
+  try {
+    const response = await geonetHttp.get(`/instalaciones/imprimir-contrato/${instalacionId}/`, {
+      responseType: 'arraybuffer'
+    });
+    
+    return Buffer.from(response.data);
+  } catch (error: any) {
+    console.error(`Error al descargar contrato ${instalacionId}:`, error.message);
+    throw error;
+  }
+}
+
+/**
+ * Activa una instalación específica mediante una petición POST
+ * @param instalacionId ID numérico de la instalación (ej: 1179)
+ * @param usuarioInstalacion El string del usuario (ej: '1179@geonet')
+ */
+export async function activarInstalacionGeonet(
+  instalacionId: number | string, 
+  usuarioInstalacion: string
+): Promise<boolean> {
+  try {
+    // Obtenemos el token CSRF actual de la jarra de cookies
+    const cookies = await jar.getCookies('https://admin.geonet.cl');
+    const csrfToken = cookies.find(c => c.key === 'csrftoken')?.value;
+
+    const params = new URLSearchParams();
+    params.append('csrfmiddlewaretoken', csrfToken || '');
+    params.append('edit_facturacion', '0');
+
+    const response = await geonetHttp.post(
+      `/Instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`,
+      params,
+      {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Referer': `https://admin.geonet.cl/Instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`,
+        }
+      }
+    );
+
+    console.log(`Petición de activación enviada para ${instalacionId}. Status: ${response.status}`);
+    return response.status === 200;
+  } catch (error: any) {
+    console.error(`Error al activar instalación ${instalacionId}:`, error.message);
+    return false;
+  }
+}
+
+// --- FUNCIONES WISPHUB ---
+
 export async function checkHealth(): Promise<{ ok: boolean; latencyMs?: number; error?: string }>{
   const start = Date.now();
   try {
-    // Perform a lightweight request to validate auth & connectivity
     await http.get('/api/clientes/', { params: { limit: 1, offset: 0 } });
     return { ok: true, latencyMs: Date.now() - start };
   } catch (err: any) {
@@ -84,12 +193,11 @@ function mapToEntity(item: WisphubClientListItem): Client {
   entity.sn_onu = item.sn_onu ?? null;
   entity.mac_cpe = item.mac_cpe ?? null;
   entity.estado = (typeof item.estado === 'number' ? String(item.estado) : item.estado) ?? null;
-  // Do not persist installation-specific/temporary flags into client table
-  // Store full raw payload for completeness
-  // Parse raw with helper to normalize values
+
   const rawObj = parseRaw(item);
   entity.raw = rawObj;
-  // Map common fields using parser helpers (skip blacklisted keys)
+
+  // Mapeo selectivo por campos con blacklist
   if (!CLIENT_FIELD_BLACKLIST.has('email_cc')) entity.email_cc = asString(rawObj, 'email_cc') ?? null;
   if (!CLIENT_FIELD_BLACKLIST.has('razon_social')) entity.razon_social = asString(rawObj, 'razon_social') ?? null;
   if (!CLIENT_FIELD_BLACKLIST.has('tipo_persona')) entity.tipo_persona = asString(rawObj, 'tipo_persona') ?? null;
@@ -107,12 +215,12 @@ function mapToEntity(item: WisphubClientListItem): Client {
   if (!CLIENT_FIELD_BLACKLIST.has('fecha_cancelacion')) entity.fecha_cancelacion = asDateString(rawObj, 'fecha_cancelacion');
   if (!CLIENT_FIELD_BLACKLIST.has('fecha_corte')) entity.fecha_corte = asDateString(rawObj, 'fecha_corte');
   if (!CLIENT_FIELD_BLACKLIST.has('ultimo_cambio')) entity.ultimo_cambio = asDateString(rawObj, 'ultimo_cambio');
-  // Flatten nested objects for names
   if (!CLIENT_FIELD_BLACKLIST.has('plan_internet')) entity.plan_internet = asString(rawObj, 'plan_internet') ?? null;
   if (!CLIENT_FIELD_BLACKLIST.has('zona')) entity.zona = asString(rawObj, 'zona') ?? null;
   if (!CLIENT_FIELD_BLACKLIST.has('router')) entity.router = asString(rawObj, 'router') ?? null;
   if (!CLIENT_FIELD_BLACKLIST.has('sectorial')) entity.sectorial = asString(rawObj, 'sectorial') ?? null;
   if (!CLIENT_FIELD_BLACKLIST.has('tecnico')) entity.tecnico = asString(rawObj, 'tecnico') ?? null;
+
   entity.lastSyncedAt = new Date();
   return entity;
 }
@@ -121,7 +229,6 @@ export async function upsertClients(items: WisphubClientListItem[]): Promise<num
   if (!items.length) return 0;
   const repo = AppDataSource.getRepository(Client);
   const entities = items.map(mapToEntity);
-  // Save in chunks to avoid very large single query
   const CHUNK = 100;
   for (let i = 0; i < entities.length; i += CHUNK) {
     const slice = entities.slice(i, i + CHUNK);
@@ -144,11 +251,9 @@ export async function fullSyncClients(batchSize = 200, maxPages = 1000) {
   return { processed, lastFullSyncAt };
 }
 
-// Installations sync helper is now in a separate file. Export a thin proxy for convenience.
 export { fullSyncInstallations as _placeholder } from './wisphubInstallations';
 
 export async function refreshClientsByTerm(term: string): Promise<number> {
-  // Try a few common filters to minimize calls
   const filters: Record<string, string>[] = [
     { usuario__contains: term },
     { nombre__contains: term },
@@ -165,7 +270,7 @@ export async function refreshClientsByTerm(term: string): Promise<number> {
         seen.set(item.id_servicio, item);
       }
     } catch {
-      // ignore filter errors and continue
+      // ignorar errores de filtros individuales
     }
   }
   return upsertClients([...seen.values()]);

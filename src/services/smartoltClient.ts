@@ -169,6 +169,52 @@ async function get<T = any>(path: string) {
   });
   return res.data;
 }
+export async function getAllOnuTypes(): Promise<string[]> {
+  const url = `${baseUrl}/api/system/get_onu_types`;
+  const { data } = await axios.get(url, {
+    headers: { 'X-Token': SMARTOLT.apiKey || '' },
+  });
+  if (data && Array.isArray(data.response)) {
+    return data.response.map((t: any) => t.name || t.type || t).filter(Boolean);
+  }
+  return [];
+}
+export async function getAllZones(): Promise<string[]> {
+  const url = `${baseUrl}/api/system/get_zones`;
+  const { data } = await axios.get(url, {
+    headers: { 'X-Token': SMARTOLT.apiKey || '' },
+  });
+  if (data && Array.isArray(data.response)) {
+    return data.response.map((z: any) => z.name || z.id || z).filter(Boolean);
+  }
+  return [];
+}
+export interface OltVlan {
+  smartoltId: string;
+  vlan: string;
+  description: string;
+}
+
+export async function getVlansByOltId(
+  oltId: string | number
+): Promise<OltVlan[]> {
+  const url = `${baseUrl}/api/olt/get_vlans/${oltId}`;
+
+  const { data } = await axios.get(url, {
+    headers: { 'X-Token': SMARTOLT.apiKey || '' },
+  });
+
+  if (data && Array.isArray(data.response)) {
+    return data.response.map((v: any) => ({
+      smartoltId: String(v.id),
+      vlan: String(v.vlan),
+      description: v.description || '',
+    }));
+  }
+
+  return [];
+}
+
 
 // Algunos endpoints de SmartOLT rechazan GET con "Unknown method" y requieren POST.
 // Hacemos fallback automático a POST cuando vemos 405 o mensajes similares.
@@ -594,6 +640,162 @@ export async function getAvailablePortsForOdb(externalId: string | number): Prom
   }
 }
 
+/**
+ * Actualiza la configuración Wifi (SSID y Password) de una ONU.
+ * Utiliza Cookies de sesión ya que la API Key suele no tener permisos para este endpoint interno.
+ *
+ * @param onuId - ID interno de la ONU (ej. 1254)
+ * @param frequency - '2.4GHz' (Puerto 1) o '5GHz' (Puerto 5)
+ * @param ssid - Nuevo nombre de la red
+ * @param password - Nueva contraseña
+ * @param enable - (Opcional) Habilitar o deshabilitar el puerto. Por defecto true.
+ */
+export async function updateOnuWifi(
+  onuId: string | number,
+  frequency: '2.4GHz' | '5GHz',
+  ssid: string,
+  password: string,
+  enable: boolean = true
+) {
+  if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
+
+  // Mapeo de puertos según tu indicación: 1 para 2.4G, 5 para 5G
+  const wifiPortId = frequency === '5GHz' ? '104' : '100';
+
+  // Construcción del payload form-urlencoded
+  const form = new URLSearchParams();
+  form.append('onu_id', String(onuId));
+  form.append('wifi_port_id', wifiPortId);
+  form.append('wifi_port_is_enabled', enable ? '1' : '0');
+  form.append('wifi_port_mode', 'LAN'); // Modo estándar
+  form.append('ssid', ssid);
+  form.append('auth_mode', 'wpa2'); // WPA2 por defecto
+  form.append('wifi_password', password);
+  form.append('wifi_vlan_dhcp', 'No control'); // Valor por defecto del sistema
+
+  const endpoint = `${baseUrl}/api/onu/update_wifi_port`;
+
+  // Función interna para realizar la petición con manejo de cookies
+  const performRequest = async (forceCookie: boolean) => {
+    const cookie = await getSmartoltSessionCookie(forceCookie);
+    if (!cookie) throw new Error('No se pudo obtener la cookie de sesión de SmartOLT');
+
+    return axios.post(endpoint, form, {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Cookie': cookie,
+        'X-Requested-With': 'XMLHttpRequest', // Importante para endpoints internos
+        'X-Token': SMARTOLT.apiKey || '' // Enviamos también el token por si acaso
+      },
+      timeout: 20000
+    });
+  };
+
+  try {
+    // Intento 1: Usar cookie cacheada o generar una nueva si no existe
+    const res = await performRequest(false);
+    return res.data;
+  } catch (err: any) {
+    const status = err?.response?.status;
+    
+    // Si recibimos 403 Forbidden o 401 Unauthorized, es probable que la cookie haya caducado.
+    // Forzamos un re-login y reintentamos.
+    if (status === 403 || status === 401) {
+      console.warn('updateOnuWifi: Cookie expirada, regenerando sesión...');
+      const retryRes = await performRequest(true);
+      return retryRes.data;
+    }
+    
+    // Si es otro error, lo lanzamos
+    throw err;
+  }
+}
+
+export async function listAllUnconfiguredOnus(): Promise<any[]> {
+  const subdomain = process.env.SMARTOLT_BASE_URL;
+  const url = `${subdomain}api/onu/unconfigured_onus`;
+  const resp = await axios.get(url, {
+    headers: { 'X-Token': process.env.SMARTOLT_API_KEY }
+  });
+  // La respuesta suele estar en resp.data.data o resp.data
+  return resp.data?.data || resp.data || [];
+}
+/**
+ * Obtiene el ID numérico interno de la ONU buscando por su Serial Number (SN).
+ * Replica el comportamiento de curl + grep buscando el patrón "status_onu_{id}".
+ * @param sn - El número de serie de la ONU (ej. HWTC4411D498)
+ */
+export async function getInternalOnuIdBySn(sn: string): Promise<number | string | null> {
+  if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
+
+  // Endpoint interno usado en el panel web
+  const endpoint = `${baseUrl}/onu/get_configured_list`;
+
+  // Función auxiliar para realizar la petición (mismo manejo de cookies que antes)
+  const performRequest = async (forceCookie: boolean) => {
+    const cookie = await getSmartoltSessionCookie(forceCookie);
+    if (!cookie) throw new Error('No se pudo obtener la cookie de sesión de SmartOLT');
+
+    return axios.get(endpoint, {
+      params: {
+        free_text: sn // Parámetro de búsqueda
+      },
+      headers: {
+        'Cookie': cookie,
+        'X-Requested-With': 'XMLHttpRequest', // Requerido para que el backend responda correctamente
+        'X-Token': SMARTOLT.apiKey || '',
+        'Accept': 'application/json, text/plain, */*' // Aceptamos cualquier formato para poder hacer regex
+      },
+      timeout: 15000,
+      // Importante: No forzar JSON parse si la respuesta es HTML mezclado
+      transformResponse: [(data) => data] 
+    });
+  };
+
+  // Lógica de extracción (El equivalente a tu grep -oP "status_onu_\K\d+")
+  const extractId = (data: any): string | null => {
+    // Aseguramos que data sea string (axios puede haberlo parseado parcialmente si era JSON)
+    const stringData = typeof data === 'object' ? JSON.stringify(data) : String(data);
+    
+    // Buscamos el patrón status_onu_ seguido de dígitos
+    const match = stringData.match(/status_onu_(\d+)/);
+    
+    if (match && match[1]) {
+      return match[1]; // Retorna el grupo de captura (los dígitos)
+    }
+    return null;
+  };
+
+  try {
+    // Intento 1: Con cookie actual
+    const res = await performRequest(false);
+    const id = extractId(res.data);
+    
+    if (id) return id;
+
+    // Si no encontramos ID, podría ser que la cookie expiró y la respuesta fue una redirección al login
+    // o simplemente no hubo resultados. Intentamos regenerar cookie por si acaso.
+    // (Opcional: revisar si res.data incluye "login" o status 403 explícito)
+    
+    return null; 
+
+  } catch (err: any) {
+    const status = err?.response?.status;
+    
+    // Si falla por Auth (403/401), regeneramos cookie y reintentamos una vez
+    if (status === 403 || status === 401) {
+      try {
+        const retryRes = await performRequest(true);
+        return extractId(retryRes.data);
+      } catch (retryErr) {
+        throw retryErr;
+      }
+    }
+    
+    throw err;
+  }
+}
+
 export default {
   authorizeOnu,
   getOnuBySerial,
@@ -610,5 +812,8 @@ export default {
   getInstallationById,
   setOnuWanModeStaticIp,
   updateOnuLocation,
-  getAvailablePortsForOdb
+  getAvailablePortsForOdb,
+  listAllUnconfiguredOnus,
+  updateOnuWifi,
+  getInternalOnuIdBySn
 };

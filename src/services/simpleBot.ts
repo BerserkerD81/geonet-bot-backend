@@ -1,3 +1,6 @@
+import { AppDataSource } from '../datasource';
+import { Installation } from '../models/Installation';
+
 export type SuggestedAction = {
   id: string;
   type: 'button' | 'input';
@@ -5,72 +8,117 @@ export type SuggestedAction = {
   payload?: string;
   placeholder?: string;
   helperText?: string;
+  options?: string[];
 };
 
-export function getMockResponse(userMessage: string): string {
-  const lowerMessage = userMessage.toLowerCase();
-
-  if (lowerMessage.includes('alta') || lowerMessage.includes('nuevo cliente') || lowerMessage.includes('instalación')) {
-    return `Asistente SmartOLT - Alta de cliente:\n\nPuedo ayudarte a validar que la instalación está lista para ser autorizada. Normalmente revisamos:\n\n1) Datos del cliente completos (nombre, documento, dirección)\n2) ONT registrada con número de serie correcto\n3) Puerto de OLT disponible y sin alarmas\n4) Potencia óptica dentro de rango\n5) Evidencias subidas (fotos de acometida, ONT y etiqueta)\n\nCuéntame qué ya tienes cargado y qué te falta, y te guío paso a paso.`;
+/**
+ * Obtiene instalaciones pendientes directamente de la BD para respuestas rápidas
+ */
+async function getPendingInstallations() {
+  try {
+    const repo = AppDataSource.getRepository(Installation);
+    // Ajusta el filtro 'estado' según como guardes tus datos ('Instalación', 'Pendiente', etc.)
+    const rows = await repo.find({ where: { estado_instalacion: 'Pendiente' }, take: 5 });
+    
+    return rows.map((inst: any) => ({
+      clientName: inst.nombre || '',
+      address: inst.direccion || '',
+      status: inst.estado_instalacion || 'Pendiente',
+      rut: inst.cedula || '',
+      id: inst.id
+    }));
+  } catch (error) {
+    console.error("Error en simpleBot getPendingInstallations:", error);
+    return [];
   }
-
-  if (lowerMessage.includes('ont') || lowerMessage.includes('olt') || lowerMessage.includes('potencia')) {
-    return `Asistente SmartOLT - Estado de ONT/OLT:\n\nDe forma típica, para revisar un cliente en SmartOLT debes comprobar:\n\n- Estado de la ONT (online/offline)\n- Potencia RX de la ONT\n- Puerto PON y posición del cliente\n- Alarmas activas en el puerto o en la ONT\n\nSi me indicas el ID de cliente, la OLT o el número de serie de la ONT, te puedo sugerir los pasos de diagnóstico que suele seguir el NOC.`;
-  }
-
-  if (lowerMessage.includes('revisar') || lowerMessage.includes('validar') || lowerMessage.includes('checklist')) {
-    return `Asistente SmartOLT - Checklist de instalación:\n\nAquí tienes un checklist típico que usan los instaladores antes de autorizar el alta:\n\n- ONT energizada y con luz PON fija\n- Potencia óptica medida y dentro de rango\n- Conectores limpios y sin dobleces críticos en la fibra\n- Serie de ONT registrada en SmartOLT\n- Fotos de la instalación y del ONT subidas al sistema\n\nPuedes usar este checklist y marcar cada punto mientras haces la instalación.`;
-  }
-
-  return `Soy tu asistente para SmartOLT y la autogestión de instalaciones.\n\nPuedo ayudarte con:\n- Altas de nuevos clientes FTTH\n- Revisión de estado de ONT y puertos de OLT\n- Validación de instalaciones antes de autorizar el servicio\n- Listas de verificación para técnicos instaladores\n\nDime qué estás haciendo (alta nueva, visita técnica, verificación de señal, etc.) y te guío paso a paso.`;
 }
 
-export function getSuggestedActions(userMessage: string): SuggestedAction[] {
+/**
+ * Genera el texto de respuesta basado en palabras clave
+ */
+async function getMockResponse(userMessage: string): Promise<string> {
+  const lowerMessage = userMessage.toLowerCase();
+
+  // 1. Instalaciones Pendientes
+  if (
+    lowerMessage.includes('instalaciones pendientes') ||
+    lowerMessage.includes('instalacion pendiente') ||
+    lowerMessage.includes('instalación pendiente')
+  ) {
+    const installations = await getPendingInstallations();
+    if (!installations.length) {
+      return 'No hay instalaciones pendientes de evidencia para autorizar el alta en este momento.';
+    }
+    const list = installations
+      .map(
+        (inst, idx) =>
+          `${idx + 1}. ${inst.clientName} (ID: ${inst.id}) - ${inst.address}`
+      )
+      .join('\n');
+    return `Instalaciones pendientes encontradas:\n\n${list}`;
+  }
+
+  // 2. Ayuda de Alta
+  if (lowerMessage.includes('alta') || lowerMessage.includes('nuevo cliente') || (lowerMessage.includes('instalación') && !lowerMessage.includes('pendiente'))) {
+    return `Asistente SmartOLT - Alta de cliente:\n\nPuedo ayudarte a validar que la instalación está lista. Normalmente revisamos:\n\n1) Datos del cliente (nombre, documento)\n2) ONT registrada (SN correcto)\n3) Puerto OLT disponible\n4) Potencia óptica\n\nDime qué te falta y te guío.`;
+  }
+
+  // 3. Estado ONT/OLT
+  if (lowerMessage.includes('ont') || lowerMessage.includes('olt') || lowerMessage.includes('potencia')) {
+    return `Asistente SmartOLT - Estado:\n\nPara revisar un cliente comprueba:\n- Estado ONT (online/offline)\n- Potencia RX\n- Puerto PON\n- Alarmas\n\nIndícame un ID o SN para revisar.`;
+  }
+
+  // 4. Checklists
+  if (lowerMessage.includes('revisar') || lowerMessage.includes('validar') || lowerMessage.includes('checklist')) {
+    return `Checklist de instalación:\n\n- [ ] ONT energizada (Luz PON fija)\n- [ ] Potencia óptica en rango\n- [ ] Conectores limpios\n- [ ] SN registrado en SmartOLT\n- [ ] Evidencias subidas\n\n¿Todo listo?`;
+  }
+
+  // Default
+  return `Soy tu asistente para SmartOLT.\n\nPuedo ayudarte con:\n- "Buscar cliente Juan"\n- "Instalaciones pendientes"\n- "Checklist de instalación"\n- "Autorizar ONU"`;
+}
+
+/**
+ * Genera botones sugeridos basados en palabras clave
+ */
+async function getSuggestedActions(userMessage: string): Promise<SuggestedAction[]> {
   const lower = userMessage.toLowerCase();
-
-  const wisphubActions: SuggestedAction[] = [
-    {
-      id: 'wisphub-instalaciones-pendientes',
-      type: 'button',
-      label: 'Listar instalaciones pendientes.',
-      payload: 'Ver instalaciones pendientes en WispHub',
-    },
-  ];
-
-  const smartoltActions: SuggestedAction[] = [
-    {
-      id: 'smartolt-checklist',
-      type: 'button',
-      label: 'Checklist de instalación FTTH',
-      payload: 'Mostrar checklist de instalación FTTH en SmartOLT',
-    },
-    
-  ];
-
   const actions: SuggestedAction[] = [];
 
-  if (lower.includes('wisphub') || lower.includes('wisp') || lower.includes('cliente')) {
-    actions.push(...wisphubActions);
-  }
+  if (
+    lower.includes('instalaciones pendientes') ||
+    lower.includes('instalacion pendiente')
+  ) {
+    const installations = await getPendingInstallations();
 
-  if (lower.includes('smartolt') || lower.includes('olt') || lower.includes('ont')) {
-    actions.push(...smartoltActions);
-  }
+    // Acciones globales
+    actions.push({
+      id: 'update-installations',
+      type: 'button',
+      label: '🔄 Actualizar lista',
+      payload: 'Enséñame las instalaciones pendientes de evidencia para autorizar el alta'
+    });
 
-  if (actions.length === 0) {
-    actions.push(
-      wisphubActions[0],
-      wisphubActions[1],
-      smartoltActions[0],
-      smartoltActions[1],
-    );
+    // Botones para cada instalación encontrada
+    installations.forEach(inst => {
+      actions.push({
+        id: `select-inst-${inst.id}`,
+        type: 'button',
+        label: `Seleccionar ${inst.clientName}`,
+        payload: `seleccionar instalación ${inst.id}`
+      });
+    });
+  } else if (lower.includes('alta') || lower.includes('nuevo cliente')) {
+     actions.push({ id: 'search-mode', type: 'button', label: 'Buscar Cliente', payload: 'modo busqueda general' });
   }
 
   return actions;
 }
 
-export function buildStructuredResponse(userMessage: string): { content: string; actions: SuggestedAction[] } {
-  const content = getMockResponse(userMessage);
-  const actions = getSuggestedActions(userMessage);
+/**
+ * Función principal exportada que usa el chatController
+ */
+export async function buildStructuredResponse(userMessage: string): Promise<{ content: string; actions: SuggestedAction[] }> {
+  const content = await getMockResponse(userMessage);
+  const actions = await getSuggestedActions(userMessage);
   return { content, actions };
 }
