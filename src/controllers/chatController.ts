@@ -16,7 +16,7 @@ import {
   getAutoLoginContractLink,
   registrarOnuGeonet,
   agregarArticuloACliente,
-  uploadDocumentoCliente // <--- CRÍTICO: Importado de tu wisphubClient
+  uploadDocumentoCliente 
 } from '../services/wisphubClient';
 import { searchLocalInstallations, refreshInstallationsByTerm, listPendingLocalInstallations, fullSyncInstallations } from '../services/wisphubInstallations';
 import {
@@ -532,7 +532,7 @@ export async function respond(req: any, res: any) {
                 finalContent = `❌ Error interno al subir evidencia: ${error.message}`;
             }
         } 
-        // Si NO hay cliente seleccionado, guardamos en la cola para procesar después de "Auth Submit"
+        // Si NO hay cliente seleccionado, guardamos en la cola para procesar después
         else {
             session.pendingPhotos.push({
                 systemPath: savedImage.systemPath,
@@ -541,7 +541,7 @@ export async function respond(req: any, res: any) {
             });
 
             const count = session.pendingPhotos.length;
-            finalContent = `📥 **Foto recolectada** (Total pendientes: ${count}).\n\nEstas fotos se subirán automáticamente a Geonet cuando **Autorices la ONU** y se cree el servicio.`;
+            finalContent = `📥 **Foto recolectada** (Total pendientes: ${count}).\n\nEstas fotos se subirán automáticamente a Geonet cuando **Actives el Servicio** en Wisphub.`;
         }
     } 
     // ------------------------------------------------------------------
@@ -558,7 +558,7 @@ export async function respond(req: any, res: any) {
 
         // --- 1. PRIORIDAD ALTA: Comandos Específicos (WiFi, Auth) ---
 
-        // --- LÓGICA ACTIVAR WISPHUB ---
+        // --- LÓGICA ACTIVAR WISPHUB (CON SUBIDA DE FOTOS BUFFERED) ---
         if (lower.startsWith('wisphub activate')) {
           const idMatch = prompt.match(/activate\s+(\d+)/i);
           const targetId = idMatch ? idMatch[1] : null;
@@ -573,7 +573,36 @@ export async function respond(req: any, res: any) {
               const exito = await activarInstalacionGeonet(targetId, fullGeonetUser);
               
               if (exito) {
-                  finalContent = `🚀 **¡Activación Exitosa!**\nLa instalación **${targetId}** ha sido activada correctamente bajo el usuario \`${fullGeonetUser}\`. Ahora manda las fotos para llevar registro completo.`;
+                  finalContent = `🚀 **¡Activación Exitosa!**\nLa instalación **${targetId}** ha sido activada correctamente bajo el usuario \`${fullGeonetUser}\`.`;
+
+                  // --- SUBIDA DE FOTOS DEL BUFFER AL ACTIVAR ---
+                  if (session.pendingPhotos && session.pendingPhotos.length > 0) {
+                      finalContent += `\n\n📤 **Procesando ${session.pendingPhotos.length} fotos acumuladas...**`;
+                      let uploadedCount = 0;
+
+                      for (const photo of session.pendingPhotos) {
+                          try {
+                              const subidaOk = await uploadDocumentoCliente(
+                                  targetId, 
+                                  fullGeonetUser, 
+                                  photo.systemPath, // Ruta física
+                                  `Evidencia Activación - ${photo.timestamp}`, 
+                                  photo.caption || 'Foto adjunta al activar'
+                              );
+                              if (subidaOk) uploadedCount++;
+                          } catch (err) {
+                              console.error('Error subiendo foto batch en activación:', err);
+                          }
+                      }
+
+                      if (uploadedCount > 0) {
+                          finalContent += `\n✅ **${uploadedCount} fotos subidas correctamente a la ficha.**`;
+                          delete session.pendingPhotos; // Limpiamos el buffer
+                      } else {
+                          finalContent += `\n⚠️ Hubo un problema subiendo las fotos.`;
+                      }
+                  }
+                  
               } else {
                   finalContent = `❌ **Error en Activación**\nNo se pudo activar el usuario \`${fullGeonetUser}\`. Por favor, verifique el panel de Geonet.`;
                   actionsOut = [{ id: 'retry', type: 'button', label: '🔄 Reintentar', payload: `wisphub activate ${targetId}` }];
@@ -911,38 +940,7 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
             await agregarArticuloACliente(clientid, `${data.name}@geonet` || '', onuId); 
         }
 
-        // --- NUEVA LÓGICA: SUBIDA DE FOTOS PENDIENTES ---
-        if (session.pendingPhotos && session.pendingPhotos.length > 0 && clientid) {
-            messages.push(`\n📤 **Procesando ${session.pendingPhotos.length} fotos guardadas...**`);
-            
-            const baseName = session.lastAuthNameUsed || 'tecnico';
-            const fullGeonetUser = `${baseName}@geonet`;
-            let uploadedCount = 0;
-
-            for (const photo of session.pendingPhotos) {
-                try {
-                    const ok = await uploadDocumentoCliente(
-                        clientid,
-                        fullGeonetUser,
-                        photo.systemPath, // Ruta física
-                        `Evidencia Auto - ${photo.timestamp}`,
-                        photo.caption
-                    );
-                    if (ok) uploadedCount++;
-                } catch (err) {
-                    console.error('Error subiendo foto batch:', err);
-                }
-            }
-
-            if (uploadedCount > 0) {
-                messages.push(`✅ **${uploadedCount} fotos subidas a Geonet.**`);
-            } else {
-                messages.push(`⚠️ Falló la subida automática de fotos.`);
-            }
-
-            // Limpiamos la cola
-            delete session.pendingPhotos;
-        }
+        // --- NOTA: Aquí se eliminó la subida de fotos del buffer (movido a wisphub activate) ---
 
     } else {
         messages.push('ℹ️ ONU ya registrada en BD (SN coincidente).');
@@ -1035,7 +1033,7 @@ export async function submitAuth(req: any, res: any) {
             address_or_comment: finalAddress, 
             odb_port: cleanOdbPort,
             onu_type: merged.onu_type, 
-            _session: session // <--- Pasamos la sesión para acceder a pendingPhotos
+            _session: session 
         }, targetId);
 
         cacheDelete('listOlts');
