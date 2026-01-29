@@ -641,10 +641,93 @@ export async function getAvailablePortsForOdb(externalId: string | number): Prom
 }
 
 /**
+ * Helper interno: Obtiene mapeo data-id vs portIndex.
+ * REPARADO: Filtra estrictamente para que data-port incluya 'wifi'
+ * para evitar capturar puertos LAN (eth_X) o voz que también tienen data-id.
+ */
+async function fetchWifiPortsFromPage(onuId: string | number): Promise<Array<{ id: string; portIndex: number }>> {
+  if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
+
+  const endpoint = `${baseUrl}/onu/view/${onuId}`;
+
+  // Helper interno que realiza la petición y el parseo
+  const executeScrape = async (forceNewCookie: boolean): Promise<Array<{ id: string; portIndex: number }>> => {
+    const cookie = await getSmartoltSessionCookie(forceNewCookie);
+    if (!cookie) throw new Error('No se pudo obtener la cookie de sesión');
+
+    let res;
+    try {
+      res = await axios.get(endpoint, {
+        headers: {
+          'Cookie': cookie,
+          'X-Requested-With': 'XMLHttpRequest',
+          'X-Token': SMARTOLT.apiKey || ''
+        },
+        transformResponse: [(data) => data] // Evitar parseo JSON, queremos texto crudo
+      });
+    } catch (err: any) {
+      throw err;
+    }
+
+    const html = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+    const mappedPorts: Array<{ id: string; portIndex: number }> = [];
+
+    // Regex global para capturar data-id y data-port, soportando saltos de línea entre atributos
+    const regex = /data-id=["'](\d+)["'][\s\S]*?data-port=["']([^"']+)["']/g;
+    
+    let match;
+    while ((match = regex.exec(html)) !== null) {
+      const smartoltId = match[1];      // ej: "100" (Wifi) o "211" (Eth)
+      const portLabel = match[2];       // ej: "wifi_0/1" o "eth_1"
+      
+      // === FILTRO ESTRICTO ===
+      // Si el puerto no contiene la palabra "wifi", lo ignoramos. 
+      // Esto elimina los puertos LAN/ETH/POTS que estaban ensuciando el array.
+      if (!portLabel.toLowerCase().includes('wifi')) {
+        continue;
+      }
+
+      // Extraemos el número final del puerto (ej: de "wifi_0/1" saca "1")
+      const indexMatch = portLabel.match(/(\d+)$/);
+      if (indexMatch) {
+        mappedPorts.push({
+          id: smartoltId,
+          portIndex: parseInt(indexMatch[1], 10)
+        });
+      }
+    }
+    
+    return mappedPorts;
+  };
+
+  // 1. Intento inicial
+  let resultPorts: Array<{ id: string; portIndex: number }> = [];
+  try {
+    resultPorts = await executeScrape(false);
+  } catch (err: any) {
+    // Si falla por autenticación, reintentamos forzando nueva cookie
+    if (err?.response?.status === 403 || err?.response?.status === 401) {
+      resultPorts = await executeScrape(true);
+    } else {
+      throw err;
+    }
+  }
+
+  // 2. Si el array está vacío, es posible que la cookie haya expirado y SmartOLT 
+  // devolvió el HTML del Login (status 200) en lugar de un error. Forzamos reintento.
+  if (resultPorts.length === 0) {
+    console.warn(`fetchWifiPortsFromPage: No se encontraron puertos WiFi para ONU ${onuId}. Posible sesión caducada. Reintentando con cookie nueva...`);
+    resultPorts = await executeScrape(true);
+  }
+
+  return resultPorts;
+}
+
+/**
  * Actualiza la configuración Wifi (SSID y Password) de una ONU.
- * Utiliza Cookies de sesión ya que la API Key suele no tener permisos para este endpoint interno.
- *
- * @param onuId - ID interno de la ONU (ej. 1254)
+ * - Si es 2.4GHz -> Busca el puerto físico 1 (wifi_0/1) y usa su data-id (ej. 100).
+ * - Si es 5GHz   -> Busca el puerto físico 5 (wifi_0/5) y usa su data-id (ej. 104).
+ * * @param onuId - ID interno de la ONU (ej. 1254)
  * @param frequency - '2.4GHz' (Puerto 1) o '5GHz' (Puerto 5)
  * @param ssid - Nuevo nombre de la red
  * @param password - Nueva contraseña
@@ -659,24 +742,48 @@ export async function updateOnuWifi(
 ) {
   if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
 
-  // Mapeo de puertos según tu indicación: 1 para 2.4G, 5 para 5G
-  const wifiPortId = frequency === '5GHz' ? '104' : '100';
+  // 1. Obtener el mapa de puertos disponibles desde el HTML
+  const availablePorts = await fetchWifiPortsFromPage(onuId);
 
-  // Construcción del payload form-urlencoded
+  console.log(`updateOnuWifi: Puertos confirmados para ONU ${onuId}:`, availablePorts);
+
+  if (availablePorts.length === 0) {
+    throw new Error(`No se encontraron puertos WiFi configurables para la ONU ${onuId}. (Intento de scrape fallido incluso tras renovar cookie)`);
+  }
+
+  // 2. Seleccionar el ID correcto (data-id) basado en la frecuencia (portIndex)
+  let selectedId: string | undefined;
+
+  if (frequency === '2.4GHz') {
+    // Buscamos el que corresponde a wifi_0/1
+    const port1 = availablePorts.find(p => p.portIndex === 1);
+    selectedId = port1?.id;
+  } else {
+    // Buscamos el que corresponde a wifi_0/5
+    const port5 = availablePorts.find(p => p.portIndex === 5);
+    selectedId = port5?.id;
+  }
+
+  if (!selectedId) {
+    throw new Error(`No se encontró el puerto para ${frequency} en la ONU ${onuId}. 
+      (Se buscó índice 1 para 2.4GHz o índice 5 para 5GHz). 
+      Puertos detectados: ${availablePorts.map(p => `wifi_0/${p.portIndex}(id:${p.id})`).join(', ')}`);
+  }
+
+  // 3. Enviar la configuración usando el ID extraído (100 o 104)
   const form = new URLSearchParams();
   form.append('onu_id', String(onuId));
-  form.append('wifi_port_id', wifiPortId);
+  form.append('wifi_port_id', selectedId);
   form.append('wifi_port_is_enabled', enable ? '1' : '0');
-  form.append('wifi_port_mode', 'LAN'); // Modo estándar
+  form.append('wifi_port_mode', 'LAN'); 
   form.append('ssid', ssid);
-  form.append('auth_mode', 'wpa2'); // WPA2 por defecto
+  form.append('auth_mode', 'wpa2'); 
   form.append('wifi_password', password);
-  form.append('wifi_vlan_dhcp', 'No control'); // Valor por defecto del sistema
+  form.append('wifi_vlan_dhcp', 'No control'); 
 
   const endpoint = `${baseUrl}/api/onu/update_wifi_port`;
 
-  // Función interna para realizar la petición con manejo de cookies
-  const performRequest = async (forceCookie: boolean) => {
+  const performPost = async (forceCookie: boolean) => {
     const cookie = await getSmartoltSessionCookie(forceCookie);
     if (!cookie) throw new Error('No se pudo obtener la cookie de sesión de SmartOLT');
 
@@ -684,29 +791,23 @@ export async function updateOnuWifi(
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Cookie': cookie,
-        'X-Requested-With': 'XMLHttpRequest', // Importante para endpoints internos
-        'X-Token': SMARTOLT.apiKey || '' // Enviamos también el token por si acaso
+        'X-Requested-With': 'XMLHttpRequest', 
+        'X-Token': SMARTOLT.apiKey || '' 
       },
       timeout: 20000
     });
   };
 
   try {
-    // Intento 1: Usar cookie cacheada o generar una nueva si no existe
-    const res = await performRequest(false);
+    const res = await performPost(false);
     return res.data;
   } catch (err: any) {
     const status = err?.response?.status;
-    
-    // Si recibimos 403 Forbidden o 401 Unauthorized, es probable que la cookie haya caducado.
-    // Forzamos un re-login y reintentamos.
     if (status === 403 || status === 401) {
-      console.warn('updateOnuWifi: Cookie expirada, regenerando sesión...');
-      const retryRes = await performRequest(true);
+      console.warn('updateOnuWifi: Cookie expirada durante el POST, regenerando sesión...');
+      const retryRes = await performPost(true);
       return retryRes.data;
     }
-    
-    // Si es otro error, lo lanzamos
     throw err;
   }
 }

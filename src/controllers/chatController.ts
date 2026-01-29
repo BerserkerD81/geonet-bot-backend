@@ -15,7 +15,8 @@ import {
   processContractUpdate,
   getAutoLoginContractLink,
   registrarOnuGeonet,
-  agregarArticuloACliente
+  agregarArticuloACliente,
+  uploadDocumentoCliente // <--- CRÍTICO: Importado de tu wisphubClient
 } from '../services/wisphubClient';
 import { searchLocalInstallations, refreshInstallationsByTerm, listPendingLocalInstallations, fullSyncInstallations } from '../services/wisphubInstallations';
 import {
@@ -26,7 +27,6 @@ import {
   updateOnuWifi,
   getInternalOnuIdBySn
 } from '../services/smartoltClient';
-import { url } from 'inspector';
 
 // --- HELPERS: Caching & Utils ---
 
@@ -47,17 +47,33 @@ function cacheDelete(keyPrefix: string) {
   }
 }
 
-function saveImageDataUrl(imageDataUrl?: string): string | null {
+/**
+ * Guarda la imagen en disco y devuelve las rutas necesarias.
+ * Retorna null si falla o no hay imagen.
+ */
+function saveImageDataUrl(imageDataUrl?: string): { webPath: string; systemPath: string } | null {
   if (!imageDataUrl || typeof imageDataUrl !== 'string') return null;
   try {
     const matches = imageDataUrl.match(/^data:(image\/[-a-zA-Z0-9.+]+);base64,(.+)$/);
     if (!matches) return null;
+    
     const ext = (matches[1].split('/')[1] || 'png').toLowerCase();
     const fileName = `chat_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+    
+    // Ruta del sistema (física) - Compatible con Docker si se mapea el volumen
     const uploadDir = path.join(process.cwd(), 'uploads', 'chat');
-    fs.mkdirSync(uploadDir, { recursive: true });
-    fs.writeFileSync(path.join(uploadDir, fileName), Buffer.from(matches[2], 'base64'));
-    return `/uploads/chat/${fileName}`;
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+    const systemPath = path.join(uploadDir, fileName);
+    
+    // Escribir archivo
+    fs.writeFileSync(systemPath, Buffer.from(matches[2], 'base64'));
+    
+    // Ruta web (para el frontend)
+    const webPath = `/uploads/chat/${fileName}`;
+    
+    return { webPath, systemPath };
   } catch (err) {
     console.error('Failed to store chat image', err);
     return null;
@@ -95,14 +111,11 @@ function pickFirstString(values: Array<any>): string | undefined {
 
 function defaultsFromEntity(entity: any, type: 'client' | 'installation'): Record<string, any> {
     const isInst = type === 'installation';
-    
-    // Priorizar 'servicio' (nombre del plan) para el campo name
     const plan = entity.servicio || entity.plan_internet;
     const clientName = `${entity.nombre || ''} ${entity.apellidos || ''}`.trim();
 
     return {
       sn: entity.sn_onu || undefined,
-      // Si existe plan, usamos el plan. Si no, el nombre del cliente.
       name: plan || clientName || undefined, 
       zone: entity.zona || entity.ciudad || entity.localidad || undefined,
       address_or_comment: entity.direccion || undefined,
@@ -237,8 +250,8 @@ async function hydrateZonesAndOdbs(state: any, zoneFilter?: string) {
     if (mergedMap.size === 0) {
       const apiOdbs = await cacheGet('smartolt_odbs', 300, async () => await getOdbs().catch(() => []));
       (apiOdbs || []).forEach((o: any) => {
-         const item = { id: o.id || o.name, name: o.name || o.id || '', zone: o.zone || '' };
-         mergedMap.set(`${item.id}`.toLowerCase(), item);
+          const item = { id: o.id || o.name, name: o.name || o.id || '', zone: o.zone || '' };
+          mergedMap.set(`${item.id}`.toLowerCase(), item);
       });
     }
 
@@ -290,18 +303,18 @@ async function buildOltAndNetworkSection(serviceIdOrTerm?: number | string, opts
   const vlanFromOltLists = Array.from(vlanMap.values()).flat();
 
   (oltSection.olts || []).forEach(olt => {
-     const rawOnus = byOlt.get(String(olt.id)) || [];
-     const seen = new Set();
-     const available = rawOnus.filter(o => {
+      const rawOnus = byOlt.get(String(olt.id)) || [];
+      const seen = new Set();
+      const available = rawOnus.filter(o => {
         const k = pickFirstString([o.sn, o.serial, o.onu_sn, o.mac]) || '';
         if (k && seen.has(k)) return false;
         if (k) seen.add(k);
         return true; // Assume free if in this list
-     });
+      });
 
-     if (available.length) {
-       const entry = { oltId: String(olt.id), oltName: olt.name, availableCount: available.length, onus: [] as any[] };
-       available.slice(0, 8).forEach((o, idx) => {
+      if (available.length) {
+        const entry = { oltId: String(olt.id), oltName: olt.name, availableCount: available.length, onus: [] as any[] };
+        available.slice(0, 8).forEach((o, idx) => {
           const id = pickFirstString([o.sn, o.serial, o.onu_sn]) || `ONU${idx}`;
           const pon = (o.pon_type || 'gpon').toLowerCase();
           const port = pickFirstString([o.port, o.port_id, o.slot]) || '-';
@@ -309,9 +322,9 @@ async function buildOltAndNetworkSection(serviceIdOrTerm?: number | string, opts
           const payload = `seleccionar onu ${id} olt ${olt.id} pon ${pon} port ${port}${model !== '-' ? ` model ${model}` : ''}`;
           entry.onus.push({ id, label: id, ponType: pon, port, model, actionPayload: payload });
           onuActions.push({ id: `select-onu-${olt.id}-${idx}`, type: 'button', label: id, payload });
-       });
-       oltAvailability.push(entry);
-     }
+        });
+        oltAvailability.push(entry);
+      }
   });
 
   const suggestedVlan = pickFirstString(vlanFromOltLists);
@@ -427,8 +440,19 @@ export async function addMessage(req: any, res: any) {
     const { userId } = req.session || {};
     if (!userId) return res.status(401).json({ error: 'unauthenticated' });
     const { role, content, imageDataUrl } = req.body;
+    
+    // Guardamos la imagen si existe
+    const savedImage = saveImageDataUrl(imageDataUrl);
+    const webPath = savedImage ? savedImage.webPath : undefined;
+
     const repo = AppDataSource.getRepository(ChatMessage);
-    const msg = repo.create({ userId: Number(userId), role, content: content || (imageDataUrl ? '[Img]' : ''), imageUrl: saveImageDataUrl(imageDataUrl) });
+    const msg = repo.create({ 
+        userId: Number(userId), 
+        role, 
+        content: content || (imageDataUrl ? '[Img]' : ''), 
+        imageUrl: webPath 
+    });
+    
     await repo.save(msg);
     return res.json({ ok: true, id: msg.id });
 }
@@ -450,289 +474,343 @@ export async function respond(req: any, res: any) {
   if (!content && !imageDataUrl) return res.status(400).json({ error: 'empty' });
 
   const repo = AppDataSource.getRepository(ChatMessage);
-  const imageUrl = saveImageDataUrl(imageDataUrl);
-  await repo.save(repo.create({ userId: Number(userId), role: 'user', content: content || '[Img]', imageUrl: imageUrl || undefined }));
 
-  const prompt = content || '';
-  const lower = prompt.toLowerCase();
-  
-  const structured = await buildStructuredResponse(prompt); 
-  let finalContent = structured.content;
-  let actionsOut: any[] = structured.actions as any[];
+  // 1. Manejo de Imagen: Guardar físicamente
+  const savedImage = saveImageDataUrl(imageDataUrl);
+  const webPath = savedImage ? savedImage.webPath : undefined;
+
+  // 2. Guardar mensaje del usuario
+  await repo.save(repo.create({ 
+      userId: Number(userId), 
+      role: 'user', 
+      content: content || '[Img]', 
+      imageUrl: webPath 
+  }));
+
+  let finalContent = '';
+  let actionsOut: any[] = [];
   let assistantMetadata: any = null;
 
   try {
     // ------------------------------------------------------------------
-    // 1. PRIORIDAD ALTA: Comandos Específicos (WiFi, Auth)
+    // A. LÓGICA DE IMAGEN (NUEVO BLOQUE PRIORITARIO)
     // ------------------------------------------------------------------
-
-    // --- 2. LÓGICA ACTIVAR WISPHUB ---
-    if (lower.startsWith('wisphub activate')) {
-      const idMatch = prompt.match(/activate\s+(\d+)/i);
-      const targetId = idMatch ? idMatch[1] : null;
-
-      // Recuperamos el nombre que se usó en el paso de submitAuth (ej: 1193_jorge)
-      const baseName = session.lastAuthNameUsed || targetId;
-      const fullGeonetUser = `${baseName}@geonet`;
-
-      if (!targetId) {
-          finalContent = "⚠️ Error: No se detectó ID para activar.";
-      } else {
-          finalContent = `⏳ Activando servicio en Geonet para **${fullGeonetUser}**...`;
-          const exito = await activarInstalacionGeonet(targetId, fullGeonetUser);
-          
-          if (exito) {
-              finalContent = `🚀 **¡Activación Exitosa!**\nLa instalación **${targetId}** ha sido activada correctamente bajo el usuario \`${fullGeonetUser}\`.ahora manda las fotos para llevar registro completo`;
-          } else {
-              finalContent = `❌ **Error en Activación**\nNo se pudo activar el usuario \`${fullGeonetUser}\`. Por favor, verifique el panel de Geonet.`;
-              actionsOut = [{ id: 'retry', type: 'button', label: '🔄 Reintentar', payload: `wisphub activate ${targetId}` }];
-          }
-      }
-    }
-    // --- LÓGICA WIFI APPLY (Con Botones de Contrato y ACTIVAR) ---
-    else if (lower.startsWith('wifi apply')) {
-        const snMatch = prompt.match(/sn\s+([a-zA-Z0-9]+)/i);
-        const ssidMatch = prompt.match(/ssid\s+(.+?)(?=\s+pass)/i); 
-        const passMatch = prompt.match(/pass\s+(.+?)(?=\s+contract_id|$)/i);
-
-        const bodyData = req.body || {};
-        const container = bodyData.collected || bodyData.data || {};
+    if (savedImage && savedImage.systemPath) {
+        // Verificamos si tenemos contexto de un cliente/instalación activa
+        const targetId = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
         
-        const sn = (snMatch ? snMatch[1].toUpperCase() : null) || container.sn;
-        const ssid = (ssidMatch ? ssidMatch[1].trim() : null) || bodyData.wifi_ssid || container.wifi_ssid;
-        const pass = (passMatch ? passMatch[1].trim() : null) || bodyData.wifi_pass || container.wifi_pass;
+        // --- NUEVA LÓGICA: COLA DE FOTOS ---
+        // Inicializar el buffer de fotos si no existe
+        if (!session.pendingPhotos) {
+            session.pendingPhotos = [];
+        }
 
-        if (sn && ssid && pass) {
+        // Si ya hay cliente seleccionado, subimos directo (o podrías encolar también si prefieres)
+        if (targetId) {
+            finalContent = `📸 Imagen recibida. Subiendo a Geonet (ID: ${targetId})...`;
+            
+            // Construimos el usuario técnico 
+            const baseName = session.lastAuthNameUsed || 'tecnico'; 
+            const fullGeonetUser = `${baseName}@geonet`;
+
             try {
-                const internalId = await getInternalOnuIdBySn(sn);
-                
-                if (!internalId) {
-                    finalContent = `❌ Error: No se encontró el ID interno de la ONU ${sn}. Verifique autorización.`;
-                } else {
-                    const results = [];
-                    // 2.4GHz
-                    try {
-                        await updateOnuWifi(internalId, '2.4GHz', ssid, pass, true);
-                        results.push('✅ 2.4GHz Configurado');
-                    } catch (e: any) {
-                        results.push(`❌ 2.4GHz Falló: ${e.message}`);
-                    }
-                    // 5GHz
-                    try {
-                        await updateOnuWifi(internalId, '5GHz', `${ssid}_5G`, pass, true);
-                        results.push('✅ 5GHz Configurado');
-                    } catch (e: any) {
-                        results.push(`⚠️ 5GHz: ${e.message || 'No disponible'}`);
-                    }
-                    
-                    finalContent = `📡 Resultado WiFi (SN: ${sn}):\nSSID: ${ssid}\nClave: ${pass}\n\n${results.join('\n')}`;
-                    
-                    // --- 3. AQUÍ AGREGAMOS LOS BOTONES NUEVOS ---
-                    actionsOut = [];
-                    
-                    // Recuperamos el ID guardado en la sesión
-                    const targetId = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
+               const subidaExitosa = await uploadDocumentoCliente(
+                   targetId, 
+                   fullGeonetUser, 
+                   savedImage.systemPath, // Ruta absoluta
+                   `Evidencia Chat - ${new Date().toLocaleTimeString()}`, 
+                   content || 'Imagen subida automáticamente desde el chat' // Descripción
+               );
 
-                    if (targetId) {
-                        actionsOut.push(
-                            { 
-                                id: 'btn-contrato', 
-                                type: 'button', 
-                                label: '📄 Generar Contrato', 
-                                payload: `generar contrato ${targetId}` 
-                            },
-
-                        );
-                        finalContent += `\n\n👇 Acciones post-instalación para ID ${targetId}:`;
-                    } else {
-                        finalContent += `\n\n(ℹ️ No se detectó un ID seleccionado previamente para generar el contrato)`;
-                    }
-                }
-            } catch (err: any) {
-                console.error('Error general Wifi:', err);
-                finalContent = `❌ Error crítico WiFi: ${err.message}`;
+               if (subidaExitosa) {
+                   finalContent = `✅ **Imagen subida a Geonet exitosamente** como evidencia para el cliente **${targetId}**.`;
+               } else {
+                   finalContent = `⚠️ La imagen se guardó en el chat, pero **falló la subida a Geonet**. Verifique si el usuario técnico es correcto.`;
+               }
+            } catch (error: any) {
+                console.error('Error subiendo imagen auto:', error);
+                finalContent = `❌ Error interno al subir evidencia: ${error.message}`;
             }
-        } else {
-            finalContent = '⚠️ Error de formato WiFi. Intente de nuevo.';
+        } 
+        // Si NO hay cliente seleccionado, guardamos en la cola para procesar después de "Auth Submit"
+        else {
+            session.pendingPhotos.push({
+                systemPath: savedImage.systemPath,
+                timestamp: new Date().toLocaleTimeString(),
+                caption: content || 'Evidencia previa autorización'
+            });
+
+            const count = session.pendingPhotos.length;
+            finalContent = `📥 **Foto recolectada** (Total pendientes: ${count}).\n\nEstas fotos se subirán automáticamente a Geonet cuando **Autorices la ONU** y se cree el servicio.`;
         }
-    }
-    else if (lower.startsWith('generar contrato')) {
-      const idMatch = prompt.match(/generar contrato\s+(\d+)/i);
-      const targetId = idMatch ? idMatch[1] : null;
-      if (targetId) {
-          finalContent = `📄 Generando contrato para ID **${targetId}**...`;
-          const contractUrl = `/chat/downloads/contract/${targetId}`;
-          await processContractUpdate(targetId).catch(err => {
-              console.error('Error generating contract:', err);
-          });
-          const baseName = session.lastAuthNameUsed || targetId;
-
-          let contratourl=  await getAutoLoginContractLink(`${baseName}@geonet`, targetId);
-
-          
-          finalContent = `✅ Contrato generado:`;
-          const directActions: any[] = [];
-             directActions.push(
-                { 
-                    id: 'btn-contrato', 
-                    type: 'link', 
-                    label: '📄 copiar Contrato', 
-                    url: `${contratourl}` 
-                },
-                { 
-                    id: 'btn-activar-wisphub', 
-                    type: 'button', 
-                    label: '🚀 Activar en WispHub', 
-                    payload: `wisphub activate ${targetId}` 
-                });
-          actionsOut = directActions;
-      } else {
-          finalContent = '⚠️ Error: No se detectó ID para generar contrato.';
-      }
-
-
-    }
- 
-    // --- LÓGICA AUTH SUBMIT ---
-    else if (lower === 'auth submit') {
-        if (!session.pendingAuth) finalContent = 'No hay autorización en curso.';
-        else { await submitAuth(req, res); return; }
-    }
-    
+    } 
     // ------------------------------------------------------------------
-    // 2. PRIORIDAD MEDIA: Selección de Cliente/Instalación
+    // B. LÓGICA DE TEXTO (EXISTENTE)
     // ------------------------------------------------------------------
-    else if (/^(seleccionar|select) (cliente|instalación|instalacion)/i.test(lower)) {
-        const isClient = lower.includes('cliente');
-        const id = Number(lower.split(/\s+/).pop());
-        
-        let entity: any = null;
-        if (isClient) {
-             const repo = AppDataSource.getRepository(Client);
-             entity = await repo.findOne({ where: { id_servicio: id } });
-        } else {
-             const repo = AppDataSource.getRepository(Installation);
-             entity = await repo.findOne({ where: { id: id } });
-        }
-
-        if (entity) {
-             // CAMBIO CRÍTICO: Guardar ID en sesión para el contrato posterior
-             // Priorizamos id_servicio. Si es instalación y no tiene id_servicio (raro), usamos id.
-             const serviceId = entity.id_servicio || entity.id; 
-             session.lastSelectedClientIdServicio = serviceId; 
-             if (!isClient) session.lastSelectedInstallationId = entity.id;
-
-             const { text, actions, assistantMetadata: meta } = await prepareAuthSession(session, entity, isClient ? 'client' : 'installation');
-             assistantMetadata = meta;
-
-             const clientDetails = buildClientDetails(entity, isClient ? 'client' : 'installation');
-
-             finalContent = `${clientDetails}\n\n📡 **Disponibilidad en SmartOLT:**\n${text}\n👇 Selecciona una ONU libre abajo o completa el formulario.`;
-             actionsOut = actions;
-
-             if (isClient) {
-                 const insts = await AppDataSource.getRepository(Installation).find({ where: { id_servicio: (entity as Client).id_servicio }, take: 5 });
-                 if (insts.length) {
-                     const iFmt = formatEntityList(insts, 'installation');
-                     finalContent += `\n\n⚠️ **Instalaciones vinculadas encontradas:**`;
-                     actionsOut = [...actionsOut, ...iFmt.actions];
-                 }
-             }
-        } else {
-            finalContent = `${isClient ? 'Cliente' : 'Instalación'} no encontrada.`;
-        }
-    }
-    // --- LÓGICA SELECCIÓN MANUAL DE ONU ---
-    else if (/^seleccionar\s+onu\s+/i.test(lower)) {
-        const snMatch = lower.match(/onu\s+([a-z0-9]+)/i);
-        const sn = snMatch ? snMatch[1].toUpperCase() : null;
-        
-        if (sn) {
-            const allOnus = (await cacheGet('smartolt_unconfigured_onus_global', 60, listGlobalUnconfiguredOnus) as any[]) || [];
-            let onu = allOnus.find(o => String(o.sn || o.serial).toUpperCase() === sn);
-            
-            if (!onu) {
-                const oltId = (lower.match(/olt\s+([0-9]+)/i) || [])[1];
-                const ponType = (lower.match(/pon\s+([a-z0-9]+)/i) || [])[1];
-                const port = (lower.match(/port\s+([0-9]+)/i) || [])[1];
-                const board = (lower.match(/board\s+([0-9]+)/i) || [])[1];
-                const model = (lower.match(/model\s+([^\s]+)/i) || [])[1];
-
-                if (oltId) {
-                    onu = {
-                        sn: sn, olt_id: oltId, pon_type: (ponType || 'gpon').toLowerCase(),
-                        board: board || '', port: port || '', onu_type: model, onu_type_name: model, onu_mode: 'Routing'
-                    };
-                }
-            }
-
-            if (onu) {
-                session.pendingAuth = session.pendingAuth || { collected: {} };
-                session.pendingAuth.collected = {
-                    ...session.pendingAuth.collected,
-                    olt_id: onu.olt_id, pon_type: (onu.pon_type || 'gpon').toLowerCase(),
-                    board: onu.board, port: onu.port, sn: onu.sn || onu.serial,
-                    onu_type: onu.onu_type_name || onu.onu_type, onu_mode: 'Routing'
-                };
-                finalContent = `ONU ${sn} seleccionada. Formulario prellenado.`;
-                actionsOut = await buildAuthActions(session.pendingAuth, req);
-            } else {
-                finalContent = 'No pude encontrar los detalles de esa ONU.';
-            }
-        }
-    }
-
-    // ------------------------------------------------------------------
-    // 3. PRIORIDAD BAJA: Listados y Búsquedas Generales
-    // ------------------------------------------------------------------
-    else if (lower.includes('instalaciones pendientes') || /^modo\s+b(usqueda|úsqueda)\s+instalacion$/i.test(lower)) {
-        if (/^modo\s+b(usqueda|úsqueda)\s+instalacion$/i.test(lower)) { 
-            session.searchMode = 'installation'; session.lastContextType = 'installations'; 
-        }
-
-        let items = await listPendingLocalInstallations(20);
-        if (!items?.length) { await fullSyncInstallations(100, 3).catch(()=>{}); items = await listPendingLocalInstallations(20); }
-        
-        const table = buildInstallationsTable(items || []);
-        finalContent = items?.length ? `Instalaciones pendientes:\n\n${table}` : 'No hay instalaciones pendientes.';
-        const fmt = formatEntityList(items || [], 'installation');
-        actionsOut = [...fmt.actions, { id: 'refresh', type: 'button', label: 'Refrescar', payload: 'Enséñame las instalaciones pendientes de evidencia para autorizar el alta' }];
-    }
-    else if (lower.match(/actualiza|refresca|no esta/)) {
-        const ctx = session.lastContextType;
-        const term = session.lastSearchTerm;
-        await (ctx === 'installations' ? fullSyncInstallations() : fullSyncClients());
-        finalContent = 'Base de datos sincronizada. Intenta buscar de nuevo.';
-    }
-    // BÚSQUEDA GENERAL (Regex de Números) - AL FINAL
     else {
-        const docMatch = prompt.match(/\b(\d{6,20})\b/);
-        const nameMatch = prompt.match(/buscar\s+cliente\s+(.+)/i);
-        const searchGenMode = /^modo\s+b(usqueda|úsqueda)\s+general$/i.test(lower);
+        const prompt = content || '';
+        const lower = prompt.toLowerCase();
         
-        if (searchGenMode) { session.searchMode = 'general'; }
+        const structured = await buildStructuredResponse(prompt); 
+        finalContent = structured.content;
+        actionsOut = structured.actions as any[];
+        assistantMetadata = null;
 
-        if (lower.includes('buscar cliente') || docMatch || nameMatch) {
-            const term = docMatch ? docMatch[1] : (nameMatch ? nameMatch[1].trim() : prompt.trim());
-            const { clients, installations, refreshed } = await findOrSync(String(term), 'both');
+        // --- 1. PRIORIDAD ALTA: Comandos Específicos (WiFi, Auth) ---
+
+        // --- LÓGICA ACTIVAR WISPHUB ---
+        if (lower.startsWith('wisphub activate')) {
+          const idMatch = prompt.match(/activate\s+(\d+)/i);
+          const targetId = idMatch ? idMatch[1] : null;
+
+          const baseName = session.lastAuthNameUsed || targetId;
+          const fullGeonetUser = `${baseName}@geonet`;
+
+          if (!targetId) {
+              finalContent = "⚠️ Error: No se detectó ID para activar.";
+          } else {
+              finalContent = `⏳ Activando servicio en Geonet para **${fullGeonetUser}**...`;
+              const exito = await activarInstalacionGeonet(targetId, fullGeonetUser);
+              
+              if (exito) {
+                  finalContent = `🚀 **¡Activación Exitosa!**\nLa instalación **${targetId}** ha sido activada correctamente bajo el usuario \`${fullGeonetUser}\`. Ahora manda las fotos para llevar registro completo.`;
+              } else {
+                  finalContent = `❌ **Error en Activación**\nNo se pudo activar el usuario \`${fullGeonetUser}\`. Por favor, verifique el panel de Geonet.`;
+                  actionsOut = [{ id: 'retry', type: 'button', label: '🔄 Reintentar', payload: `wisphub activate ${targetId}` }];
+              }
+          }
+        }
+        // --- LÓGICA WIFI APPLY ---
+        else if (lower.startsWith('wifi apply')) {
+            const snMatch = prompt.match(/sn\s+([a-zA-Z0-9]+)/i);
+            const ssidMatch = prompt.match(/ssid\s+(.+?)(?=\s+pass)/i); 
+            const passMatch = prompt.match(/pass\s+(.+?)(?=\s+contract_id|$)/i);
+
+            const bodyData = req.body || {};
+            const container = bodyData.collected || bodyData.data || {};
             
-            session.lastSearchTerm = String(term);
-            session.lastContextType = 'clients-installations';
+            const sn = (snMatch ? snMatch[1].toUpperCase() : null) || container.sn;
+            const ssid = (ssidMatch ? ssidMatch[1].trim() : null) || bodyData.wifi_ssid || container.wifi_ssid;
+            const pass = (passMatch ? passMatch[1].trim() : null) || bodyData.wifi_pass || container.wifi_pass;
 
-            const cFmt = formatEntityList(clients, 'client');
-            const iFmt = formatEntityList(installations, 'installation');
+            if (sn && ssid && pass) {
+                try {
+                    const internalId = await getInternalOnuIdBySn(sn);
+                    
+                    if (!internalId) {
+                        finalContent = `❌ Error: No se encontró el ID interno de la ONU ${sn}. Verifique autorización.`;
+                    } else {
+                        const results = [];
+                        // 2.4GHz
+                        try {
+                            await updateOnuWifi(internalId, '2.4GHz', ssid, pass, true);
+                            results.push('✅ 2.4GHz Configurado');
+                        } catch (e: any) {
+                            results.push(`❌ 2.4GHz Falló: ${e.message}`);
+                        }
+                        // 5GHz
+                        try {
+                            await updateOnuWifi(internalId, '5GHz', `${ssid}_5G`, pass, true);
+                            results.push('✅ 5GHz Configurado');
+                        } catch (e: any) {
+                            results.push(`⚠️ 5GHz: ${e.message || 'No disponible'}`);
+                        }
+                        
+                        finalContent = `📡 Resultado WiFi (SN: ${sn}):\nSSID: ${ssid}\nClave: ${pass}\n\n${results.join('\n')}`;
+                        
+                        actionsOut = [];
+                        
+                        const targetId = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
 
-            if (clients.length + installations.length > 0) {
-                finalContent = `Resultados para "${term}":\n\n${cFmt.textLines.join('\n')}\n\n${iFmt.textLines.join('\n')}`;
-                actionsOut = [
-                    { id: 'mode-inst', type: 'button', label: 'Modo Instalación', payload: 'modo busqueda instalacion' }, 
-                    ...cFmt.actions, ...iFmt.actions
-                ];
+                        if (targetId) {
+                            actionsOut.push(
+                                { 
+                                    id: 'btn-contrato', 
+                                    type: 'button', 
+                                    label: '📄 Generar Contrato', 
+                                    payload: `generar contrato ${targetId}` 
+                                },
+                            );
+                            finalContent += `\n\n👇 Acciones post-instalación para ID ${targetId}:`;
+                        } else {
+                            finalContent += `\n\n(ℹ️ No se detectó un ID seleccionado previamente para generar el contrato)`;
+                        }
+                    }
+                } catch (err: any) {
+                    console.error('Error general Wifi:', err);
+                    finalContent = `❌ Error crítico WiFi: ${err.message}`;
+                }
             } else {
-                finalContent = `${refreshed ? 'Actualicé BD pero no' : 'No'} encontré resultados para "${term}".`;
+                finalContent = '⚠️ Error de formato WiFi. Intente de nuevo.';
             }
         }
-    }
+        else if (lower.startsWith('generar contrato')) {
+          const idMatch = prompt.match(/generar contrato\s+(\d+)/i);
+          const targetId = idMatch ? idMatch[1] : null;
+          if (targetId) {
+              finalContent = `📄 Generando contrato para ID **${targetId}**...`;
+              await processContractUpdate(targetId).catch(err => {
+                  console.error('Error generating contract:', err);
+              });
+              const baseName = session.lastAuthNameUsed || targetId;
+
+              let contratourl = await getAutoLoginContractLink(`${baseName}@geonet`, targetId);
+              
+              finalContent = `✅ Contrato generado:`;
+              const directActions: any[] = [];
+                  directActions.push(
+                     { 
+                        id: 'btn-contrato', 
+                        type: 'link', 
+                        label: '📄 Copiar Contrato', 
+                        url: `${contratourl}` 
+                     },
+                     { 
+                        id: 'btn-activar-wisphub', 
+                        type: 'button', 
+                        label: '🚀 Activar en WispHub', 
+                        payload: `wisphub activate ${targetId}` 
+                     });
+              actionsOut = directActions;
+          } else {
+              finalContent = '⚠️ Error: No se detectó ID para generar contrato.';
+          }
+        }
+      
+        // --- LÓGICA AUTH SUBMIT ---
+        else if (lower === 'auth submit') {
+            if (!session.pendingAuth) finalContent = 'No hay autorización en curso.';
+            else { await submitAuth(req, res); return; }
+        }
+        
+        // --- 2. PRIORIDAD MEDIA: Selección de Cliente/Instalación ---
+        else if (/^(seleccionar|select) (cliente|instalación|instalacion)/i.test(lower)) {
+            const isClient = lower.includes('cliente');
+            const id = Number(lower.split(/\s+/).pop());
+            
+            let entity: any = null;
+            if (isClient) {
+                 const repo = AppDataSource.getRepository(Client);
+                 entity = await repo.findOne({ where: { id_servicio: id } });
+            } else {
+                 const repo = AppDataSource.getRepository(Installation);
+                 entity = await repo.findOne({ where: { id: id } });
+            }
+
+            if (entity) {
+                 const serviceId = entity.id_servicio || entity.id; 
+                 session.lastSelectedClientIdServicio = serviceId; 
+                 if (!isClient) session.lastSelectedInstallationId = entity.id;
+
+                 const { text, actions, assistantMetadata: meta } = await prepareAuthSession(session, entity, isClient ? 'client' : 'installation');
+                 assistantMetadata = meta;
+
+                 const clientDetails = buildClientDetails(entity, isClient ? 'client' : 'installation');
+
+                 finalContent = `${clientDetails}\n\n📡 **Disponibilidad en SmartOLT:**\n${text}\n👇 Selecciona una ONU libre abajo o completa el formulario.`;
+                 actionsOut = actions;
+
+                 if (isClient) {
+                     const insts = await AppDataSource.getRepository(Installation).find({ where: { id_servicio: (entity as Client).id_servicio }, take: 5 });
+                     if (insts.length) {
+                         const iFmt = formatEntityList(insts, 'installation');
+                         finalContent += `\n\n⚠️ **Instalaciones vinculadas encontradas:**`;
+                         actionsOut = [...actionsOut, ...iFmt.actions];
+                     }
+                 }
+            } else {
+                finalContent = `${isClient ? 'Cliente' : 'Instalación'} no encontrada.`;
+            }
+        }
+        // --- LÓGICA SELECCIÓN MANUAL DE ONU ---
+        else if (/^seleccionar\s+onu\s+/i.test(lower)) {
+            const snMatch = lower.match(/onu\s+([a-z0-9]+)/i);
+            const sn = snMatch ? snMatch[1].toUpperCase() : null;
+            
+            if (sn) {
+                const allOnus = (await cacheGet('smartolt_unconfigured_onus_global', 60, listGlobalUnconfiguredOnus) as any[]) || [];
+                let onu = allOnus.find(o => String(o.sn || o.serial).toUpperCase() === sn);
+                
+                if (!onu) {
+                    const oltId = (lower.match(/olt\s+([0-9]+)/i) || [])[1];
+                    const ponType = (lower.match(/pon\s+([a-z0-9]+)/i) || [])[1];
+                    const port = (lower.match(/port\s+([0-9]+)/i) || [])[1];
+                    const board = (lower.match(/board\s+([0-9]+)/i) || [])[1];
+                    const model = (lower.match(/model\s+([^\s]+)/i) || [])[1];
+
+                    if (oltId) {
+                        onu = {
+                            sn: sn, olt_id: oltId, pon_type: (ponType || 'gpon').toLowerCase(),
+                            board: board || '', port: port || '', onu_type: model, onu_type_name: model, onu_mode: 'Routing'
+                        };
+                    }
+                }
+
+                if (onu) {
+                    session.pendingAuth = session.pendingAuth || { collected: {} };
+                    session.pendingAuth.collected = {
+                        ...session.pendingAuth.collected,
+                        olt_id: onu.olt_id, pon_type: (onu.pon_type || 'gpon').toLowerCase(),
+                        board: onu.board, port: onu.port, sn: onu.sn || onu.serial,
+                        onu_type: onu.onu_type_name || onu.onu_type, onu_mode: 'Routing'
+                    };
+                    finalContent = `ONU ${sn} seleccionada. Formulario prellenado.`;
+                    actionsOut = await buildAuthActions(session.pendingAuth, req);
+                } else {
+                    finalContent = 'No pude encontrar los detalles de esa ONU.';
+                }
+            }
+        }
+
+        // --- 3. PRIORIDAD BAJA: Listados y Búsquedas Generales ---
+        else if (lower.includes('instalaciones pendientes') || /^modo\s+b(usqueda|úsqueda)\s+instalacion$/i.test(lower)) {
+            if (/^modo\s+b(usqueda|úsqueda)\s+instalacion$/i.test(lower)) { 
+                session.searchMode = 'installation'; session.lastContextType = 'installations'; 
+            }
+
+            let items = await listPendingLocalInstallations(20);
+            if (!items?.length) { await fullSyncInstallations(100, 3).catch(()=>{}); items = await listPendingLocalInstallations(20); }
+            
+            const table = buildInstallationsTable(items || []);
+            finalContent = items?.length ? `Instalaciones pendientes:\n\n${table}` : 'No hay instalaciones pendientes.';
+            const fmt = formatEntityList(items || [], 'installation');
+            actionsOut = [...fmt.actions, { id: 'refresh', type: 'button', label: 'Refrescar', payload: 'Enséñame las instalaciones pendientes de evidencia para autorizar el alta' }];
+        }
+        else if (lower.match(/actualiza|refresca|no esta/)) {
+            const ctx = session.lastContextType;
+            await (ctx === 'installations' ? fullSyncInstallations() : fullSyncClients());
+            finalContent = 'Base de datos sincronizada. Intenta buscar de nuevo.';
+        }
+        // BÚSQUEDA GENERAL
+        else {
+            const docMatch = prompt.match(/\b(\d{6,20})\b/);
+            const nameMatch = prompt.match(/buscar\s+cliente\s+(.+)/i);
+            const searchGenMode = /^modo\s+b(usqueda|úsqueda)\s+general$/i.test(lower);
+            
+            if (searchGenMode) { session.searchMode = 'general'; }
+
+            if (lower.includes('buscar cliente') || docMatch || nameMatch) {
+                const term = docMatch ? docMatch[1] : (nameMatch ? nameMatch[1].trim() : prompt.trim());
+                const { clients, installations, refreshed } = await findOrSync(String(term), 'both');
+                
+                session.lastSearchTerm = String(term);
+                session.lastContextType = 'clients-installations';
+
+                const cFmt = formatEntityList(clients, 'client');
+                const iFmt = formatEntityList(installations, 'installation');
+
+                if (clients.length + installations.length > 0) {
+                    finalContent = `Resultados para "${term}":\n\n${cFmt.textLines.join('\n')}\n\n${iFmt.textLines.join('\n')}`;
+                    actionsOut = [
+                        { id: 'mode-inst', type: 'button', label: 'Modo Instalación', payload: 'modo busqueda instalacion' }, 
+                        ...cFmt.actions, ...iFmt.actions
+                    ];
+                } else {
+                    finalContent = `${refreshed ? 'Actualicé BD pero no' : 'No'} encontré resultados para "${term}".`;
+                }
+            }
+        }
+    } // FIN BLOQUE ELSE (TEXTO)
 
   } catch (err: any) {
       console.error('Respond error:', err);
@@ -744,7 +822,7 @@ export async function respond(req: any, res: any) {
   
   return res.json({
       ok: true,
-      userMessage: { role: 'user', content: prompt },
+      userMessage: { role: 'user', content: content, imageUrl: webPath },
       assistantMessage: { role: 'assistant', content: finalContent, actions: actionsOut, metadata: assistantMetadata }
   });
 }
@@ -785,11 +863,11 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
         messages.push('⚠️ Falta IP para WAN.');
     }
     
-    // --- LÓGICA DE VERIFICACIÓN EN TABLA INSTALLATION ---
+    // --- LÓGICA DE VERIFICACIÓN EN TABLA INSTALLATION Y GEONET ---
     
-    // A) Resolvemos el ID
-    let clientid = targetId;
+    // A) Resolvemos el ID y Sesión
     const session = data._session || {};
+    let clientid = targetId;
     if (!clientid) {
         clientid = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
     }
@@ -801,7 +879,6 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
         try {
             const instRepo = AppDataSource.getRepository(Installation);
             
-            // Buscamos si existe una instalación por ID o por ID de servicio que coincida
             const installation = await instRepo.findOne({ 
                 where: [
                     { id: Number(clientid) },
@@ -810,7 +887,6 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
             });
 
             if (installation && installation.sn_onu) {
-                // Comparamos SNs normalizados
                 const storedSn = String(installation.sn_onu).trim().toUpperCase();
                 const newSn = String(onuId).trim().toUpperCase();
 
@@ -826,12 +902,48 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
 
     // C) Ejecutamos Geonet y Artículos SOLO si no se debe saltar
     if (!skipGeonetRegistration) {
+        // Registrar ONU
         await registrarOnuGeonet(data.onu_type, onuId);
         
+        // Agregar Artículo
         console.log('Client ID for adding article:', clientid);
         if (clientid !== undefined) {
             await agregarArticuloACliente(clientid, `${data.name}@geonet` || '', onuId); 
         }
+
+        // --- NUEVA LÓGICA: SUBIDA DE FOTOS PENDIENTES ---
+        if (session.pendingPhotos && session.pendingPhotos.length > 0 && clientid) {
+            messages.push(`\n📤 **Procesando ${session.pendingPhotos.length} fotos guardadas...**`);
+            
+            const baseName = session.lastAuthNameUsed || 'tecnico';
+            const fullGeonetUser = `${baseName}@geonet`;
+            let uploadedCount = 0;
+
+            for (const photo of session.pendingPhotos) {
+                try {
+                    const ok = await uploadDocumentoCliente(
+                        clientid,
+                        fullGeonetUser,
+                        photo.systemPath, // Ruta física
+                        `Evidencia Auto - ${photo.timestamp}`,
+                        photo.caption
+                    );
+                    if (ok) uploadedCount++;
+                } catch (err) {
+                    console.error('Error subiendo foto batch:', err);
+                }
+            }
+
+            if (uploadedCount > 0) {
+                messages.push(`✅ **${uploadedCount} fotos subidas a Geonet.**`);
+            } else {
+                messages.push(`⚠️ Falló la subida automática de fotos.`);
+            }
+
+            // Limpiamos la cola
+            delete session.pendingPhotos;
+        }
+
     } else {
         messages.push('ℹ️ ONU ya registrada en BD (SN coincidente).');
     }
@@ -877,7 +989,7 @@ export async function submitAuth(req: any, res: any) {
     const state = session.pendingAuth || {};
     const merged = { ...state.defaults, ...state.collected, ...req.body, ...req.body.collected };
 
-    // --- 4. CAMBIO CRÍTICO: GUARDAR EL NOMBRE PARA GEONET ---
+    // --- GUARDAR EL NOMBRE PARA GEONET ---
     session.lastAuthNameUsed = merged.name || state.defaults?.name;
     
     // Recuperamos el ID del cliente/instalación de la sesión para pasarlo a processPostAuthActions
@@ -915,10 +1027,16 @@ export async function submitAuth(req: any, res: any) {
 
         if (!success) throw new Error(result?.error || result?.message || 'SmartOLT rechazó la solicitud.');
 
-        // 2. PASAMOS targetId A LA FUNCIÓN DE POST-PROCESO
+        // 2. PASAMOS targetId Y LA SESIÓN A LA FUNCIÓN DE POST-PROCESO
         const postResult = await processPostAuthActions({
-            ...merged, onu_external_id: explicitSn, vlan: cleanVlan, address_or_comment: finalAddress, odb_port: cleanOdbPort
-        ,onu_type: merged.onu_type, _session: session }, targetId);
+            ...merged, 
+            onu_external_id: explicitSn, 
+            vlan: cleanVlan, 
+            address_or_comment: finalAddress, 
+            odb_port: cleanOdbPort,
+            onu_type: merged.onu_type, 
+            _session: session // <--- Pasamos la sesión para acceder a pendingPhotos
+        }, targetId);
 
         cacheDelete('listOlts');
         if (merged.olt_id) cacheDelete(`onus:${merged.olt_id}`);

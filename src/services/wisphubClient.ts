@@ -7,7 +7,9 @@ import { AppDataSource } from '../datasource';
 import { Client } from '../models/Client';
 import { WISPHUB } from '../config';
 import { parseRaw, asString, asDateString, stripHtml } from './rawParser';
-
+import * as fs from 'fs';
+import * as path from 'path';
+// ... tus otros imports (axios, wrapper, CookieJar, FormData, etc.)
 // --- UTILIDADES DE FECHA ---
 
 /** Formatea una fecha JS a DD/MM/YYYY (Formato requerido por Geonet) */
@@ -733,6 +735,8 @@ export async function agregarArticuloACliente(
     return false;
   }
 }
+
+
 export async function searchLocal(term: string, limit = 50) {
   const repo = AppDataSource.getRepository(Client);
   return repo.createQueryBuilder('c')
@@ -749,6 +753,145 @@ export async function searchLocal(term: string, limit = 50) {
     .orWhere('c.mac_cpe LIKE :q', { q: `%${term}%` })
     .limit(limit)
     .getMany();
+}
+// =============================================================================
+// SECCIÓN: SUBIDA DE DOCUMENTOS (GEONET)
+// =============================================================================
+
+/**
+ * Helper para detectar el tipo MIME correcto del archivo.
+ * Vital para evitar el Error 500 en Django.
+ */
+function getMimeType(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case '.png': return 'image/png';
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg';
+    case '.pdf': return 'application/pdf';
+    case '.doc':
+    case '.docx': return 'application/msword';
+    default: return 'application/octet-stream';
+  }
+}
+
+/**
+ * Sube una imagen o documento al perfil de un cliente en Geonet.
+ * Replica el comportamiento del formulario "Agregar archivo".
+ * * @param clienteId - ID numérico del cliente (ej: 1178)
+ * @param clienteUsuario - Slug del usuario (ej: "yanira_1178@geonet")
+ * @param filePath - Ruta absoluta o relativa al archivo en tu PC
+ * @param titulo - (Opcional) Título del documento. Si no se da, usa el nombre del archivo.
+ * @param descripcion - (Opcional) Descripción.
+ * @param visible - (Opcional) Si es visible para el cliente (True/False). Default: true.
+ */
+
+export async function uploadDocumentoCliente(
+  clienteId: number | string,
+  clienteUsuario: string,
+  filePath: string,
+  titulo?: string,
+  descripcion: string = 'Carga automática via Bot',
+  visible: boolean = true
+): Promise<boolean> {
+
+  // --- LÓGICA DE RUTAS DOCKER / LINUX ---
+  let systemPath = filePath;
+
+  // 1. Detectamos si es una ruta absoluta que apunta a la raíz '/' 
+  // pero que debería estar dentro del WORKDIR del contenedor.
+  if (filePath.startsWith('/')) {
+      // Verificamos si existe en la raíz absoluta (poco probable en Docker a menos que sea un volumen externo)
+      if (!fs.existsSync(filePath)) {
+          // Si no existe en raíz, asumimos que es relativa al directorio de trabajo del bot (/app)
+          const relativePath = filePath.replace(/^\//, ''); // Quitamos el slash inicial
+          systemPath = path.join(process.cwd(), relativePath);
+      }
+  } 
+  // 2. Si es relativa normal
+  else if (!path.isAbsolute(filePath)) {
+      systemPath = path.join(process.cwd(), filePath);
+  }
+
+  // --- DEBUGGING PARA DOCKER ---
+  // Esto aparecerá en los logs del contenedor (docker logs <container_id>)
+  if (!fs.existsSync(systemPath)) {
+    console.error(`❌ [DOCKER ERROR] Archivo no encontrado.`);
+    console.error(`   👉 Ruta recibida (BD): ${filePath}`);
+    console.error(`   👉 Ruta intentada (Sistema): ${systemPath}`);
+    console.error(`   👉 Directorio de trabajo (CWD): ${process.cwd()}`);
+    
+    // Intento desesperado: Listar carpeta uploads para ver si hay algo
+    try {
+        const uploadDir = path.join(process.cwd(), 'uploads', 'chat');
+        console.error(`   📂 Contenido de ${uploadDir}:`, fs.readdirSync(uploadDir));
+    } catch (e) {
+        console.error(`   📂 No se pudo leer la carpeta uploads/chat`);
+    }
+    
+    return false;
+  }
+
+  // ... (RESTO DEL CÓDIGO IGUAL QUE ANTES: PREPARAR FORMDATA Y POST) ...
+  
+  const fileName = path.basename(systemPath);
+  const mimeType = getMimeType(systemPath);
+  const finalTitulo = titulo || fileName;
+  const fileSize = fs.statSync(systemPath).size;
+
+  console.log(`🚀 [Geonet] Subiendo desde Docker: ${systemPath}`);
+
+  const targetUrl = `/clientes/agregar-documento/${clienteUsuario}/`;
+  const fullUrl = `https://admin.geonet.cl${targetUrl}`;
+
+  try {
+    await geonetHttp.get(targetUrl);
+    const cookies = await jar.getCookies('https://admin.geonet.cl');
+    let csrfToken = cookies.find(c => c.key === 'csrftoken')?.value;
+
+    if (!csrfToken) {
+        const logged = await authenticateGeonet();
+        if (!logged) return false;
+        const newCookies = await jar.getCookies('https://admin.geonet.cl');
+        csrfToken = newCookies.find(c => c.key === 'csrftoken')?.value;
+    }
+
+    if (!csrfToken) return false;
+
+    const form = new FormData();
+    form.append('csrfmiddlewaretoken', csrfToken);
+    form.append('titulo', finalTitulo);
+    form.append('descripcion', descripcion);
+    if (visible) form.append('visible', 'on');
+
+    const fileStream = fs.createReadStream(systemPath);
+    form.append('archivo', fileStream, {
+      filename: fileName,
+      contentType: mimeType,
+      knownLength: fileSize
+    });
+
+    const response = await geonetHttp.post(targetUrl, form, {
+      headers: {
+        ...form.getHeaders(),
+        'Referer': fullUrl,
+        'Origin': 'https://admin.geonet.cl',
+        'X-CSRFToken': csrfToken
+      },
+      maxRedirects: 0, 
+      validateStatus: (status) => status >= 200 && status < 400
+    });
+
+    if (response.status === 302 || response.status === 200) {
+      console.log(`✅ Documento subido exitosamente.`);
+      return true;
+    }
+    return false;
+
+  } catch (error: any) {
+    console.error(`❌ Error subiendo documento: ${error.message}`);
+    return false;
+  }
 }
 
 
