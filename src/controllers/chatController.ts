@@ -47,10 +47,7 @@ function cacheDelete(keyPrefix: string) {
   }
 }
 
-/**
- * Guarda la imagen en disco y devuelve las rutas necesarias.
- * Retorna null si falla o no hay imagen.
- */
+
 function saveImageDataUrl(imageDataUrl?: string): { webPath: string; systemPath: string } | null {
   if (!imageDataUrl || typeof imageDataUrl !== 'string') return null;
   try {
@@ -60,19 +57,20 @@ function saveImageDataUrl(imageDataUrl?: string): { webPath: string; systemPath:
     const ext = (matches[1].split('/')[1] || 'png').toLowerCase();
     const fileName = `chat_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
     
-    // Ruta del sistema (física) - Compatible con Docker si se mapea el volumen
+    // USAR process.cwd() IGUAL QUE EN INDEX.TS
     const uploadDir = path.join(process.cwd(), 'uploads', 'chat');
+    
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
     }
-    const systemPath = path.join(uploadDir, fileName);
     
-    // Escribir archivo
+    const systemPath = path.join(uploadDir, fileName);
     fs.writeFileSync(systemPath, Buffer.from(matches[2], 'base64'));
     
-    // Ruta web (para el frontend)
-    const webPath = `/uploads/chat/${fileName}`;
+    // Log para ver en la consola de Docker si realmente se guardó
+    console.log(`💾 Imagen guardada en Docker: ${systemPath}`);
     
+    const webPath = `/uploads/chat/${fileName}`;
     return { webPath, systemPath };
   } catch (err) {
     console.error('Failed to store chat image', err);

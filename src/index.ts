@@ -31,8 +31,8 @@ app.use(
 );
 
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: '20mb' })); 
-app.use(express.urlencoded({ limit: '20mb', extended: true }));
+app.use(express.json({ limit: '50mb' })); // Aumentado por si envían fotos 4K
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 app.use(
   session({
@@ -42,15 +42,27 @@ app.use(
   })
 );
 
-// --- RUTAS Y CARPETAS ---
-const uploadsPath = path.join(process.cwd(), 'uploads');
+// --- CONFIGURACIÓN DE CARPETAS DE UPLOADS (CRÍTICO) ---
+// Usamos path.resolve para obtener la ruta absoluta real del sistema
+const uploadsPath = path.resolve(process.cwd(), 'uploads');
+const chatUploadsPath = path.join(uploadsPath, 'chat');
+
+// Asegurar que las carpetas existen al iniciar
 if (!fs.existsSync(uploadsPath)) {
-    console.log(`📂 Creando carpeta uploads en: ${uploadsPath}`);
+    console.log(`📂 Creando carpeta base: ${uploadsPath}`);
     fs.mkdirSync(uploadsPath, { recursive: true });
+}
+if (!fs.existsSync(chatUploadsPath)) {
+    console.log(`📂 Creando carpeta chat: ${chatUploadsPath}`);
+    fs.mkdirSync(chatUploadsPath, { recursive: true });
 }
 
 // Servir archivos estáticos
+// Mapea la URL "/uploads" -> Carpeta física "c:\tu-proyecto\uploads"
 app.use('/uploads', express.static(uploadsPath));
+
+// Log de depuración para verificar rutas al arrancar
+console.log(`📡 Sirviendo archivos estáticos desde: ${uploadsPath}`);
 
 // Rutas de API
 app.use('/auth', authRoutes);
@@ -75,13 +87,11 @@ AppDataSource.initialize()
     // 🧹 SISTEMA DE LIMPIEZA AUTOMÁTICA (GARBAGE COLLECTOR)
     // -------------------------------------------------------------
     const limpiarImagenesViejas = () => {
-      // Apuntamos específicamente a la subcarpeta 'chat' donde guardas las evidencias
-      const chatDir = path.join(uploadsPath, 'chat');
-      const diasVida = 30; // Configuración: Borrar fotos de más de 30 días
+      const diasVida = 30; 
       
-      if (!fs.existsSync(chatDir)) return;
+      if (!fs.existsSync(chatUploadsPath)) return;
 
-      fs.readdir(chatDir, (err, files) => {
+      fs.readdir(chatUploadsPath, (err, files) => {
         if (err) return console.error('⚠️ Error leyendo carpeta de limpieza:', err);
 
         const now = Date.now();
@@ -89,48 +99,33 @@ AppDataSource.initialize()
         let contador = 0;
 
         files.forEach((file) => {
-          const filePath = path.join(chatDir, file);
+          const filePath = path.join(chatUploadsPath, file);
           fs.stat(filePath, (err, stats) => {
             if (err) return;
-            // Si la fecha de modificación es más vieja que el límite
             if (now - stats.mtimeMs > millisVida) {
               fs.unlink(filePath, (unlinkErr) => {
-                if (!unlinkErr) {
-                  contador++;
-                  // Log opcional para ver qué se borra (puedes comentarlo)
-                  // console.log(`🗑️ Borrado archivo antiguo: ${file}`);
-                }
+                if (!unlinkErr) contador++;
               });
             }
           });
         });
-        // Nota: El console.log de abajo podría salir antes de terminar de borrar por asincronía, 
-        // pero sirve como aviso general.
-        if (files.length > 0) console.log(`🧹 Tarea de limpieza ejecutada en ${chatDir}`);
       });
     };
 
-    // 1. Ejecutar limpieza 10 segundos después de iniciar el servidor
     setTimeout(limpiarImagenesViejas, 10000);
-
-    // 2. Programar limpieza cada 24 horas
     setInterval(limpiarImagenesViejas, 24 * 60 * 60 * 1000);
-    // -------------------------------------------------------------
 
-
-    // Inits de servicios y sincronización WispHub
+    // Inits de servicios y sincronización
     try {
       await refreshZoneOdbCache().catch((e) => console.error('Cache init failed', e));
       const { fullSyncClients } = await import('./services/wisphubClient');
       const { fullSyncInstallations } = await import('./services/wisphubInstallations');
       const syncRawToColumns = (await import('./scripts/syncRawToColumns')).default;
 
-      // Syncs iniciales
       setTimeout(() => { fullSyncClients().catch(() => {}); }, 1000);
       setTimeout(() => { fullSyncInstallations().catch(() => {}); }, 2000);
       setTimeout(() => { syncRawToColumns().catch(() => {}); }, 5000);
 
-      // Cron Jobs (Cada hora)
       setInterval(() => {
         fullSyncClients().catch((e) => console.error('Hourly WispHub sync failed', e?.message));
       }, 60 * 60 * 1000);
@@ -143,7 +138,7 @@ AppDataSource.initialize()
     
     app.listen(port, () => {
         console.log(`🚀 Server listening on port ${port}`);
-        console.log(`📂 Serving uploads from: ${uploadsPath}`);
+        console.log(`📂 VERIFICAR CARPETA DE FOTOS: ${chatUploadsPath}`); // <--- Verifica esta ruta en tu consola
     });
   })
   .catch((err) => {
