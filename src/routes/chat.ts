@@ -1,11 +1,12 @@
 import express from 'express';
 import { requireAuth } from '../middlewares/auth';
-import { addMessage, respond, submitAuth, applyPendingWan } from '../controllers/chatController';
+import { addMessage, respond, submitAuth, applyPendingWan, getUserChats } from '../controllers/chatController';
 import { authenticateGeonet, downloadContratoGeonet } from '../services/wisphubClient';
 
 const router = express.Router();
 
 // --- Rutas del Chat ---
+router.get('/history', requireAuth, getUserChats); // <--- NUEVA RUTA
 router.post('/messages', requireAuth, addMessage);
 router.post('/respond', requireAuth, respond);
 router.post('/submitAuth', requireAuth, submitAuth);

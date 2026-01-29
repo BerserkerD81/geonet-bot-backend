@@ -1067,3 +1067,97 @@ export async function applyPendingWan(req: any, res: any) {
         return res.status(500).json({ error: e.message });
     }
 }
+
+
+export async function getUserChats(req: any, res: any) {
+  const userId = req.session?.userId;
+  if (!userId) return res.status(401).json({ error: 'unauthenticated' });
+
+  try {
+    const repo = AppDataSource.getRepository(ChatMessage);
+
+    const messages = await repo.find({
+      where: { userId: Number(userId) },
+      order: { createdAt: 'ASC' }
+    });
+
+    if (!messages.length) {
+      return res.json({ chats: [] });
+    }
+
+    // 2. Algoritmo de Agrupación por Tiempo (Time-Gap)
+    // Si pasan más de 60 mins entre mensajes, se considera un chat nuevo.
+    const chats: any[] = [];
+    let currentGroup: any[] = [];
+    const TIMEOUT_MS = 60 * 60 * 1000; // 1 Hora
+
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i];
+
+      if (currentGroup.length === 0) {
+        currentGroup.push(msg);
+        continue;
+      }
+
+      const prevMsg = currentGroup[currentGroup.length - 1];
+      
+      // Convertir fechas a timestamp numérico para comparar
+      const tCurrent = new Date(msg.createdAt).getTime();
+      const tPrev = new Date(prevMsg.createdAt).getTime();
+      const diff = tCurrent - tPrev;
+
+      if (diff > TIMEOUT_MS) {
+        // Cierre del grupo anterior
+        chats.push(currentGroup);
+        // Inicio de grupo nuevo
+        currentGroup = [msg];
+      } else {
+        // Continuación del mismo grupo
+        currentGroup.push(msg);
+      }
+    }
+    
+    // Empujar el último grupo
+    if (currentGroup.length > 0) {
+      chats.push(currentGroup);
+    }
+
+    // 3. Formatear para el Frontend
+    // Usamos .reverse() para que los chats más recientes salgan arriba
+    const formattedChats = chats.reverse().map((group) => {
+      const firstMsg = group[0];
+      const lastMsg = group[group.length - 1];
+      
+      // Buscar el primer mensaje del usuario para usarlo como título
+      const firstUserMsg = group.find((m: any) => m.role === 'user');
+      const rawTitle = firstUserMsg ? firstUserMsg.content : (firstMsg.content || 'Conversación');
+      
+      // Limpiar título si es muy largo
+      const title = rawTitle.length > 40 ? rawTitle.substring(0, 40) + '...' : rawTitle;
+
+      return {
+        id: `chat-group-${firstMsg.id}`, // ID virtual basado en el primer mensaje
+        title: title,
+        timestamp: new Date(lastMsg.createdAt).toLocaleString(), // Fecha del último mensaje
+        preview: lastMsg.content.substring(0, 50),
+        isAdminHistory: false,
+        ownerUserId: userId,
+        messages: group.map((m: any) => ({
+          id: `msg-${m.id}`,
+          role: m.role,
+          content: m.content,
+          imageDataUrl: m.imageUrl,
+          createdAt: m.createdAt,
+          actions: m.actions,     // TypeORM debería manejar el JSON automáticamente
+          metadata: m.metadata
+        }))
+      };
+    });
+
+    return res.json({ chats: formattedChats });
+
+  } catch (error) {
+    console.error('Error fetching user chats:', error);
+    return res.status(500).json({ error: 'Error interno al cargar chats' });
+  }
+}
