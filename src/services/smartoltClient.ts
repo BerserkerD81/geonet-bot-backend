@@ -250,14 +250,36 @@ export async function listOlts(options?: { cacheTtlMs?: number }) {
   return fromCache('olts', ttl, fetchOlts);
 }
 
-async function fetchZones(): Promise<SmartOltZone[]> {
-  const data = await getWithPostFallback<{ status?: boolean; response?: SmartOltZone[] } | SmartOltZone[]>(
-    '/api/system/get_zones'
-  );
 
-  if (Array.isArray((data as any)?.response)) return (data as any).response as SmartOltZone[];
-  if (Array.isArray(data)) return data as SmartOltZone[];
-  return [];
+
+async function fetchZones(): Promise<SmartOltZone[]> {
+  // Implementación estricta tipo CURL para obtener TODAS las zonas
+  const url = `${baseUrl}/api/system/get_zones`;
+
+  try {
+    const { data } = await axios.get(url, {
+      headers: {
+        'X-Token': SMARTOLT.apiKey,
+        'Accept': 'application/json'
+      },
+      timeout: 15000
+    });
+
+    // SmartOLT suele devolver: { response: [ ...zonas... ] }
+    if (data && Array.isArray(data.response)) {
+      return data.response as SmartOltZone[];
+    }
+    
+    // O a veces el array directo
+    if (Array.isArray(data)) {
+      return data as SmartOltZone[];
+    }
+
+    return [];
+  } catch (err: any) {
+    console.error('❌ Error fetching Zones:', err?.message || err);
+    return [];
+  }
 }
 
 export async function getZones(options?: { cacheTtlMs?: number }) {
@@ -485,22 +507,54 @@ export async function listGlobalUnconfiguredOnus(options?: { cacheTtlMs?: number
   const ttl = options?.cacheTtlMs ?? 45_000;
   return fromCache('unconfigured:global', ttl, () => fetchGlobalUnconfiguredOnus());
 }
+/**
+ * Obtiene TODOS los ODBs (Splitters) del sistema.
+ * Replica el comando:
+ * curl --location 'https://geonet-cl.smartolt.com/api/system/get_odbs' \
+ * --header 'X-Token: ...'
+// --- REEMPLAZAR BLOQUE DE ODBs ---
 
-async function fetchOdbs(): Promise<Array<{ id?: string; name?: string }>> {
-  const data = await getWithPostFallback<{ status?: boolean; response?: Array<{ id?: string; name?: string }> } | Array<{ id?: string; name?: string }>>(
-    '/api/system/get_odbs'
-  );
+/**
+ * Obtiene TODOS los ODBs (Splitters) del sistema.
+ * Replica el comando CURL verificado.
+ */
+async function fetchOdbs(): Promise<Array<{ id?: string; name?: string; zone_id?: string; zone_name?: string }>> {
+  if (!baseUrl || !SMARTOLT.apiKey) throw new Error('Config missing');
+  
+  const url = `${baseUrl}/api/system/get_odbs`;
 
-  if (Array.isArray((data as any)?.response)) return (data as any).response as Array<{ id?: string; name?: string }>;
-  if (Array.isArray(data)) return data as Array<{ id?: string; name?: string }>;
-  return [];
+  try {
+    const { data } = await axios.get(url, {
+      headers: {
+        'X-Token': SMARTOLT.apiKey,
+        'Accept': 'application/json'
+      },
+      timeout: 30000 // Timeout alto por si la lista es grande
+    });
+
+    // La respuesta típica es { status: true, response: [...] }
+    if (data && Array.isArray(data.response)) {
+      return data.response;
+    }
+
+    // Por si la API devuelve el array directo
+    if (Array.isArray(data)) {
+      return data;
+    }
+
+    console.warn('fetchOdbs: Respuesta inesperada de SmartOLT', data);
+    return [];
+
+  } catch (err: any) {
+    console.error('❌ Error fetching ODBs:', err?.message || err);
+    return [];
+  }
 }
 
 export async function getOdbs(options?: { cacheTtlMs?: number }) {
   const ttl = options?.cacheTtlMs ?? 5 * 60_000;
   return fromCache('odbs', ttl, fetchOdbs);
 }
-
 async function fetchOnuTypes(ponType: 'gpon' | 'epon'): Promise<string[]> {
   const data = await getWithPostFallback<{ status?: boolean; response?: Array<SmartOltOnuType | string> } | Array<SmartOltOnuType | string>>(
     `/api/system/get_onu_types_by_pon_type/${ponType}`

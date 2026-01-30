@@ -79,139 +79,176 @@ export async function getInstallation(req: Request, res: Response) {
 }
 
 export async function listOdbsByZone(req: Request, res: Response) {
+  // 1. Obtener y limpiar el parámetro
   const zoneParam = (req.params.zone || '').toString().trim();
-  if (!zoneParam) return res.status(400).json({ error: 'zone is required' });
-  const zoneName = decodeURIComponent(zoneParam);
+  if (!zoneParam) return res.status(400).json({ error: 'zone parameter is required' });
+
+  const zoneNameDecoded = decodeURIComponent(zoneParam);
+  const isIdParam = !isNaN(Number(zoneParam));
+  const zoneIdTarget = isIdParam ? Number(zoneParam) : null;
 
   try {
-    // Avoid stale cached responses for dynamic SmartOLT data
     res.setHeader('Cache-Control', 'no-store');
 
     const odbRepo = AppDataSource.getRepository(SmartoltOdb);
     const zoneRepo = AppDataSource.getRepository(SmartoltZone);
 
-    const zoneLower = zoneName.toLowerCase();
-    const zoneCode = (zoneLower.match(/z\d+/) || [null])[0];
-    const tokenPattern = zoneLower.split(/\s+/).filter(Boolean).join('%');
-    const tokens = zoneLower.split(/[^a-z0-9]+/).filter(Boolean);
-    const reversed = zoneLower.split(/\s*-\s*/).reverse().join(' - ');
+    // -----------------------------------------------------------
+    // FUNCIONES AUXILIARES
+    // -----------------------------------------------------------
 
-    const findZone = async () => {
-      const qb = zoneRepo
-        .createQueryBuilder('z')
-        .where('LOWER(z.name) = :zone', { zone: zoneLower })
-        .orWhere('LOWER(z.name) LIKE :zoneLike', { zoneLike: `%${zoneLower}%` })
-        .orWhere('LOWER(z.name) = :revZone', { revZone: reversed });
+    /**
+     * Busca la entidad Zona en la DB local.
+     * - Si zoneParam es número, busca por ID.
+     * - Si zoneParam es texto, busca por nombre.
+     */
+    const findZoneLocal = async (): Promise<SmartoltZone | null> => {
+      const qb = zoneRepo.createQueryBuilder('z');
 
-      if (zoneCode) qb.orWhere('LOWER(z.name) LIKE :zoneCode', { zoneCode: `%${zoneCode}%` });
-      if (tokenPattern) qb.orWhere('LOWER(z.name) LIKE :tokenPattern', { tokenPattern: `%${tokenPattern}%` });
-      if (reversed) qb.orWhere('LOWER(z.name) LIKE :revLike', { revLike: `%${reversed}%` });
+      if (isIdParam && zoneIdTarget) {
+        // Búsqueda exacta por ID
+        qb.where('z.id = :id', { id: zoneIdTarget });
+      } else {
+        // Búsqueda por Nombre (para obtener el ID correspondiente)
+        const zoneLower = zoneNameDecoded.toLowerCase();
+        qb.where('LOWER(z.name) = :name', { name: zoneLower })
+          .orWhere('LOWER(z.name) LIKE :likeName', { likeName: `%${zoneLower}%` });
+      }
 
-      return qb.orderBy('LENGTH(z.name)', 'ASC').getOne();
+      return qb.getOne();
     };
 
-    const fetchOdbsForZone = async (zoneId: number) =>
-      odbRepo
-        .createQueryBuilder('o')
+    /**
+     * Busca las ODBs estrictamente por el ID de la zona.
+     */
+    const fetchOdbsByZoneId = async (zoneId: number) => {
+      return odbRepo.createQueryBuilder('o')
         .leftJoinAndSelect('o.zone', 'z')
-        .where('z.id = :zoneId', { zoneId })
+        .where('z.id = :zoneId', { zoneId }) // <--- FILTRO ESTRICTO: zone_id == id
         .orderBy('o.name', 'ASC')
         .getMany();
+    };
 
-    const fetchAndUpsertRemoteForZone = async (): Promise<{ zone?: SmartoltZone; odbs: SmartoltOdb[] }> => {
+    /**
+     * Lógica de sincronización con SmartOLT (API externa).
+     * Se ejecuta solo si no encontramos datos localmente.
+     */
+    const syncRemoteData = async (): Promise<{ zone: SmartoltZone | null; odbs: SmartoltOdb[] }> => {
       try {
-        const remote = await getOdbs();
-        const filtered = (remote || []).filter((o: any) => {
-          const rz = (o?.zone || '').toString().toLowerCase();
+        const remoteData = await getOdbs(); // Trae todas las ODBs de la API
+        if (!remoteData) return { zone: null, odbs: [] };
+
+        // Filtramos los datos remotos para encontrar la zona que buscamos
+        const filteredRemote = remoteData.filter((o: any) => {
+          // CORRECCIÓN: Usar zone_name en lugar de zone según el error de TS
+          const rz = (o?.zone_name || o?.zone || '').toString().toLowerCase();
+          
           if (!rz) return false;
-          if (rz.includes(zoneLower) || zoneLower.includes(rz)) return true;
-          if (tokens.length > 0) return tokens.every((t) => rz.includes(t));
-          return false;
+          return isIdParam ? true : rz.includes(zoneNameDecoded.toLowerCase());
         });
 
-        if (!filtered.length) return { odbs: [] };
+        if (filteredRemote.length === 0) return { zone: null, odbs: [] };
 
-        // Prefer linking by SmartOLT zone_id when available
-        const firstZoneExtId = filtered.map((o: any) => o?.zone_id || o?.zoneId || o?.zoneid).find(Boolean);
-        let zoneRow: SmartoltZone | null = null;
-        if (firstZoneExtId) {
-          zoneRow = await zoneRepo.findOne({ where: { externalId: String(firstZoneExtId) } });
-        }
-        if (!zoneRow) {
-          zoneRow = await findZone();
-        }
-        if (!zoneRow) {
-          zoneRow = zoneRepo.create({ name: zoneName, externalId: firstZoneExtId ? String(firstZoneExtId) : null, collectedAt: new Date() });
-          zoneRow = await zoneRepo.save(zoneRow);
-        } else {
-          zoneRow.externalId = zoneRow.externalId || (firstZoneExtId ? String(firstZoneExtId) : null);
-          zoneRow.collectedAt = new Date();
-          await zoneRepo.save(zoneRow);
+        // Identificar o Crear la Zona Localmente
+        let targetZone = await findZoneLocal();
+
+        if (!targetZone) {
+          // Si no existía, tomamos el nombre del primer resultado remoto
+          const firstMatch = filteredRemote[0];
+          // CORRECCIÓN: Usar zone_name y soportar estructuras remotas variadas (cast a any)
+          const firstZoneName = (firstMatch as any).zone_name || (firstMatch as any).zone || firstMatch.name;
+          const firstZoneExtId = firstMatch.zone_id;
+
+          targetZone = zoneRepo.create({
+            name: firstZoneName,
+            externalId: firstZoneExtId ? String(firstZoneExtId) : null,
+            collectedAt: new Date(),
+          });
+          targetZone = await zoneRepo.save(targetZone);
         }
 
-        await odbRepo.createQueryBuilder().delete().where('zone_id = :zoneId', { zoneId: zoneRow.id }).execute();
+        // Ahora que tenemos targetZone (y su ID), actualizamos sus ODBs
+        // 1. Borramos las ODBs viejas de ESTA zona específica
+        await odbRepo.createQueryBuilder()
+          .delete()
+          .where('zone_id = :zid', { zid: targetZone.id })
+          .execute();
 
-        const odbEntities = filtered.map((o: any) =>
-          odbRepo.create({
+        // 2. Insertamos las nuevas que coincidan con el nombre de la zona encontrada
+        const odbsToInsert = remoteData
+          // CORRECCIÓN: Usar zone_name para comparar
+          .filter((o: any) => (o.zone_name || o.zone) === targetZone!.name) 
+          .map((o: any) => odbRepo.create({
             name: (o?.name || o?.id || '').toString(),
             externalId: o?.id ? String(o.id) : null,
             collectedAt: new Date(),
-            zone: zoneRow!
-          })
-        );
-        if (odbEntities.length) await odbRepo.save(odbEntities);
+            zone: targetZone! // Vinculación relacional
+          }));
 
-        const odbsByZone = await fetchOdbsForZone(zoneRow.id);
-        return { zone: zoneRow, odbs: odbsByZone };
+        if (odbsToInsert.length) {
+          await odbRepo.save(odbsToInsert);
+        }
+
+        // Retornamos buscando de nuevo por ID para asegurar consistencia
+        const finalOdbs = await fetchOdbsByZoneId(targetZone.id);
+        return { zone: targetZone, odbs: finalOdbs };
+
       } catch (err) {
-        console.error('No se pudieron refrescar ODBs desde SmartOLT para zona', zoneName, err);
-        return { odbs: [] };
+        console.error('Error sincronizando datos remotos:', err);
+        return { zone: null, odbs: [] };
       }
     };
 
-    let zone = await findZone();
-    const matchedZone = zone ? { id: zone.id, name: zone.name } : undefined;
-    let odbs = zone ? await fetchOdbsForZone(zone.id) : [];
-    let refreshed = false;
+    // -----------------------------------------------------------
+    // FLUJO PRINCIPAL DE EJECUCIÓN
+    // -----------------------------------------------------------
 
-    // If nothing is found locally, refresh the cache once and retry against DB tables
+    // PASO 1: Intentar buscar la zona localmente
+    let zone = await findZoneLocal();
+    let odbs: SmartoltOdb[] = [];
+    let source = 'db';
+
+    // PASO 2: Si tenemos zona, buscamos sus ODBs por ID
+    if (zone) {
+      odbs = await fetchOdbsByZoneId(zone.id);
+    }
+
+    // PASO 3: Si no hay zona o no hay ODBs, intentamos sincronizar con remoto
     if (!zone || odbs.length === 0) {
-      await refreshZoneOdbCache().catch(() => {});
-      refreshed = true;
-      zone = await findZone();
-      odbs = zone ? await fetchOdbsForZone(zone.id) : [];
+      const remoteResult = await syncRemoteData();
+      
+      if (remoteResult.zone) {
+        zone = remoteResult.zone;
+        odbs = remoteResult.odbs;
+        source = 'db-refreshed';
+      }
     }
 
-    // If still nothing, pull from SmartOLT filtered by this zone name and persist locally
-    if ((!zone || odbs.length === 0) && !odbs.length) {
-      const remote = await fetchAndUpsertRemoteForZone();
-      if (remote.zone) zone = remote.zone;
-      if (remote.odbs.length) odbs = remote.odbs;
-      refreshed = refreshed || remote.odbs.length > 0;
-    }
-
+    // PASO 4: Respuesta final
     if (!zone) {
-      return res.status(404).json({ ok: false, error: `Zona "${zoneName}" no encontrada en la base local` });
+      return res.status(404).json({ 
+        ok: false, 
+        error: `Zona no encontrada: ${zoneNameDecoded}` 
+      });
     }
 
     const payload = odbs.map((o) => ({
       id: o.externalId || String(o.id),
       name: o.name,
-      zoneId: o.zone?.id,
-      zone: o.zone?.name || zoneName,
+      zoneId: o.zone.id,      // ID numérico de la relación
+      zone: o.zone.name,      // Nombre de la zona
       externalId: o.externalId || null
     }));
 
     return res.json({
       ok: true,
-      source: refreshed ? 'db-refreshed' : 'db',
+      source,
       zone: { id: zone.id, name: zone.name },
-      matchedZone: matchedZone || null,
-      tokens,
       odbs: payload
     });
+
   } catch (err: any) {
-    const msg = err?.response?.data || { error: err?.message || 'Failed to fetch ODBs by zone' };
-    return res.status(500).json(msg);
+    console.error(err);
+    return res.status(500).json({ error: err.message || 'Internal Server Error' });
   }
 }

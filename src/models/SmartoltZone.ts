@@ -6,10 +6,11 @@ export class SmartoltZone {
   @PrimaryGeneratedColumn()
   id!: number;
 
+  // Este guardará el ID "46", "48", etc. del JSON
   @Column({ type: 'varchar', length: 255, unique: true, nullable: true })
   externalId?: string | null;
 
-  @Column({ type: 'varchar', length: 255, unique: true })
+  @Column({ type: 'varchar', length: 255 })
   name!: string;
 
   @Column({ type: 'datetime' })
