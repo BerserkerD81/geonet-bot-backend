@@ -16,6 +16,7 @@ import smartoltRoutes from './routes/smartolt';
 import odbRoutes from './routes/odb';
 import { ensureDefaultAdmin } from './services/adminBootstrap';
 import { verifyTransport } from './services/emailService';
+import { migrateOldMessagesToSessions } from './scripts/migrateSessions'; // <--- Importa la función
 import { refreshZoneOdbCache } from './services/zoneOdbCache';
 import fs from 'fs';
 
@@ -82,6 +83,13 @@ const port = Number(process.env.PORT) || 3000;
 AppDataSource.initialize()
   .then(async () => {
     await ensureDefaultAdmin();
+    try {
+      // Esto solo hará algo si encuentra mensajes con sessionId en NULL
+      await migrateOldMessagesToSessions(); 
+      console.log('✅ Verificación de integridad de sesiones completada.');
+    } catch (e) {
+      console.error('❌ Error durante la migración de sesiones:', e);
+    }
 
     // -------------------------------------------------------------
     // 🧹 SISTEMA DE LIMPIEZA AUTOMÁTICA (GARBAGE COLLECTOR)

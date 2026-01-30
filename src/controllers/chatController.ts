@@ -1,5 +1,6 @@
 import { AppDataSource } from '../datasource';
 import { ChatMessage } from '../models/ChatMessage';
+import { ChatSession } from '../models/ChatSession';
 import { SmartoltZone } from '../models/SmartoltZone';
 import { SmartoltOdb } from '../models/SmartoltOdb';
 import { Installation } from '../models/Installation';
@@ -47,7 +48,6 @@ function cacheDelete(keyPrefix: string) {
   }
 }
 
-
 function saveImageDataUrl(imageDataUrl?: string): { webPath: string; systemPath: string } | null {
   if (!imageDataUrl || typeof imageDataUrl !== 'string') return null;
   try {
@@ -57,7 +57,6 @@ function saveImageDataUrl(imageDataUrl?: string): { webPath: string; systemPath:
     const ext = (matches[1].split('/')[1] || 'png').toLowerCase();
     const fileName = `chat_${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
     
-    // USAR process.cwd() IGUAL QUE EN INDEX.TS
     const uploadDir = path.join(process.cwd(), 'uploads', 'chat');
     
     if (!fs.existsSync(uploadDir)) {
@@ -67,7 +66,6 @@ function saveImageDataUrl(imageDataUrl?: string): { webPath: string; systemPath:
     const systemPath = path.join(uploadDir, fileName);
     fs.writeFileSync(systemPath, Buffer.from(matches[2], 'base64'));
     
-    // Log para ver en la consola de Docker si realmente se guardó
     console.log(`💾 Imagen guardada en Docker: ${systemPath}`);
     
     const webPath = `/uploads/chat/${fileName}`;
@@ -103,6 +101,38 @@ function pickFirstString(values: Array<any>): string | undefined {
     if (s) return s;
   }
   return undefined;
+}
+
+// --- HELPERS: Form Persistence ---
+
+function freezeFormActions(originalActions: any[], submittedData: any): any[] {
+  if (!Array.isArray(originalActions)) return [];
+
+  return originalActions.map(action => {
+    if (action.type === 'input' || action.type === 'select') {
+      let val = '';
+      if (submittedData[action.id] !== undefined) {
+          val = submittedData[action.id];
+      } else {
+          const keyFromId = action.id.replace(/^auth-|^wifi_/, '').replace('-', '_');
+          if (submittedData[keyFromId] !== undefined) {
+              val = submittedData[keyFromId];
+          }
+      }
+      if (!val && action.value) val = action.value;
+
+      return {
+        ...action,
+        value: val,       
+        disabled: true,
+        label: `${action.label}`
+      };
+    }
+    if (action.type === 'button') {
+      return { ...action, disabled: true, label: action.label + ' (Enviado)' };
+    }
+    return action;
+  });
 }
 
 // --- HELPERS: Data Formatting & Normalization ---
@@ -399,8 +429,6 @@ async function prepareAuthSession(session: any, entity: any, type: 'client' | 'i
     };
 }
 
-// --- CONTROLLER FUNCTIONS ---
-
 export async function buildAuthActions(state: any, req?: any) {
   const defaults = state.defaults || {};
   const collected = state.collected || {};
@@ -434,55 +462,131 @@ export async function buildAuthActions(state: any, req?: any) {
   ];
 }
 
+// =========================================================================
+// --- CONTROLLER FUNCTIONS ---
+// =========================================================================
+
+// NUEVO: Obtener lista de sesiones para Sidebar
+export async function getUserSessions(req: any, res: any) {
+  const userId = req.session?.userId;
+  if (!userId) return res.status(401).json({ error: 'unauthenticated' });
+
+  try {
+    const sessionRepo = AppDataSource.getRepository(ChatSession);
+    const sessions = await sessionRepo.find({
+      where: { userId: Number(userId) },
+      order: { createdAt: 'DESC' },
+      take: 50 // Límite razonable
+    });
+    return res.json({ sessions });
+  } catch (error) {
+    console.error('Error fetching sessions:', error);
+    return res.status(500).json({ error: 'Error interno al cargar sesiones' });
+  }
+}
+
+// NUEVO: Obtener mensajes de una sesión específica
+
+
+// MODIFICADO: Add Message (Creación automática de sesión)
 export async function addMessage(req: any, res: any) {
     const { userId } = req.session || {};
     if (!userId) return res.status(401).json({ error: 'unauthenticated' });
-    const { role, content, imageDataUrl } = req.body;
+    
+    // Recibe sessionId (puede ser null/undefined para chats nuevos)
+    const { role, content, imageDataUrl, sessionId } = req.body;
     
     // Guardamos la imagen si existe
     const savedImage = saveImageDataUrl(imageDataUrl);
     const webPath = savedImage ? savedImage.webPath : undefined;
 
-    const repo = AppDataSource.getRepository(ChatMessage);
-    const msg = repo.create({ 
+    const sessionRepo = AppDataSource.getRepository(ChatSession);
+    const msgRepo = AppDataSource.getRepository(ChatMessage);
+
+    let activeSessionId = sessionId;
+
+    // 1. Si no hay sessionId, creamos una NUEVA sesión
+    if (!activeSessionId) {
+        const title = content ? content.substring(0, 40) + (content.length > 40 ? '...' : '') : 'Nueva Conversación';
+        const newSession = sessionRepo.create({
+            userId: Number(userId),
+            title: title
+        });
+        const savedSession = await sessionRepo.save(newSession);
+        activeSessionId = savedSession.id;
+    }
+
+    // 2. Guardamos el mensaje vinculado a la sesión
+    const msg = msgRepo.create({ 
         userId: Number(userId), 
+        sessionId: Number(activeSessionId), // <--- VINCUACIÓN
         role, 
         content: content || (imageDataUrl ? '[Img]' : ''), 
         imageUrl: webPath 
     });
     
-    await repo.save(msg);
-    return res.json({ ok: true, id: msg.id });
+    await msgRepo.save(msg);
+    
+    // Devolvemos el ID de sesión para que el frontend lo actualice
+    return res.json({ ok: true, id: msg.id, sessionId: activeSessionId });
 }
 
-export async function listUserMessages(req: any, res: any) {
-   const repo = AppDataSource.getRepository(ChatMessage);
-   const messages = await repo.find({ where: { userId: Number(req.params.userId) }, order: { createdAt: 'ASC' } });
-   return res.json({ messages });
-}
 
 // --- FUNCIÓN PRINCIPAL DEL BOT (RESPOND) ---
 
 export async function respond(req: any, res: any) {
-  const session = req.session as any;
+  const session = req.session as any; // Express Session (state temporal)
   const userId = session?.userId;
   if (!userId) return res.status(401).json({ error: 'unauthenticated' });
 
-  const { content, imageDataUrl } = req.body;
+  // Recibimos sessionId del frontend (o null si es chat nuevo y addMessage no se llamó antes)
+  const { content, imageDataUrl, collected, actions: submittedActions, sessionId } = req.body;
   if (!content && !imageDataUrl) return res.status(400).json({ error: 'empty' });
 
-  const repo = AppDataSource.getRepository(ChatMessage);
+  const msgRepo = AppDataSource.getRepository(ChatMessage);
+  const sessionRepo = AppDataSource.getRepository(ChatSession);
 
-  // 1. Manejo de Imagen: Guardar físicamente
+  // 1. Garantizar Sesión (por si se llama directo a respond sin addMessage)
+  let activeSessionId = sessionId;
+  if (!activeSessionId) {
+      const title = content ? content.substring(0, 40) : 'Conversación sin título';
+      const newS = await sessionRepo.save(sessionRepo.create({ userId: Number(userId), title }));
+      activeSessionId = newS.id;
+  }
+
+  // 2. Manejo de Imagen: Guardar físicamente
   const savedImage = saveImageDataUrl(imageDataUrl);
   const webPath = savedImage ? savedImage.webPath : undefined;
 
-  // 2. Guardar mensaje del usuario
-  await repo.save(repo.create({ 
+  // --- DETECTAR Y GUARDAR FORMULARIOS ---
+  let userMessageActions = undefined;
+
+  if (collected || (content && content.toLowerCase().startsWith('wifi apply'))) {
+      if (Array.isArray(submittedActions)) {
+          userMessageActions = freezeFormActions(submittedActions, collected || req.body);
+      }
+      else if (content.toLowerCase().startsWith('wifi apply')) {
+          const ssidMatch = content.match(/ssid\s+(.+?)(?=\s+pass)/i);
+          const passMatch = content.match(/pass\s+(.+?)(?=\s+contract_id|$)/i);
+          const ssid = ssidMatch ? ssidMatch[1] : (req.body.wifi_ssid || '***');
+          const pass = passMatch ? passMatch[1] : (req.body.wifi_pass || '***');
+          
+          userMessageActions = [
+              { type: 'input', label: 'SSID Configurado', value: ssid, disabled: true, id: 'wifi_ssid' },
+              { type: 'input', label: 'Password Configurado', value: pass, disabled: true, id: 'wifi_pass' }
+          ];
+      }
+  }
+
+  // 3. Guardar mensaje del usuario (Vinculado a la Session DB)
+  await msgRepo.save(msgRepo.create({ 
       userId: Number(userId), 
+      sessionId: Number(activeSessionId), // <---
       role: 'user', 
       content: content || '[Img]', 
-      imageUrl: webPath 
+      imageUrl: webPath,
+      actions: userMessageActions,
+      metadata: collected ? { submittedData: collected } : undefined
   }));
 
   let finalContent = '';
@@ -491,23 +595,15 @@ export async function respond(req: any, res: any) {
 
   try {
     // ------------------------------------------------------------------
-    // A. LÓGICA DE IMAGEN (NUEVO BLOQUE PRIORITARIO)
+    // A. LÓGICA DE IMAGEN
     // ------------------------------------------------------------------
     if (savedImage && savedImage.systemPath) {
-        // Verificamos si tenemos contexto de un cliente/instalación activa
         const targetId = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
         
-        // --- NUEVA LÓGICA: COLA DE FOTOS ---
-        // Inicializar el buffer de fotos si no existe
-        if (!session.pendingPhotos) {
-            session.pendingPhotos = [];
-        }
+        if (!session.pendingPhotos) session.pendingPhotos = [];
 
-        // Si ya hay cliente seleccionado, subimos directo (o podrías encolar también si prefieres)
         if (targetId) {
             finalContent = `📸 Imagen recibida. Subiendo a Geonet (ID: ${targetId})...`;
-            
-            // Construimos el usuario técnico 
             const baseName = session.lastAuthNameUsed || 'tecnico'; 
             const fullGeonetUser = `${baseName}@geonet`;
 
@@ -515,9 +611,9 @@ export async function respond(req: any, res: any) {
                const subidaExitosa = await uploadDocumentoCliente(
                    targetId, 
                    fullGeonetUser, 
-                   savedImage.systemPath, // Ruta absoluta
+                   savedImage.systemPath, 
                    `Evidencia Chat - ${new Date().toLocaleTimeString()}`, 
-                   content || 'Imagen subida automáticamente desde el chat' // Descripción
+                   content || 'Imagen subida automáticamente desde el chat'
                );
 
                if (subidaExitosa) {
@@ -530,20 +626,18 @@ export async function respond(req: any, res: any) {
                 finalContent = `❌ Error interno al subir evidencia: ${error.message}`;
             }
         } 
-        // Si NO hay cliente seleccionado, guardamos en la cola para procesar después
         else {
             session.pendingPhotos.push({
                 systemPath: savedImage.systemPath,
                 timestamp: new Date().toLocaleTimeString(),
                 caption: content || 'Evidencia previa autorización'
             });
-
             const count = session.pendingPhotos.length;
             finalContent = `📥 **Foto recolectada** (Total pendientes: ${count}).\n\nEstas fotos se subirán automáticamente a Geonet cuando **Actives el Servicio** en Wisphub.`;
         }
     } 
     // ------------------------------------------------------------------
-    // B. LÓGICA DE TEXTO (EXISTENTE)
+    // B. LÓGICA DE TEXTO
     // ------------------------------------------------------------------
     else {
         const prompt = content || '';
@@ -554,9 +648,7 @@ export async function respond(req: any, res: any) {
         actionsOut = structured.actions as any[];
         assistantMetadata = null;
 
-        // --- 1. PRIORIDAD ALTA: Comandos Específicos (WiFi, Auth) ---
-
-        // --- LÓGICA ACTIVAR WISPHUB (CON SUBIDA DE FOTOS BUFFERED) ---
+        // --- WISPHUB ACTIVATE ---
         if (lower.startsWith('wisphub activate')) {
           const idMatch = prompt.match(/activate\s+(\d+)/i);
           const targetId = idMatch ? idMatch[1] : null;
@@ -573,29 +665,24 @@ export async function respond(req: any, res: any) {
               if (exito) {
                   finalContent = `🚀 **¡Activación Exitosa!**\nLa instalación **${targetId}** ha sido activada correctamente bajo el usuario \`${fullGeonetUser}\`.`;
 
-                  // --- SUBIDA DE FOTOS DEL BUFFER AL ACTIVAR ---
                   if (session.pendingPhotos && session.pendingPhotos.length > 0) {
                       finalContent += `\n\n📤 **Procesando ${session.pendingPhotos.length} fotos acumuladas...**`;
                       let uploadedCount = 0;
-
                       for (const photo of session.pendingPhotos) {
                           try {
                               const subidaOk = await uploadDocumentoCliente(
                                   targetId, 
                                   fullGeonetUser, 
-                                  photo.systemPath, // Ruta física
+                                  photo.systemPath, 
                                   `Evidencia Activación - ${photo.timestamp}`, 
                                   photo.caption || 'Foto adjunta al activar'
                               );
                               if (subidaOk) uploadedCount++;
-                          } catch (err) {
-                              console.error('Error subiendo foto batch en activación:', err);
-                          }
+                          } catch (err) { console.error('Error batch foto:', err); }
                       }
-
                       if (uploadedCount > 0) {
                           finalContent += `\n✅ **${uploadedCount} fotos subidas correctamente a la ficha.**`;
-                          delete session.pendingPhotos; // Limpiamos el buffer
+                          delete session.pendingPhotos;
                       } else {
                           finalContent += `\n⚠️ Hubo un problema subiendo las fotos.`;
                       }
@@ -607,12 +694,11 @@ export async function respond(req: any, res: any) {
               }
           }
         }
-        // --- LÓGICA WIFI APPLY ---
+        // --- WIFI APPLY ---
         else if (lower.startsWith('wifi apply')) {
             const snMatch = prompt.match(/sn\s+([a-zA-Z0-9]+)/i);
             const ssidMatch = prompt.match(/ssid\s+(.+?)(?=\s+pass)/i); 
             const passMatch = prompt.match(/pass\s+(.+?)(?=\s+contract_id|$)/i);
-
             const bodyData = req.body || {};
             const container = bodyData.collected || bodyData.data || {};
             
@@ -623,94 +709,57 @@ export async function respond(req: any, res: any) {
             if (sn && ssid && pass) {
                 try {
                     const internalId = await getInternalOnuIdBySn(sn);
-                    
                     if (!internalId) {
                         finalContent = `❌ Error: No se encontró el ID interno de la ONU ${sn}. Verifique autorización.`;
                     } else {
                         const results = [];
-                        // 2.4GHz
-                        try {
-                            await updateOnuWifi(internalId, '2.4GHz', ssid, pass, true);
-                            results.push('✅ 2.4GHz Configurado');
-                        } catch (e: any) {
-                            results.push(`❌ 2.4GHz Falló: ${e.message}`);
-                        }
-                        // 5GHz
-                        try {
-                            await updateOnuWifi(internalId, '5GHz', `${ssid}_5G`, pass, true);
-                            results.push('✅ 5GHz Configurado');
-                        } catch (e: any) {
-                            results.push(`⚠️ 5GHz: ${e.message || 'No disponible'}`);
-                        }
+                        try { await updateOnuWifi(internalId, '2.4GHz', ssid, pass, true); results.push('✅ 2.4GHz Configurado'); } catch (e: any) { results.push(`❌ 2.4GHz Falló: ${e.message}`); }
+                        try { await updateOnuWifi(internalId, '5GHz', `${ssid}_5G`, pass, true); results.push('✅ 5GHz Configurado'); } catch (e: any) { results.push(`⚠️ 5GHz: ${e.message || 'No disponible'}`); }
                         
                         finalContent = `📡 Resultado WiFi (SN: ${sn}):\nSSID: ${ssid}\nClave: ${pass}\n\n${results.join('\n')}`;
-                        
                         actionsOut = [];
-                        
                         const targetId = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
 
                         if (targetId) {
-                            actionsOut.push(
-                                { 
-                                    id: 'btn-contrato', 
-                                    type: 'button', 
-                                    label: '📄 Generar Contrato', 
-                                    payload: `generar contrato ${targetId}` 
-                                },
-                            );
+                            actionsOut.push({ id: 'btn-contrato', type: 'button', label: '📄 Generar Contrato', payload: `generar contrato ${targetId}` });
                             finalContent += `\n\n👇 Acciones post-instalación para ID ${targetId}:`;
                         } else {
                             finalContent += `\n\n(ℹ️ No se detectó un ID seleccionado previamente para generar el contrato)`;
                         }
                     }
                 } catch (err: any) {
-                    console.error('Error general Wifi:', err);
                     finalContent = `❌ Error crítico WiFi: ${err.message}`;
                 }
             } else {
                 finalContent = '⚠️ Error de formato WiFi. Intente de nuevo.';
             }
         }
+        // --- GENERAR CONTRATO ---
         else if (lower.startsWith('generar contrato')) {
           const idMatch = prompt.match(/generar contrato\s+(\d+)/i);
           const targetId = idMatch ? idMatch[1] : null;
           if (targetId) {
               finalContent = `📄 Generando contrato para ID **${targetId}**...`;
-              await processContractUpdate(targetId).catch(err => {
-                  console.error('Error generating contract:', err);
-              });
+              await processContractUpdate(targetId).catch(err => console.error('Error generating contract:', err));
               const baseName = session.lastAuthNameUsed || targetId;
-
               let contratourl = await getAutoLoginContractLink(`${baseName}@geonet`, targetId);
               
               finalContent = `✅ Contrato generado:`;
-              const directActions: any[] = [];
-                  directActions.push(
-                     { 
-                        id: 'btn-contrato', 
-                        type: 'link', 
-                        label: '📄 Copiar Contrato', 
-                        url: `${contratourl}` 
-                     },
-                     { 
-                        id: 'btn-activar-wisphub', 
-                        type: 'button', 
-                        label: '🚀 Activar en WispHub', 
-                        payload: `wisphub activate ${targetId}` 
-                     });
-              actionsOut = directActions;
+              actionsOut = [
+                     { id: 'btn-contrato', type: 'link', label: '📄 Copiar Contrato', url: `${contratourl}` },
+                     { id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` }
+              ];
           } else {
               finalContent = '⚠️ Error: No se detectó ID para generar contrato.';
           }
         }
-      
-        // --- LÓGICA AUTH SUBMIT ---
+        // --- AUTH SUBMIT (Trigger) ---
         else if (lower === 'auth submit') {
             if (!session.pendingAuth) finalContent = 'No hay autorización en curso.';
             else { await submitAuth(req, res); return; }
         }
         
-        // --- 2. PRIORIDAD MEDIA: Selección de Cliente/Instalación ---
+        // --- SELECCIONAR CLIENTE/INSTALACION ---
         else if (/^(seleccionar|select) (cliente|instalación|instalacion)/i.test(lower)) {
             const isClient = lower.includes('cliente');
             const id = Number(lower.split(/\s+/).pop());
@@ -733,7 +782,6 @@ export async function respond(req: any, res: any) {
                  assistantMetadata = meta;
 
                  const clientDetails = buildClientDetails(entity, isClient ? 'client' : 'installation');
-
                  finalContent = `${clientDetails}\n\n📡 **Disponibilidad en SmartOLT:**\n${text}\n👇 Selecciona una ONU libre abajo o completa el formulario.`;
                  actionsOut = actions;
 
@@ -749,7 +797,7 @@ export async function respond(req: any, res: any) {
                 finalContent = `${isClient ? 'Cliente' : 'Instalación'} no encontrada.`;
             }
         }
-        // --- LÓGICA SELECCIÓN MANUAL DE ONU ---
+        // --- SELECCIONAR ONU ---
         else if (/^seleccionar\s+onu\s+/i.test(lower)) {
             const snMatch = lower.match(/onu\s+([a-z0-9]+)/i);
             const sn = snMatch ? snMatch[1].toUpperCase() : null;
@@ -764,12 +812,8 @@ export async function respond(req: any, res: any) {
                     const port = (lower.match(/port\s+([0-9]+)/i) || [])[1];
                     const board = (lower.match(/board\s+([0-9]+)/i) || [])[1];
                     const model = (lower.match(/model\s+([^\s]+)/i) || [])[1];
-
                     if (oltId) {
-                        onu = {
-                            sn: sn, olt_id: oltId, pon_type: (ponType || 'gpon').toLowerCase(),
-                            board: board || '', port: port || '', onu_type: model, onu_type_name: model, onu_mode: 'Routing'
-                        };
+                        onu = { sn: sn, olt_id: oltId, pon_type: (ponType || 'gpon').toLowerCase(), board: board || '', port: port || '', onu_type: model, onu_type_name: model, onu_mode: 'Routing' };
                     }
                 }
 
@@ -788,16 +832,13 @@ export async function respond(req: any, res: any) {
                 }
             }
         }
-
-        // --- 3. PRIORIDAD BAJA: Listados y Búsquedas Generales ---
+        // --- LISTADOS Y BUSQUEDA ---
         else if (lower.includes('instalaciones pendientes') || /^modo\s+b(usqueda|úsqueda)\s+instalacion$/i.test(lower)) {
             if (/^modo\s+b(usqueda|úsqueda)\s+instalacion$/i.test(lower)) { 
                 session.searchMode = 'installation'; session.lastContextType = 'installations'; 
             }
-
             let items = await listPendingLocalInstallations(20);
             if (!items?.length) { await fullSyncInstallations(100, 3).catch(()=>{}); items = await listPendingLocalInstallations(20); }
-            
             const table = buildInstallationsTable(items || []);
             finalContent = items?.length ? `Instalaciones pendientes:\n\n${table}` : 'No hay instalaciones pendientes.';
             const fmt = formatEntityList(items || [], 'installation');
@@ -808,12 +849,10 @@ export async function respond(req: any, res: any) {
             await (ctx === 'installations' ? fullSyncInstallations() : fullSyncClients());
             finalContent = 'Base de datos sincronizada. Intenta buscar de nuevo.';
         }
-        // BÚSQUEDA GENERAL
         else {
             const docMatch = prompt.match(/\b(\d{6,20})\b/);
             const nameMatch = prompt.match(/buscar\s+cliente\s+(.+)/i);
             const searchGenMode = /^modo\s+b(usqueda|úsqueda)\s+general$/i.test(lower);
-            
             if (searchGenMode) { session.searchMode = 'general'; }
 
             if (lower.includes('buscar cliente') || docMatch || nameMatch) {
@@ -822,33 +861,37 @@ export async function respond(req: any, res: any) {
                 
                 session.lastSearchTerm = String(term);
                 session.lastContextType = 'clients-installations';
-
                 const cFmt = formatEntityList(clients, 'client');
                 const iFmt = formatEntityList(installations, 'installation');
 
                 if (clients.length + installations.length > 0) {
                     finalContent = `Resultados para "${term}":\n\n${cFmt.textLines.join('\n')}\n\n${iFmt.textLines.join('\n')}`;
-                    actionsOut = [
-                        { id: 'mode-inst', type: 'button', label: 'Modo Instalación', payload: 'modo busqueda instalacion' }, 
-                        ...cFmt.actions, ...iFmt.actions
-                    ];
+                    actionsOut = [{ id: 'mode-inst', type: 'button', label: 'Modo Instalación', payload: 'modo busqueda instalacion' }, ...cFmt.actions, ...iFmt.actions];
                 } else {
                     finalContent = `${refreshed ? 'Actualicé BD pero no' : 'No'} encontré resultados para "${term}".`;
                 }
             }
         }
-    } // FIN BLOQUE ELSE (TEXTO)
+    }
 
   } catch (err: any) {
       console.error('Respond error:', err);
       finalContent += `\n(Error interno: ${err.message})`;
   }
 
-  const msg = repo.create({ userId: Number(userId), role: 'assistant', content: finalContent, actions: actionsOut, metadata: assistantMetadata });
-  await repo.save(msg);
+  const msg = msgRepo.create({ 
+      userId: Number(userId), 
+      sessionId: Number(activeSessionId), // <---
+      role: 'assistant', 
+      content: finalContent, 
+      actions: actionsOut, 
+      metadata: assistantMetadata 
+  });
+  await msgRepo.save(msg);
   
   return res.json({
       ok: true,
+      sessionId: activeSessionId, // Importante retornar el ID
       userMessage: { role: 'user', content: content, imageUrl: webPath },
       assistantMessage: { role: 'assistant', content: finalContent, actions: actionsOut, metadata: assistantMetadata }
   });
@@ -890,65 +933,43 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
         messages.push('⚠️ Falta IP para WAN.');
     }
     
-    // --- LÓGICA DE VERIFICACIÓN EN TABLA INSTALLATION Y GEONET ---
-    
-    // A) Resolvemos el ID y Sesión
+    // --- VERIFICACIÓN EN TABLA INSTALLATION Y GEONET ---
     const session = data._session || {};
     let clientid = targetId;
     if (!clientid) {
         clientid = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
     }
-
     let skipGeonetRegistration = false;
-
-    // B) Consultamos la tabla Installation si tenemos un ID
     if (clientid) {
         try {
             const instRepo = AppDataSource.getRepository(Installation);
-            
             const installation = await instRepo.findOne({ 
-                where: [
-                    { id: Number(clientid) },
-                    { id_servicio: Number(clientid) }
-                ]
+                where: [{ id: Number(clientid) }, { id_servicio: Number(clientid) }]
             });
-
             if (installation && installation.sn_onu) {
                 const storedSn = String(installation.sn_onu).trim().toUpperCase();
                 const newSn = String(onuId).trim().toUpperCase();
-
                 if (storedSn === newSn) {
                     console.log(`ℹ️ El SN ${newSn} ya existe en la tabla Installation (ID: ${installation.id}). Saltando registros.`);
                     skipGeonetRegistration = true;
                 }
             }
-        } catch (err) {
-            console.error('⚠️ Error consultando tabla Installation:', err);
-        }
+        } catch (err) { console.error('⚠️ Error consultando tabla Installation:', err); }
     }
 
-    // C) Ejecutamos Geonet y Artículos SOLO si no se debe saltar
     if (!skipGeonetRegistration) {
-        // Registrar ONU
         await registrarOnuGeonet(data.onu_type, onuId);
-        
-        // Agregar Artículo
-        console.log('Client ID for adding article:', clientid);
         if (clientid !== undefined) {
             await agregarArticuloACliente(clientid, `${data.name}@geonet` || '', onuId); 
         }
-
-        // --- NOTA: Aquí se eliminó la subida de fotos del buffer (movido a wisphub activate) ---
-
     } else {
         messages.push('ℹ️ ONU ya registrada en BD (SN coincidente).');
     }
 
-    // --- 3. LOGICA CONDICIONAL (WIFI vs BOTONES DIRECTOS) ---
+    // --- WIFI vs BOTONES DIRECTOS ---
     const rawType = String(data.onu_type || '').toUpperCase().replace(/[- ]/g, '');
-    const wifiModels = ['ZTEF6600P', 'ZXHNF600P']; // Modelos que SÍ requieren WiFi manual
+    const wifiModels = ['ZTEF6600P', 'ZXHNF600P'];
 
-    // Si ES uno de los modelos WiFi, mostramos el formulario
     if (wifiModels.includes(rawType)) {
         const wifiActions = [
             { id: 'wifi_ssid', type: 'input', label: 'Nombre WiFi (SSID)', placeholder: 'Nuevo Nombre', payload: 'wifi set ssid {input}' },
@@ -957,40 +978,31 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
         ];
         return { message: messages.join(' '), actions: wifiActions };
     } 
-    // Si NO es de esos modelos, vamos directo a Contrato y Activar
     else {
         const directActions: any[] = [];
         if (targetId) {
-             directActions.push(
-                { 
-                    id: 'btn-contrato', 
-                    type: 'button', 
-                    label: '📄 Generar Contrato', 
-                    payload: `generar contrato ${targetId}` 
-                },
-            );
+             directActions.push({ id: 'btn-contrato', type: 'button', label: '📄 Generar Contrato', payload: `generar contrato ${targetId}` });
             messages.push(`\n\n👇 **Proceso finalizado.** Selecciona una acción:`);
         } else {
             messages.push('\n(⚠️ No se detectó ID asociado para generar contrato)');
         }
-        
         return { message: messages.join(' '), actions: directActions };
     }
 }
 
 export async function submitAuth(req: any, res: any) {
     const session = req.session || {};
-    if (!session.userId) return res.status(401).json({ error: 'unauthenticated' });
+    const userId = session.userId;
+    if (!userId) return res.status(401).json({ error: 'unauthenticated' });
 
+    // Extraemos sessionId del request body para saber dónde guardar la respuesta
+    const sessionId = req.body.sessionId; 
+    
     const state = session.pendingAuth || {};
     const merged = { ...state.defaults, ...state.collected, ...req.body, ...req.body.collected };
 
-    // --- GUARDAR EL NOMBRE PARA GEONET ---
     session.lastAuthNameUsed = merged.name || state.defaults?.name;
-    
-    // Recuperamos el ID del cliente/instalación de la sesión para pasarlo a processPostAuthActions
     const targetId = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
-
     const finalAddress = req.body.address || req.body.collected?.address || merged.address || merged.address_or_comment || merged.direccion || 'Sin dirección';
     let cleanVlan = merged.vlan;
     if (cleanVlan && String(cleanVlan).includes('-')) cleanVlan = String(cleanVlan).split('-')[0].trim();
@@ -1006,6 +1018,23 @@ export async function submitAuth(req: any, res: any) {
         return res.json({ ok: false, message: `Faltan campos: ${missing.join(', ')}`, actions: newActions });
     }
 
+    const msgRepo = AppDataSource.getRepository(ChatMessage);
+
+    // Guardar "intento" del usuario
+    try {
+        const rawActions = await buildAuthActions({ defaults: state.defaults, collected: merged });
+        const frozenActions = freezeFormActions(rawActions, merged);
+        
+        await msgRepo.save(msgRepo.create({ 
+            userId: Number(userId), 
+            sessionId: sessionId ? Number(sessionId) : undefined, // VINCULAR
+            role: 'user', 
+            content: `📝 Solicitud de Autorización Enviada\nSN: ${explicitSn}\nZona: ${merged.zone}`, 
+            actions: frozenActions, 
+            metadata: { type: 'form_submission', context: 'auth_onu', payload: merged }
+        }));
+    } catch (err) { console.error('Error guardando historial Auth form:', err); }
+
     try {
         const authPayload = {
             olt_id: merged.olt_id, pon_type: merged.pon_type || 'gpon', board: merged.board,
@@ -1017,31 +1046,37 @@ export async function submitAuth(req: any, res: any) {
             upload_speed_profile_name: merged.upload_speed_profile_name
         };
 
-        console.log('🚀 Payload Autorización:', JSON.stringify(authPayload));
         const result: any = await authorizeOnu(authPayload);
         const success = result && (result.status === true || String(result.response_code) === 'success');
-
         if (!success) throw new Error(result?.error || result?.message || 'SmartOLT rechazó la solicitud.');
 
-        // 2. PASAMOS targetId Y LA SESIÓN A LA FUNCIÓN DE POST-PROCESO
         const postResult = await processPostAuthActions({
-            ...merged, 
-            onu_external_id: explicitSn, 
-            vlan: cleanVlan, 
-            address_or_comment: finalAddress, 
-            odb_port: cleanOdbPort,
-            onu_type: merged.onu_type, 
-            _session: session 
+            ...merged, onu_external_id: explicitSn, vlan: cleanVlan, address_or_comment: finalAddress, odb_port: cleanOdbPort, onu_type: merged.onu_type, _session: session 
         }, targetId);
 
         cacheDelete('listOlts');
         if (merged.olt_id) cacheDelete(`onus:${merged.olt_id}`);
         delete session.pendingAuth;
 
+        await msgRepo.save(msgRepo.create({ 
+            userId: Number(userId), 
+            sessionId: sessionId ? Number(sessionId) : undefined, // VINCULAR
+            role: 'assistant', 
+            content: postResult.message, 
+            actions: postResult.actions 
+        }));
+
         return res.json({ ok: true, message: postResult.message, actions: postResult.actions });
     } catch (e: any) {
         console.error('❌ Error en submitAuth:', e);
         const errorMsg = e.response?.data?.error || e.message;
+        
+        await msgRepo.save(msgRepo.create({ 
+            userId: Number(userId), 
+            sessionId: sessionId ? Number(sessionId) : undefined, // VINCULAR
+            role: 'assistant', 
+            content: `❌ Error al autorizar: ${errorMsg}` 
+        }));
         return res.status(500).json({ ok: false, error: errorMsg });
     }
 }
@@ -1066,96 +1101,164 @@ export async function applyPendingWan(req: any, res: any) {
     }
 }
 
+// -------------------------------------------------------------------------
+// FUNCIONES DE SOPORTE PARA ADMIN Y LEGACY ROUTING
+// -------------------------------------------------------------------------
 
-export async function getUserChats(req: any, res: any) {
+/**
+ * RESTAURADO: Listar todos los mensajes de un usuario en orden cronológico.
+ * Usado por el Admin Panel para construir el historial.
+ */
+export async function listUserMessages(req: any, res: any) {
+    try {
+        const userId = Number(req.params.userId);
+        if (!userId) return res.status(400).json({ error: 'User ID required' });
+        
+        const repo = AppDataSource.getRepository(ChatMessage);
+        const messages = await repo.find({ 
+            where: { userId: userId }, 
+            order: { createdAt: 'ASC' } 
+        });
+        
+        return res.json({ messages });
+    } catch (error) {
+        console.error('Error fetching user messages (admin)', error);
+        return res.status(500).json({ error: 'Error fetching user history' });
+    }
+}
+// ... importaciones existentes ...
+import { Brackets } from 'typeorm'; // Asegúrate de importar esto de typeorm
+
+// -------------------------------------------------------------------------
+// BÚSQUEDA GLOBAL (Endpoint Nuevo)
+// -------------------------------------------------------------------------
+export async function searchUserMessages(req: any, res: any) {
   const userId = req.session?.userId;
+  const { query } = req.query;
+
+  if (!userId) return res.status(401).json({ error: 'unauthenticated' });
+  if (!query || String(query).trim().length < 2) return res.json({ results: [] });
+
+  try {
+    const msgRepo = AppDataSource.getRepository(ChatMessage);
+    
+    // Debug: Ver con qué ID estamos buscando
+    // console.log(`Buscando "${query}" para usuario ID: ${userId}`);
+
+    const messages = await msgRepo.createQueryBuilder('msg')
+      // Usamos LEFT JOIN para traer el mensaje aunque la sesión se haya borrado
+      .leftJoinAndSelect('msg.session', 'session')
+      .where('msg.userId = :userId', { userId })
+      // COMPATIBILIDAD: Usamos LOWER(col) LIKE LOWER(val) para soportar MySQL y Postgres
+      .andWhere('LOWER(msg.content) LIKE LOWER(:query)', { query: `%${query}%` })
+      .orderBy('msg.createdAt', 'DESC')
+      .take(20)
+      .getMany();
+
+    const results = messages.map(m => ({
+      chatId: String(m.sessionId),
+      // Si no hay sesión (orphan), mostramos un fallback
+      chatTitle: (m as any).session?.title || 'Chat sin título', 
+      chatTimestamp: new Date(m.createdAt).toLocaleDateString(),
+      messageId: m.id, // TypeORM suele devolver number o string según config
+      messageRole: m.role,
+      messageContent: m.content,
+      matchType: 'message'
+    }));
+
+    return res.json({ results });
+  } catch (error) {
+    console.error('Search error:', error);
+    return res.status(500).json({ error: 'Error en búsqueda' });
+  }
+}
+// -------------------------------------------------------------------------
+// OBTENER MENSAJES (Modificado para Contexto y Paginación)
+// -------------------------------------------------------------------------
+// En controllers/chatController.ts
+
+export async function getSessionMessages(req: any, res: any) {
+  const userId = req.session?.userId;
+  const { sessionId } = req.params;
+  const { limit = 20, aroundId, beforeId } = req.query;
+
   if (!userId) return res.status(401).json({ error: 'unauthenticated' });
 
   try {
-    const repo = AppDataSource.getRepository(ChatMessage);
-
-    const messages = await repo.find({
-      where: { userId: Number(userId) },
-      order: { createdAt: 'ASC' }
-    });
-
-    if (!messages.length) {
-      return res.json({ chats: [] });
-    }
-
-    // 2. Algoritmo de Agrupación por Tiempo (Time-Gap)
-    // Si pasan más de 60 mins entre mensajes, se considera un chat nuevo.
-    const chats: any[] = [];
-    let currentGroup: any[] = [];
-    const TIMEOUT_MS = 60 * 60 * 1000; // 1 Hora
-
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i];
-
-      if (currentGroup.length === 0) {
-        currentGroup.push(msg);
-        continue;
-      }
-
-      const prevMsg = currentGroup[currentGroup.length - 1];
-      
-      // Convertir fechas a timestamp numérico para comparar
-      const tCurrent = new Date(msg.createdAt).getTime();
-      const tPrev = new Date(prevMsg.createdAt).getTime();
-      const diff = tCurrent - tPrev;
-
-      if (diff > TIMEOUT_MS) {
-        // Cierre del grupo anterior
-        chats.push(currentGroup);
-        // Inicio de grupo nuevo
-        currentGroup = [msg];
-      } else {
-        // Continuación del mismo grupo
-        currentGroup.push(msg);
-      }
-    }
+    const msgRepo = AppDataSource.getRepository(ChatMessage);
     
-    // Empujar el último grupo
-    if (currentGroup.length > 0) {
-      chats.push(currentGroup);
-    }
-
-    // 3. Formatear para el Frontend
-    // Usamos .reverse() para que los chats más recientes salgan arriba
-    const formattedChats = chats.reverse().map((group) => {
-      const firstMsg = group[0];
-      const lastMsg = group[group.length - 1];
-      
-      // Buscar el primer mensaje del usuario para usarlo como título
-      const firstUserMsg = group.find((m: any) => m.role === 'user');
-      const rawTitle = firstUserMsg ? firstUserMsg.content : (firstMsg.content || 'Conversación');
-      
-      // Limpiar título si es muy largo
-      const title = rawTitle.length > 40 ? rawTitle.substring(0, 40) + '...' : rawTitle;
-
-      return {
-        id: `chat-group-${firstMsg.id}`, // ID virtual basado en el primer mensaje
-        title: title,
-        timestamp: new Date(lastMsg.createdAt).toLocaleString(), // Fecha del último mensaje
-        preview: lastMsg.content.substring(0, 50),
-        isAdminHistory: false,
-        ownerUserId: userId,
-        messages: group.map((m: any) => ({
-          id: `msg-${m.id}`,
-          role: m.role,
-          content: m.content,
-          imageDataUrl: m.imageUrl,
-          createdAt: m.createdAt,
-          actions: m.actions,     // TypeORM debería manejar el JSON automáticamente
-          metadata: m.metadata
-        }))
-      };
+    // 1. Validar que la sesión exista y pertenezca al usuario
+    // Si la búsqueda arrojó un mensaje huérfano (sin sesión), esto daría 404.
+    // Usamos createQueryBuilder para ser más flexibles o un findOne básico.
+    const sessionRepo = AppDataSource.getRepository(ChatSession);
+    const session = await sessionRepo.findOne({ 
+        where: { id: Number(sessionId), userId: Number(userId) } 
     });
 
-    return res.json({ chats: formattedChats });
+    // Si no existe la sesión pero intentamos cargar mensajes, devolvemos array vacío
+    // en lugar de error 404 para que el frontend no rompa.
+    if (!session) {
+        return res.json({ messages: [] });
+    }
 
-  } catch (error) {
-    console.error('Error fetching user chats:', error);
-    return res.status(500).json({ error: 'Error interno al cargar chats' });
+    let messages: any[] = [];
+    const take = Math.min(Number(limit), 50);
+
+    // 2. Lógica de Contexto (Saltar al mensaje)
+    if (aroundId) {
+      const targetId = Number(aroundId);
+      
+      // Mensajes anteriores + el actual
+      const prevMsgs = await msgRepo.createQueryBuilder('msg')
+        .where('msg.sessionId = :sid', { sid: sessionId })
+        .andWhere('msg.id <= :mid', { mid: targetId }) 
+        .orderBy('msg.createdAt', 'DESC') // Hacia atrás
+        .take(Math.ceil(take / 2) + 1)
+        .getMany();
+
+      // Mensajes posteriores
+      const nextMsgs = await msgRepo.createQueryBuilder('msg')
+        .where('msg.sessionId = :sid', { sid: sessionId })
+        .andWhere('msg.id > :mid', { mid: targetId })
+        .orderBy('msg.createdAt', 'ASC') // Hacia adelante
+        .take(Math.ceil(take / 2))
+        .getMany();
+
+      // Unir y ordenar por fecha ascendente para el chat
+      messages = [...prevMsgs, ...nextMsgs].sort((a, b) => 
+        new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+      );
+
+    } 
+    // 3. Lógica de Paginación (Scroll hacia arriba)
+    else if (beforeId) {
+      const targetId = Number(beforeId);
+      
+      messages = await msgRepo.createQueryBuilder('msg')
+        .where('msg.sessionId = :sid', { sid: sessionId })
+        .andWhere('msg.id < :bid', { bid: targetId })
+        .orderBy('msg.createdAt', 'DESC') // Los más recientes anteriores a ese ID
+        .take(take)
+        .getMany();
+      
+      // Invertimos para que queden cronológicos (Viejo -> Nuevo)
+      messages.reverse();
+
+    } 
+    // 4. Lógica Inicial (Últimos mensajes)
+    else {
+      messages = await msgRepo.find({
+        where: { sessionId: Number(sessionId) },
+        order: { createdAt: 'DESC' },
+        take: take
+      });
+      messages.reverse();
+    }
+
+    return res.json({ messages });
+  } catch (error: any) {
+    console.error("Error en getSessionMessages:", error);
+    // Devolvemos 500 con el mensaje para que puedas verlo en la consola del navegador
+    return res.status(500).json({ error: error.message });
   }
 }
