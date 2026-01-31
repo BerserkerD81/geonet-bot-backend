@@ -69,7 +69,7 @@ app.use('/chat', chatRoutes);
 app.use('/clients', clientsRoutes);
 app.use('/integrations', integrationsRoutes);
 app.use('/smartolt', smartoltRoutes);
-app.use('/api', odbRoutes); 
+app.use('/odb', odbRoutes); 
 app.use('/admin', adminRoutes);
 app.use('/installations', installationsRoutes);
 
