@@ -112,20 +112,50 @@ export async function upsertInstallations(items: WisphubInstallationItem[]): Pro
   return processed;
 }
 
-export async function fullSyncInstallations(batchSize = 200, maxPages = 1000) {
-  console.log(`[wisphub] fullSyncInstallations start batchSize=${batchSize} maxPages=${maxPages}`);
+async function purgeMissingInstallations(fetchedIds: Set<number>): Promise<number> {
+  if (!fetchedIds.size) return 0;
+  const repo = AppDataSource.getRepository(Installation);
+  const all = await repo.find({ select: { id: true, id_servicio: true } as any });
+  const toDelete = all
+    .filter((i: any) => i.id_servicio && !fetchedIds.has(Number(i.id_servicio)))
+    .map((i: any) => i.id);
+
+  if (!toDelete.length) return 0;
+
+  const chunkSize = 500;
+  let deleted = 0;
+  for (let i = 0; i < toDelete.length; i += chunkSize) {
+    const chunk = toDelete.slice(i, i + chunkSize);
+    const res = await repo.delete(chunk);
+    deleted += res.affected || 0;
+  }
+  return deleted;
+}
+
+export async function fullSyncInstallations(batchSize = 200, maxPages = 1000, purgeMissing = true) {
+  console.log(`[wisphub] fullSyncInstallations start batchSize=${batchSize} maxPages=${maxPages} purgeMissing=${purgeMissing}`);
   let offset = 0;
   let processed = 0;
+  const fetchedIds = new Set<number>();
   for (let page = 0; page < maxPages; page++) {
     const data = await listInstallationsPage({ limit: batchSize, offset });
+    (data.results || []).forEach((item) => {
+      const idServicio = item.id_servicio ?? item.id;
+      if (idServicio) fetchedIds.add(Number(idServicio));
+    });
     const added = await upsertInstallations(data.results || []);
     processed += added;
     console.log(`[wisphub] sync page=${page + 1} offset=${offset} fetched=${(data.results || []).length} upserted=${added} processed=${processed}`);
     if (!data.next || (data.results || []).length === 0) break;
     offset += batchSize;
   }
+  let deleted = 0;
+  if (purgeMissing) {
+    deleted = await purgeMissingInstallations(fetchedIds);
+    if (deleted) console.log(`[wisphub] fullSyncInstallations purge deleted=${deleted}`);
+  }
   console.log(`[wisphub] fullSyncInstallations done processed=${processed}`);
-  return { processed, lastSyncAt: new Date() };
+  return { processed, deleted, lastSyncAt: new Date() };
 }
 
 export async function searchLocalInstallations(term: string, limit = 50) {
