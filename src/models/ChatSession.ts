@@ -13,6 +13,9 @@ export class ChatSession {
   @Column('varchar', { length: 255, default: 'Conversación Nueva' })
   title!: string;
 
+  @Column('simple-json', { nullable: true })
+  context?: Record<string, any> | null;
+
   @CreateDateColumn()
   createdAt!: Date;
 

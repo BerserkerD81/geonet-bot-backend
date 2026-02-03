@@ -29,7 +29,11 @@ export type WisphubInstallationItem = {
 };
 
 export async function listInstallationsPage(params: Record<string, any> = {}) {
+  console.log('[wisphub] GET /api/instalaciones/', params);
   const res = await http.get('/api/instalaciones/', { params });
+  const count = res?.data?.count ?? 0;
+  const resultsLen = Array.isArray(res?.data?.results) ? res.data.results.length : 0;
+  console.log(`[wisphub] response instalaciones: count=${count}, results=${resultsLen}`);
   return res.data as { count: number; next: string | null; previous: string | null; results: WisphubInstallationItem[] };
 }
 
@@ -109,15 +113,18 @@ export async function upsertInstallations(items: WisphubInstallationItem[]): Pro
 }
 
 export async function fullSyncInstallations(batchSize = 200, maxPages = 1000) {
+  console.log(`[wisphub] fullSyncInstallations start batchSize=${batchSize} maxPages=${maxPages}`);
   let offset = 0;
   let processed = 0;
   for (let page = 0; page < maxPages; page++) {
     const data = await listInstallationsPage({ limit: batchSize, offset });
     const added = await upsertInstallations(data.results || []);
     processed += added;
+    console.log(`[wisphub] sync page=${page + 1} offset=${offset} fetched=${(data.results || []).length} upserted=${added} processed=${processed}`);
     if (!data.next || (data.results || []).length === 0) break;
     offset += batchSize;
   }
+  console.log(`[wisphub] fullSyncInstallations done processed=${processed}`);
   return { processed, lastSyncAt: new Date() };
 }
 
@@ -133,13 +140,29 @@ export async function searchLocalInstallations(term: string, limit = 50) {
 
 export async function listPendingLocalInstallations(limit = 50) {
   const repo = AppDataSource.getRepository(Installation);
-  // Pending: no fecha_instalacion yet OR estado contains 'pend'
-  return repo.createQueryBuilder('i')
+  console.log(`[db] listPendingLocalInstallations limit=${limit}`);
+  // Pending: no fecha_instalacion OR estado/tipo indica preinstalación/pendiente
+  let qb = repo.createQueryBuilder('i')
     .where('i.fecha_instalacion IS NULL')
-    .orWhere('i.estado_instalacion LIKE :p', { p: '%pend%' })
-    .orderBy('i.updatedAt', 'DESC')
-    .limit(limit)
-    .getMany();
+    .orWhere('i.fecha_instalacion = :empty', { empty: '' })
+    .orWhere('LOWER(i.estado_instalacion) LIKE :p', { p: '%pend%' })
+    .orWhere('LOWER(i.estado) LIKE :p', { p: '%pend%' })
+    .orWhere('LOWER(i.tipo) LIKE :pre', { pre: '%preinstal%' })
+    .orderBy('i.updatedAt', 'DESC');
+  if (limit && limit > 0) qb = qb.limit(limit);
+  const results = await qb.getMany();
+  console.log(`[db] listPendingLocalInstallations results=${results.length}`);
+  return results;
+}
+
+export async function listAllLocalInstallations(limit = 0) {
+  const repo = AppDataSource.getRepository(Installation);
+  console.log(`[db] listAllLocalInstallations limit=${limit}`);
+  let qb = repo.createQueryBuilder('i').orderBy('i.updatedAt', 'DESC');
+  if (limit && limit > 0) qb = qb.limit(limit);
+  const results = await qb.getMany();
+  console.log(`[db] listAllLocalInstallations results=${results.length}`);
+  return results;
 }
 
 export async function refreshInstallationsByTerm(term: string): Promise<number> {
@@ -168,5 +191,6 @@ export default {
   upsertInstallations,
   fullSyncInstallations,
   searchLocalInstallations,
-  listPendingLocalInstallations
+  listPendingLocalInstallations,
+  listAllLocalInstallations
 };

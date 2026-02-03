@@ -871,22 +871,98 @@ export async function uploadDocumentoCliente(
       knownLength: fileSize
     });
 
-    const response = await geonetHttp.post(targetUrl, form, {
-      headers: {
-        ...form.getHeaders(),
-        'Referer': fullUrl,
-        'Origin': 'https://admin.geonet.cl',
-        'X-CSRFToken': csrfToken
-      },
-      maxRedirects: 0, 
-      validateStatus: (status) => status >= 200 && status < 400
-    });
+    // --- DEBUG: mostrar cómo se enviará la petición a Geonet / Wisphub ---
+    try {
+      const debugHeaders = { ...form.getHeaders(), Referer: fullUrl, Origin: 'https://admin.geonet.cl', 'X-CSRFToken': csrfToken };
+      console.log('--- [Geonet DEBUG] Preparando subida de documento ---');
+      console.log(`   -> Target URL: ${fullUrl}`);
+      console.log(`   -> Usuario cliente: ${clienteUsuario} (ID: ${clienteId})`);
+      console.log(`   -> Archivo: ${fileName} (${mimeType}), tamaño: ${fileSize} bytes`);
+      console.log(`   -> Form fields: titulo='${finalTitulo}', descripcion='${descripcion}', visible='${visible}'`);
+      console.log('   -> Headers (sensitive values masked):', {
+        ...Object.fromEntries(Object.entries(debugHeaders).map(([k, v]) => [k, k.toLowerCase().includes('cookie') || k.toLowerCase().includes('csrf') ? (String(v).slice(0,8) + '...') : v]))
+      });
 
-    if (response.status === 302 || response.status === 200) {
-      console.log(`✅ Documento subido exitosamente.`);
-      return true;
+      let response = await geonetHttp.post(targetUrl, form, {
+        headers: debugHeaders,
+        maxRedirects: 0,
+        validateStatus: (status) => status >= 200 && status < 400
+      });
+
+      // Detect redirect to login (session expired) and retry once after re-auth
+      try {
+        const finalUrl = response?.request?.res?.responseUrl || response.headers?.location || '';
+        if (finalUrl && finalUrl.includes('/accounts/login/')) {
+          console.warn('⚠️ Geonet redirected to login during upload. Session may have expired. Re-authenticating and retrying upload once.');
+          const logged = await authenticateGeonet();
+          if (logged) {
+            const newCookies = await jar.getCookies('https://admin.geonet.cl');
+            csrfToken = newCookies.find(c => c.key === 'csrftoken')?.value;
+            if (csrfToken) {
+              // rebuild form and stream for retry
+              const form2 = new FormData();
+              form2.append('csrfmiddlewaretoken', csrfToken);
+              form2.append('titulo', finalTitulo);
+              form2.append('descripcion', descripcion);
+              if (visible) form2.append('visible', 'on');
+              const fileStream2 = fs.createReadStream(systemPath);
+              form2.append('archivo', fileStream2, { filename: fileName, contentType: mimeType, knownLength: fileSize });
+              const retryHeaders = { ...form2.getHeaders(), Referer: fullUrl, Origin: 'https://admin.geonet.cl', 'X-CSRFToken': csrfToken };
+              console.log('--- [Geonet DEBUG] Reintento de subida después de login ---');
+              const retryResp = await geonetHttp.post(targetUrl, form2, { headers: retryHeaders, maxRedirects: 0, validateStatus: (status) => status >= 200 && status < 400 });
+              response = retryResp;
+              console.log('--- [Geonet DEBUG] Respuesta reintento subida ---');
+            } else {
+              console.error('❌ Re-auth no devolvió CSRF token. Abortando reintento.');
+            }
+          } else {
+            console.error('❌ Re-authentication failed.');
+          }
+        }
+      } catch (e) {
+        console.warn('No se pudo procesar finalUrl para reintentar upload:', e);
+      }
+
+      console.log(`--- [Geonet DEBUG] Respuesta subida ---`);
+      console.log(`   -> Status: ${response.status}`);
+      try {
+        // Mostrar cabeceras y un fragmento del body para depuración
+        console.log('   -> Response headers:', Object.keys(response.headers || {}).slice(0,20));
+        const respText = typeof response.data === 'string' ? response.data : JSON.stringify(response.data).slice(0,1000);
+        console.log('   -> Response body (trunc):', respText.substring(0, 1000));
+      } catch (e) {
+        console.log('   -> No se pudo parsear response.data para debug');
+      }
+
+      // Mostrar URL final de la respuesta (útil para detectar redirect a login o a la ficha del cliente)
+      try {
+        const finalUrl = response?.request?.res?.responseUrl || response.headers?.location || '';
+        console.log('   -> Final URL (response.request.res.responseUrl / location):', finalUrl);
+        if (finalUrl && !finalUrl.includes('/clientes/')) {
+          console.warn('   -> Atención: la URL final no apunta a la ficha de cliente. Podría indicar que la subida no fue aplicada en la ficha.');
+        }
+      } catch (e) { console.log('   -> No se pudo obtener response.request.res.responseUrl para debug'); }
+
+      if (response.status === 302 || response.status === 200) {
+        console.log(`✅ Documento subido exitosamente (status ${response.status}).`);
+        return true;
+      }
+      console.error('❌ Subida retornó código inesperado');
+      return false;
+    } catch (error: any) {
+      console.error(`❌ Error subiendo documento: ${error?.message || error}`);
+      if (error?.response) {
+        try {
+          console.error('   -> Response status:', error.response.status);
+          console.error('   -> Response headers:', Object.keys(error.response.headers || {}));
+          const body = typeof error.response.data === 'string' ? error.response.data : JSON.stringify(error.response.data);
+          console.error('   -> Response body (trunc):', body.substring(0, 2000));
+        } catch (e) {
+          console.error('   -> No se pudo leer error.response para debug');
+        }
+      }
+      return false;
     }
-    return false;
 
   } catch (error: any) {
     console.error(`❌ Error subiendo documento: ${error.message}`);

@@ -19,7 +19,7 @@ import {
   agregarArticuloACliente,
   uploadDocumentoCliente 
 } from '../services/wisphubClient';
-import { searchLocalInstallations, refreshInstallationsByTerm, listPendingLocalInstallations, fullSyncInstallations } from '../services/wisphubInstallations';
+import { searchLocalInstallations, refreshInstallationsByTerm, listPendingLocalInstallations, listAllLocalInstallations, fullSyncInstallations } from '../services/wisphubInstallations';
 import {
   authorizeOnu, listOlts, type OltInfo, getZones, getOltVlans,
   getOdbs, getOnuTypesByPonType, type SmartOltOnu, updateOnuLocation,
@@ -32,6 +32,64 @@ import {
 // --- HELPERS: Caching & Utils ---
 
 const _simpleCache = new Map<string, { ts: number; val: any }>();
+
+const CHAT_CONTEXT_KEYS = [
+  'lastSelectedClientIdServicio',
+  'lastSelectedInstallationId',
+  'lastSelectedIsPyme',
+  'lastSelectedPlan',
+  'pendingAuth',
+  'pendingPhotos',
+  'lastAuthNameUsed',
+  'lastContextType',
+  'lastSearchTerm',
+  'searchMode',
+  'photoFlowMode',
+  'pendingPhotoClientSearch'
+];
+
+async function loadChatContext(session: any, sessionId: number) {
+  if (!session) return;
+  if (!session.chatContexts) session.chatContexts = {};
+
+  let stored = session.chatContexts[String(sessionId)];
+  if (!stored) {
+    try {
+      const sessionRepo = AppDataSource.getRepository(ChatSession);
+      const chatSession = await sessionRepo.findOne({ where: { id: Number(sessionId) } });
+      if (chatSession && chatSession.context) {
+        stored = chatSession.context as any;
+        session.chatContexts[String(sessionId)] = stored;
+      }
+    } catch (e) {
+      console.error('Error cargando contexto desde DB:', e);
+    }
+  }
+
+  const fallback = stored || {};
+  CHAT_CONTEXT_KEYS.forEach((k) => {
+    session[k] = fallback[k];
+  });
+  session.activeChatContextId = sessionId;
+}
+
+async function saveChatContext(session: any, sessionId: number) {
+  if (!session) return;
+  if (!session.chatContexts) session.chatContexts = {};
+  const snapshot: any = {};
+  CHAT_CONTEXT_KEYS.forEach((k) => {
+    snapshot[k] = session[k];
+  });
+  session.chatContexts[String(sessionId)] = snapshot;
+  session.activeChatContextId = sessionId;
+
+  try {
+    const sessionRepo = AppDataSource.getRepository(ChatSession);
+    await sessionRepo.update({ id: Number(sessionId) }, { context: snapshot });
+  } catch (e) {
+    console.error('Error guardando contexto en DB:', e);
+  }
+}
 
 async function cacheGet<T>(key: string, ttlSeconds: number, fetcher: () => Promise<T>): Promise<T> {
   const now = Date.now();
@@ -79,8 +137,34 @@ function saveImageDataUrl(imageDataUrl?: string): { webPath: string; systemPath:
 function normalizeSpeedProfileName(val: any): string | undefined {
   const raw = val === undefined || val === null ? '' : String(val).trim();
   if (!raw) return undefined;
+  const mbpsMatch = raw.match(/(\d+(?:\.\d+)?)\s*(?:m|mbps|mb)\b/i);
+  if (mbpsMatch) return `${mbpsMatch[1].replace(/\.0+$/, '')}M`;
   const match = raw.match(/(\d+(?:\.\d+)?)/);
   return match ? `${match[1].replace(/\.0+$/, '')}M` : raw;
+}
+
+function pickPlanFromRaw(raw: any): string | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+
+  const directKeys = [
+    'plan_internet', 'plan', 'plan_name', 'plan_nombre', 'planInternet',
+    'plan_internet_name', 'plan_internet_nombre', 'plan_servicio',
+    'servicio', 'servicio_plan', 'planServicio', 'nombre_plan'
+  ];
+
+  const candidates: any[] = [];
+  directKeys.forEach((k) => candidates.push(raw[k]));
+
+  const nestedObjects = [raw.plan_internet, raw.plan, raw.servicio, raw.planServicio, raw.plan_servicio];
+  nestedObjects.forEach((obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    candidates.push(obj.name, obj.nombre, obj.label, obj.descripcion, obj.description, obj.plan, obj.plan_internet);
+  });
+
+  if (raw.detalle_plan) candidates.push(raw.detalle_plan);
+  if (raw.planInternetNombre) candidates.push(raw.planInternetNombre);
+
+  return pickFirstString(candidates);
 }
 
 function normalizeVlanValues(values: any): string[] {
@@ -101,6 +185,151 @@ function pickFirstString(values: Array<any>): string | undefined {
     if (s) return s;
   }
   return undefined;
+}
+
+function normalizeComparableText(value: string): string {
+  return value
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function isPymeText(value: any): boolean {
+  if (!value) return false;
+  const norm = normalizeComparableText(String(value));
+  return norm.includes('pyme');
+}
+
+async function resolveIsPyme(session: any, targetId?: number | string): Promise<boolean> {
+  if (session?.lastSelectedIsPyme === true) return true;
+
+  if (session?.lastSelectedPlan && isPymeText(session.lastSelectedPlan)) {
+    session.lastSelectedIsPyme = true;
+    return true;
+  }
+
+  const pendingIsPyme = session?.pendingAuth?.isPyme ?? session?.pendingAuth?.defaults?.is_pyme;
+  if (pendingIsPyme === true) {
+    session.lastSelectedIsPyme = true;
+    return true;
+  }
+
+  const numericId = targetId !== undefined ? Number(targetId) : undefined;
+  if (numericId && !Number.isNaN(numericId)) {
+    try {
+      const instRepo = AppDataSource.getRepository(Installation);
+      const inst = await instRepo.findOne({
+        where: [{ id: numericId }, { id_servicio: numericId }]
+      });
+      if (inst) {
+        const defaults = defaultsFromEntity(inst, 'installation');
+        if (defaults.name) session.lastSelectedPlan = defaults.name;
+        session.lastSelectedIsPyme = !!defaults.is_pyme;
+        return !!defaults.is_pyme;
+      }
+    } catch (err) {
+      console.error('Error resolviendo PYME (Installation):', err);
+    }
+
+    try {
+      const clientRepo = AppDataSource.getRepository(Client);
+      const client = await clientRepo.findOne({ where: { id_servicio: numericId } });
+      if (client) {
+        const defaults = defaultsFromEntity(client, 'client');
+        if (defaults.name) session.lastSelectedPlan = defaults.name;
+        session.lastSelectedIsPyme = !!defaults.is_pyme;
+        return !!defaults.is_pyme;
+      }
+    } catch (err) {
+      console.error('Error resolviendo PYME (Client):', err);
+    }
+  }
+
+  const fallbackInstallationId = session?.lastSelectedInstallationId
+    ? Number(session.lastSelectedInstallationId)
+    : undefined;
+  if (fallbackInstallationId && !Number.isNaN(fallbackInstallationId)) {
+    try {
+      const instRepo = AppDataSource.getRepository(Installation);
+      const inst = await instRepo.findOne({ where: { id: fallbackInstallationId } });
+      if (inst) {
+        const defaults = defaultsFromEntity(inst, 'installation');
+        if (defaults.name) session.lastSelectedPlan = defaults.name;
+        session.lastSelectedIsPyme = !!defaults.is_pyme;
+        return !!defaults.is_pyme;
+      }
+    } catch (err) {
+      console.error('Error resolviendo PYME (Installation fallback):', err);
+    }
+  }
+
+  const fallbackServiceId = session?.lastSelectedClientIdServicio
+    ? Number(session.lastSelectedClientIdServicio)
+    : undefined;
+  if (fallbackServiceId && !Number.isNaN(fallbackServiceId)) {
+    try {
+      const instRepo = AppDataSource.getRepository(Installation);
+      const inst = await instRepo.findOne({ where: { id_servicio: fallbackServiceId } });
+      if (inst) {
+        const defaults = defaultsFromEntity(inst, 'installation');
+        if (defaults.name) session.lastSelectedPlan = defaults.name;
+        session.lastSelectedIsPyme = !!defaults.is_pyme;
+        return !!defaults.is_pyme;
+      }
+    } catch (err) {
+      console.error('Error resolviendo PYME (Service fallback):', err);
+    }
+  }
+
+  return !!session?.lastSelectedIsPyme;
+}
+
+function bestMatchOption(input: any, options: string[]): string | undefined {
+  if (!input || !options?.length) return undefined;
+
+  const raw = String(input).trim();
+  if (!raw) return undefined;
+
+  const normalizedInput = normalizeComparableText(raw);
+  if (!normalizedInput) return undefined;
+
+  const normalizedOptions = options.map(o => ({ raw: o, norm: normalizeComparableText(String(o)) }));
+
+  const exact = normalizedOptions.find(o => o.norm === normalizedInput);
+  if (exact) return exact.raw;
+
+  const included = normalizedOptions.find(o => o.norm.includes(normalizedInput) || normalizedInput.includes(o.norm));
+  if (included) return included.raw;
+
+  const inputNumber = normalizedInput.match(/\d+(?:\.\d+)?/)?.[0];
+  if (inputNumber) {
+    const numeric = normalizedOptions.find(o => o.norm.includes(inputNumber));
+    if (numeric) return numeric.raw;
+  }
+
+  const inputTokens = new Set(normalizedInput.split(/\s+/).filter(Boolean));
+  let best: { raw: string; score: number } | undefined;
+  for (const opt of normalizedOptions) {
+    const optTokens = opt.norm.split(/\s+/).filter(Boolean);
+    if (!optTokens.length) continue;
+    let score = 0;
+    for (const t of optTokens) if (inputTokens.has(t)) score++;
+    if (!best || score > best.score) best = { raw: opt.raw, score };
+  }
+  if (best && best.score > 0) return best.raw;
+
+  return undefined;
+}
+
+function extractVlanFromZoneLabel(value: any): string | undefined {
+  if (!value) return undefined;
+  const raw = String(value);
+  const match = raw.match(/vlan\s*(\d{1,5})/i);
+  if (match) return match[1];
+  const fallback = raw.match(/\b(\d{1,5})\b/);
+  return fallback ? fallback[1] : undefined;
 }
 
 // --- HELPERS: Form Persistence ---
@@ -138,9 +367,12 @@ function freezeFormActions(originalActions: any[], submittedData: any): any[] {
 // --- HELPERS: Data Formatting & Normalization ---
 
 function defaultsFromEntity(entity: any, type: 'client' | 'installation'): Record<string, any> {
-    const isInst = type === 'installation';
-    const plan = entity.servicio || entity.plan_internet;
-    const clientName = `${entity.nombre || ''} ${entity.apellidos || ''}`.trim();
+  const isInst = type === 'installation';
+  const plan = entity.servicio || entity.plan_internet || pickPlanFromRaw(entity.raw);
+  const clientName = `${entity.nombre || ''} ${entity.apellidos || ''}`.trim();
+  const rawString = !plan && entity?.raw ? JSON.stringify(entity.raw) : '';
+  const isPyme = isPymeText(plan) || isPymeText(clientName) || (rawString ? isPymeText(rawString) : false);
+  const normalizedSpeed = normalizeSpeedProfileName(plan);
 
     return {
       sn: entity.sn_onu || undefined,
@@ -149,8 +381,10 @@ function defaultsFromEntity(entity: any, type: 'client' | 'installation'): Recor
       address_or_comment: entity.direccion || undefined,
       ipv4_address: entity.ipv4_address || entity.ip || entity.ip_publica || (isInst ? entity.ip_cliente : entity.ip_cliente) || undefined,
       serviceId: entity.id_servicio || undefined,
-      download_speed_profile_name: normalizeSpeedProfileName(plan),
-      upload_speed_profile_name: normalizeSpeedProfileName(plan)
+      download_speed_profile_name: normalizedSpeed,
+      upload_speed_profile_name: normalizedSpeed,
+      speed: normalizedSpeed,
+      is_pyme: isPyme
     };
 }
 
@@ -167,6 +401,18 @@ function buildInstallationsTable(items: any[]): string {
   const rows = (items || []).map((it, idx) =>
     `| ${idx + 1} | ${it.nombre || ''} ${it.apellidos || ''} | ${it.cedula || it.rut || 'N/A'} | ${it.id || it.id_servicio || 'N/A'} | ${it.direccion || 'N/A'} |`
   );
+  return [header, ...rows].join('\n');
+}
+
+function buildClientsTable(items: any[]): string {
+  const header = `| # | Cliente | RUT | ID | Dirección |\n|---|---------|-----|----|-----------|`;
+  const rows = (items || []).map((it, idx) => {
+    const fullName = `${it.nombre || ''} ${it.apellidos || ''}`.trim();
+    const rut = it.cedula || it.rut || 'N/A';
+    const id = it.id_servicio || it.id || 'N/A';
+    const address = it.direccion || 'N/A';
+    return `| ${idx + 1} | ${fullName || it.razon_social || ''} | ${rut} | ${id} | ${address} |`;
+  });
   return [header, ...rows].join('\n');
 }
 
@@ -251,6 +497,61 @@ async function findOrSync(term: string, type: 'client' | 'installation' | 'both'
   results.clients = c;
   results.installations = i;
   return results;
+}
+
+async function searchClientsByNameRut(fullName?: string, rut?: string) {
+  const cleanedName = String(fullName || '').trim();
+  const cleanedRut = String(rut || '').replace(/[\.\-\s]+/g, '').trim();
+  const rawRut = String(rut || '').trim();
+
+  if (!cleanedName && !cleanedRut) return [];
+
+  const repo = AppDataSource.getRepository(Client);
+  const qb = repo.createQueryBuilder('c');
+
+  if (cleanedRut || rawRut) {
+    const rutLike = cleanedRut ? `%${cleanedRut}%` : undefined;
+    const rawLike = rawRut ? `%${rawRut}%` : undefined;
+    qb.andWhere(
+      '(c.cedula = :rutExact OR LOWER(c.cedula) LIKE LOWER(:rutLike) OR LOWER(c.cedula) LIKE LOWER(:rawLike) OR REPLACE(REPLACE(REPLACE(LOWER(c.cedula), ".", ""), "-", ""), " ", "") LIKE LOWER(:cleanedRut))',
+      {
+        rutExact: cleanedRut || rawRut,
+        rutLike: rutLike || rawLike || '%',
+        rawLike: rawLike || rutLike || '%',
+        cleanedRut: `%${cleanedRut || rawRut}%`
+      }
+    );
+  }
+
+  const tokens = cleanedName.split(/\s+/).filter(Boolean);
+  tokens.forEach((t, idx) => {
+    qb.andWhere(`(LOWER(c.nombre) LIKE LOWER(:t${idx}) OR LOWER(c.apellidos) LIKE LOWER(:t${idx}))`, {
+      [`t${idx}`]: `%${t}%`
+    });
+  });
+
+  return await qb.orderBy('c.id_servicio', 'DESC').take(10).getMany();
+}
+
+async function findClientsByNameRutWithSync(fullName?: string, rut?: string) {
+  const nameTerm = String(fullName || '').trim();
+  const rutTerm = String(rut || '').trim();
+  let clients = await searchClientsByNameRut(nameTerm, rutTerm);
+
+  if (clients.length === 0) {
+    const syncTerm = rutTerm || nameTerm;
+    if (syncTerm) {
+      await refreshClientsByTerm(syncTerm).catch(() => 0);
+      clients = await searchClientsByNameRut(nameTerm, rutTerm);
+    }
+  }
+
+  if (clients.length === 0) {
+    await fullSyncClients().catch(() => {});
+    clients = await searchClientsByNameRut(nameTerm, rutTerm);
+  }
+
+  return clients;
 }
 
 // --- LOGIC: SmartOLT State & Auth ---
@@ -400,8 +701,11 @@ async function prepareAuthSession(session: any, entity: any, type: 'client' | 'i
         installationId: type === 'installation' ? entity.id : undefined,
         clientIdServicio: type === 'client' ? entity.id_servicio : undefined,
         collected: buildPrefilledAuth(defaults),
-        defaults
+    defaults,
+    isPyme: !!defaults.is_pyme
     };
+  session.lastSelectedIsPyme = !!defaults.is_pyme;
+  if (defaults.name) session.lastSelectedPlan = defaults.name;
     const section = await buildOltAndNetworkSection(entity.id_servicio, { skipZonesFetch: type === 'installation' });
 
     // Apply suggestions
@@ -443,6 +747,26 @@ export async function buildAuthActions(state: any, req?: any) {
 
   const odbOptions = ((state.smartoltOdbs || []) as any[]).map(o => o.name || o.id).filter(Boolean);
 
+  const speedOptions = ['200M', '400M', '600M', '800M'];
+  const speedSeed = collected.download_speed_profile_name
+    || defaults.download_speed_profile_name
+    || collected.speed
+    || defaults.speed
+    || defaults.name
+    || collected.name;
+  const vlanSeed = collected.vlan || defaults.vlan || collected.vlan_id || defaults.vlan_id;
+  const zoneSeed = collected.zone || defaults.zone || collected.zona || defaults.zona;
+
+  const vlanFromZone = extractVlanFromZoneLabel(zoneSeed);
+  const zoneBasedVlan = vlanFromZone ? bestMatchOption(vlanFromZone, vlanOptions) || vlanFromZone : undefined;
+  const autoVlan = zoneBasedVlan || bestMatchOption(vlanSeed, vlanOptions) || vlanSeed;
+  const autoZone = bestMatchOption(zoneSeed, zoneOptions) || zoneSeed;
+  const autoSpeed = bestMatchOption(normalizeSpeedProfileName(speedSeed), speedOptions) || speedSeed;
+
+  if (!collected.vlan && autoVlan) collected.vlan = autoVlan;
+  if (!collected.zone && autoZone) collected.zone = autoZone;
+  if (!collected.download_speed_profile_name && autoSpeed) collected.download_speed_profile_name = autoSpeed;
+
   return [
     { id: 'auth-olt_id', type: 'input', placeholder: `${collected.olt_id || ''}`, label: 'OLT ID', helperText: 'ID numérico', payload: 'auth set olt_id {input}' },
     { id: 'auth-pon_type', type: 'input', label: 'PON type', placeholder: 'gpon', payload: 'auth set pon_type {input}' },
@@ -451,13 +775,13 @@ export async function buildAuthActions(state: any, req?: any) {
     { id: 'auth-sn', type: 'input', label: `SN/MAC ${collected.sn ? `(sug: ${collected.sn})` : ''}`, placeholder: collected.sn || 'Ej: ZTEGC...', payload: 'auth set sn {input}' },
     { id: 'auth-onu_type', type: 'input', label: 'ONU Type', placeholder: 'Ej: ZTE-F660', options: onuTypeOptions, payload: 'auth set onu_type {input}' },
     { id: 'auth-onu_mode', type: 'input', label: 'Mode', placeholder: 'Routing', payload: 'auth set onu_mode {input}' },
-    { id: 'auth-vlan', type: 'input', label: 'VLAN', placeholder: 'Ej: 100', options: vlanOptions, payload: 'auth set vlan {input}' },
-    { id: 'auth-zone', type: 'input', label: `Zona ${collected.zone ? `(sug: ${collected.zone})` : ''}`, placeholder: collected.zone || 'Zona', options: zoneOptions, payload: 'auth set zone {input}' },
+    { id: 'auth-vlan', type: 'input', label: 'VLAN', placeholder: autoVlan || 'Ej: 100', value: autoVlan || '', options: vlanOptions, payload: 'auth set vlan {input}' },
+    { id: 'auth-zone', type: 'input', label: `Zona ${collected.zone ? `(sug: ${collected.zone})` : ''}`, placeholder: autoZone || 'Zona', value: autoZone || '', options: zoneOptions, payload: 'auth set zone {input}' },
     { id: 'auth-odb', type: 'input', label: `ODB ${defaults.odb ? `(curr: ${defaults.odb})` : ''}`, placeholder: 'Selecciona ODB', options: odbOptions, payload: 'auth set odb {input}' },
     { id: 'auth-odb-port', type: 'input', label: 'Puerto ODB', placeholder: '1', payload: 'auth set odb_port {input}' },
     { id: 'auth-name', type: 'input', label: `Nombre`, placeholder: defaults.name || 'Nombre', payload: 'auth set name {input}' },
     { id: 'auth-address', type: 'input', label: 'Dirección', placeholder: defaults.address_or_comment || 'Dirección', payload: 'auth set address_or_comment {input}' },
-    { id: 'auth-speed', type: 'input', label: 'Velocidad', placeholder: defaults.download_speed_profile_name || "200M", options: ['200M', '400M','600M','800M'] },
+    { id: 'auth-speed', type: 'input', label: 'Velocidad', placeholder: autoSpeed || defaults.download_speed_profile_name || '200M', value: autoSpeed || '', options: speedOptions },
     { id: 'auth-submit', type: 'button', label: 'Autorizar SmartOLT ahora', payload: 'auth submit' }
   ];
 }
@@ -514,6 +838,21 @@ export async function addMessage(req: any, res: any) {
         });
         const savedSession = await sessionRepo.save(newSession);
         activeSessionId = savedSession.id;
+
+      // Reset session-scoped context for a new chat
+      req.session.lastSelectedClientIdServicio = undefined;
+      req.session.lastSelectedInstallationId = undefined;
+      req.session.lastSelectedIsPyme = undefined;
+      req.session.pendingAuth = undefined;
+      req.session.pendingPhotos = undefined;
+      req.session.lastAuthNameUsed = undefined;
+      req.session.lastContextType = undefined;
+      req.session.lastSearchTerm = undefined;
+      req.session.searchMode = undefined;
+
+        await saveChatContext(req.session, activeSessionId);
+      } else if (req.session?.activeChatContextId !== activeSessionId) {
+        await loadChatContext(req.session, activeSessionId);
     }
 
     // 2. Guardamos el mensaje vinculado a la sesión
@@ -552,6 +891,21 @@ export async function respond(req: any, res: any) {
       const title = content ? content.substring(0, 40) : 'Conversación sin título';
       const newS = await sessionRepo.save(sessionRepo.create({ userId: Number(userId), title }));
       activeSessionId = newS.id;
+
+      // Reset session-scoped context for a new chat
+      session.lastSelectedClientIdServicio = undefined;
+      session.lastSelectedInstallationId = undefined;
+      session.lastSelectedIsPyme = undefined;
+      session.pendingAuth = undefined;
+      session.pendingPhotos = undefined;
+      session.lastAuthNameUsed = undefined;
+      session.lastContextType = undefined;
+      session.lastSearchTerm = undefined;
+      session.searchMode = undefined;
+
+        await saveChatContext(session, activeSessionId);
+      } else if (session?.activeChatContextId !== activeSessionId) {
+        await loadChatContext(session, activeSessionId);
   }
 
   // 2. Manejo de Imagen: Guardar físicamente
@@ -603,18 +957,28 @@ export async function respond(req: any, res: any) {
         if (!session.pendingPhotos) session.pendingPhotos = [];
 
         if (targetId) {
-            finalContent = `📸 Imagen recibida. Subiendo a Geonet (ID: ${targetId})...`;
-            const baseName = session.lastAuthNameUsed || 'tecnico'; 
-            const fullGeonetUser = `${baseName}@geonet`;
+          finalContent = `📸 Imagen recibida. Subiendo a Geonet (ID: ${targetId})...`;
 
-            try {
-               const subidaExitosa = await uploadDocumentoCliente(
-                   targetId, 
-                   fullGeonetUser, 
-                   savedImage.systemPath, 
-                   `Evidencia Chat - ${new Date().toLocaleTimeString()}`, 
-                   content || 'Imagen subida automáticamente desde el chat'
-               );
+          // Intentar obtener el usuario asociado al cliente (campo `usuario`) para usarlo en Geonet
+          let clienteUsuario: string | null = null;
+          try {
+            const clientRepo = AppDataSource.getRepository(Client);
+            const clientEntity = await clientRepo.findOne({ where: { id_servicio: targetId } });
+            if (clientEntity && clientEntity.usuario) clienteUsuario = clientEntity.usuario;
+          } catch (e) {
+            console.error('Error buscando cliente para obtener usuario Geonet:', e);
+          }
+
+          const fullGeonetUser = clienteUsuario || `${session.lastAuthNameUsed || 'tecnico'}@geonet`;
+
+          try {
+             const subidaExitosa = await uploadDocumentoCliente(
+               targetId,
+               fullGeonetUser,
+               savedImage.systemPath,
+               `Evidencia Chat - ${new Date().toLocaleTimeString()}`,
+               content || 'Imagen subida automáticamente desde el chat'
+             );
 
                if (subidaExitosa) {
                    finalContent = `✅ **Imagen subida a Geonet exitosamente** como evidencia para el cliente **${targetId}**.`;
@@ -648,12 +1012,80 @@ export async function respond(req: any, res: any) {
         actionsOut = structured.actions as any[];
         assistantMetadata = null;
 
+        // --- FOTO FLOW: START ---
+        if (lower.includes('quiero agregar fotos') && (lower.includes('instalacion') || lower.includes('instalaicion'))) {
+          session.photoFlowMode = true;
+          session.pendingPhotoClientSearch = true;
+          finalContent = 'Perfecto. Ingresa el nombre completo y el RUT para buscar al cliente.';
+          actionsOut = [
+            { id: 'photo_fullname', type: 'input', label: 'Nombre Completo', placeholder: 'Ej: Juan Pérez', payload: 'fotos buscar nombre {photo_fullname} rut {photo_rut}' },
+            { id: 'photo_rut', type: 'input', label: 'RUT', placeholder: 'Ej: 12.345.678-9', payload: 'fotos buscar nombre {photo_fullname} rut {photo_rut}' },
+            { id: 'photo_submit', type: 'button', label: 'Buscar Cliente', payload: 'fotos buscar nombre {photo_fullname} rut {photo_rut}' }
+          ];
+        }
+        // --- FOTO FLOW: SEARCH CLIENT ---
+        else if (lower.startsWith('fotos buscar') || lower.startsWith('foto buscar') || (session.pendingPhotoClientSearch && (collected?.photo_fullname || collected?.photo_rut))) {
+          const nameMatch = prompt.match(/nombre\s+(.+?)(?=\s+rut|$)/i);
+          const rutMatch = prompt.match(/rut\s+([^\s]+)/i);
+
+          let fullName = (collected?.photo_fullname || nameMatch?.[1] || '').trim();
+          let rut = (collected?.photo_rut || rutMatch?.[1] || '').trim();
+
+          if (fullName.includes('{photo_fullname}')) fullName = '';
+          if (rut.includes('{photo_rut}')) rut = '';
+
+          if (!fullName && !rut) {
+            finalContent = 'Ingresa nombre completo y/o RUT para buscar al cliente.';
+            actionsOut = [
+              { id: 'photo_fullname', type: 'input', label: 'Nombre Completo', placeholder: 'Ej: Juan Pérez', payload: 'fotos buscar nombre {photo_fullname} rut {photo_rut}' },
+              { id: 'photo_rut', type: 'input', label: 'RUT', placeholder: 'Ej: 12.345.678-9', payload: 'fotos buscar nombre {photo_fullname} rut {photo_rut}' },
+              { id: 'photo_submit', type: 'button', label: 'Buscar Cliente', payload: 'fotos buscar nombre {photo_fullname} rut {photo_rut}' }
+            ];
+            session.pendingPhotoClientSearch = true;
+          } else {
+            const clients = await findClientsByNameRutWithSync(fullName, rut);
+          session.pendingPhotoClientSearch = false;
+          session.photoFlowMode = true;
+          session.lastContextType = 'photo-client-search';
+
+          if (clients.length) {
+            const fmt = formatEntityList(clients, 'client');
+            const table = buildClientsTable(clients);
+            finalContent = `Resultados para "${[fullName, rut].filter(Boolean).join(' / ') || 'búsqueda'}":\n\n${table}`;
+            actionsOut = [...fmt.actions];
+          } else {
+            finalContent = 'No encontré clientes con esos datos. Intenta nuevamente.';
+            actionsOut = [
+              { id: 'photo_fullname', type: 'input', label: 'Nombre Completo', placeholder: 'Ej: Juan Pérez', payload: 'fotos buscar nombre {photo_fullname} rut {photo_rut}' },
+              { id: 'photo_rut', type: 'input', label: 'RUT', placeholder: 'Ej: 12.345.678-9', payload: 'fotos buscar nombre {photo_fullname} rut {photo_rut}' },
+              { id: 'photo_submit', type: 'button', label: 'Buscar Cliente', payload: 'fotos buscar nombre {photo_fullname} rut {photo_rut}' }
+            ];
+          }
+          }
+        }
+
         // --- WISPHUB ACTIVATE ---
-        if (lower.startsWith('wisphub activate')) {
+        else if (lower.startsWith('wisphub activate')) {
           const idMatch = prompt.match(/activate\s+(\d+)/i);
           const targetId = idMatch ? idMatch[1] : null;
 
-          const baseName = session.lastAuthNameUsed || targetId;
+          // Resolver usuario Geonet del cliente/instalación (preferir `Client.usuario`, luego `Installation.usuario`)
+          let clienteUsuario: string | null = null;
+          try {
+            const clientRepo = AppDataSource.getRepository(Client);
+            const clientEntity = await clientRepo.findOne({ where: { id_servicio: targetId } });
+            if (clientEntity && clientEntity.usuario) clienteUsuario = clientEntity.usuario;
+          } catch (e) { console.error('Error buscando cliente para activar (Client):', e); }
+
+          if (!clienteUsuario) {
+            try {
+              const instRepo = AppDataSource.getRepository(Installation);
+              const inst = await instRepo.findOne({ where: [{ id: Number(targetId) }, { id_servicio: Number(targetId) }] });
+              if (inst && inst.usuario) clienteUsuario = inst.usuario;
+            } catch (e) { console.error('Error buscando cliente para activar (Installation):', e); }
+          }
+
+          const baseName = clienteUsuario || session.lastAuthNameUsed || targetId;
           const fullGeonetUser = `${baseName}@geonet`;
 
           if (!targetId) {
@@ -719,10 +1151,48 @@ export async function respond(req: any, res: any) {
                         finalContent = `📡 Resultado WiFi (SN: ${sn}):\nSSID: ${ssid}\nClave: ${pass}\n\n${results.join('\n')}`;
                         actionsOut = [];
                         const targetId = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
+                        const isPyme = await resolveIsPyme(session, targetId);
+                        let planText = session.lastSelectedPlan || session.pendingAuth?.defaults?.name;
+                        let planIsPyme = isPyme || (planText ? isPymeText(planText) : false);
+
+                        if (!planIsPyme && targetId) {
+                          try {
+                            const instRepo = AppDataSource.getRepository(Installation);
+                            const inst = await instRepo.findOne({ where: [{ id: Number(targetId) }, { id_servicio: Number(targetId) }] });
+                            const instPlan = inst?.plan_internet || inst?.servicio || pickPlanFromRaw(inst?.raw);
+                            if (instPlan) {
+                              planText = instPlan;
+                              session.lastSelectedPlan = instPlan;
+                              planIsPyme = isPymeText(instPlan);
+                            }
+                          } catch (err) {
+                            console.error('Error obteniendo plan (Installation) para PYME:', err);
+                          }
+
+                          if (!planIsPyme) {
+                            try {
+                              const clientRepo = AppDataSource.getRepository(Client);
+                              const client = await clientRepo.findOne({ where: { id_servicio: Number(targetId) } });
+                              const clientPlan = client?.plan_internet || client?.servicio || pickPlanFromRaw(client?.raw);
+                              if (clientPlan) {
+                                planText = clientPlan;
+                                session.lastSelectedPlan = clientPlan;
+                                planIsPyme = isPymeText(clientPlan);
+                              }
+                            } catch (err) {
+                              console.error('Error obteniendo plan (Client) para PYME:', err);
+                            }
+                          }
+                        }
 
                         if (targetId) {
+                          if (planIsPyme) {
+                            actionsOut.push({ id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` });
+                            finalContent += `\n\n👇 Acciones post-instalación (PYME) para ID ${targetId}:`;
+                          } else {
                             actionsOut.push({ id: 'btn-contrato', type: 'button', label: '📄 Generar Contrato', payload: `generar contrato ${targetId}` });
                             finalContent += `\n\n👇 Acciones post-instalación para ID ${targetId}:`;
+                          }
                         } else {
                             finalContent += `\n\n(ℹ️ No se detectó un ID seleccionado previamente para generar el contrato)`;
                         }
@@ -739,16 +1209,24 @@ export async function respond(req: any, res: any) {
           const idMatch = prompt.match(/generar contrato\s+(\d+)/i);
           const targetId = idMatch ? idMatch[1] : null;
           if (targetId) {
+            const isPyme = await resolveIsPyme(session, targetId);
+            if (isPyme) {
+              finalContent = `✅ Cliente PYME detectado. Omitiendo contrato.`;
+              actionsOut = [
+                { id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` }
+              ];
+            } else {
               finalContent = `📄 Generando contrato para ID **${targetId}**...`;
               await processContractUpdate(targetId).catch(err => console.error('Error generating contract:', err));
               const baseName = session.lastAuthNameUsed || targetId;
               let contratourl = await getAutoLoginContractLink(`${baseName}@geonet`, targetId);
-              
+                  
               finalContent = `✅ Contrato generado:`;
               actionsOut = [
-                     { id: 'btn-contrato', type: 'link', label: '📄 Copiar Contrato', url: `${contratourl}` },
-                     { id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` }
+                 { id: 'btn-contrato', type: 'link', label: '📄 Copiar Contrato', url: `${contratourl}` },
+                 { id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` }
               ];
+            }
           } else {
               finalContent = '⚠️ Error: No se detectó ID para generar contrato.';
           }
@@ -778,21 +1256,40 @@ export async function respond(req: any, res: any) {
                  session.lastSelectedClientIdServicio = serviceId; 
                  if (!isClient) session.lastSelectedInstallationId = entity.id;
 
-                 const { text, actions, assistantMetadata: meta } = await prepareAuthSession(session, entity, isClient ? 'client' : 'installation');
-                 assistantMetadata = meta;
+                const planName = entity.plan_internet || entity.servicio || pickPlanFromRaw(entity.raw);
+                if (planName) {
+                  session.lastSelectedPlan = planName;
+                  if (isPymeText(planName)) session.lastSelectedIsPyme = true;
+                }
 
-                 const clientDetails = buildClientDetails(entity, isClient ? 'client' : 'installation');
-                 finalContent = `${clientDetails}\n\n📡 **Disponibilidad en SmartOLT:**\n${text}\n👇 Selecciona una ONU libre abajo o completa el formulario.`;
-                 actionsOut = actions;
+                const displayName = `${entity.nombre || ''} ${entity.apellidos || ''}`.trim();
+                const dateLabel = new Date().toLocaleDateString('es-CL');
+                const sessionTitle = `${displayName || 'Cliente'} - ${dateLabel}`;
+                await sessionRepo.update({ id: Number(activeSessionId), userId: Number(userId) }, { title: sessionTitle });
 
-                 if (isClient) {
-                     const insts = await AppDataSource.getRepository(Installation).find({ where: { id_servicio: (entity as Client).id_servicio }, take: 5 });
-                     if (insts.length) {
-                         const iFmt = formatEntityList(insts, 'installation');
-                         finalContent += `\n\n⚠️ **Instalaciones vinculadas encontradas:**`;
-                         actionsOut = [...actionsOut, ...iFmt.actions];
-                     }
-                 }
+                if (isClient && session.photoFlowMode) {
+                  session.photoFlowMode = false;
+                  session.pendingPhotoClientSearch = false;
+                  session.lastSelectedInstallationId = undefined;
+                  finalContent = `✅ Cliente seleccionado para evidencias: **${displayName || 'Cliente'}** [ID: ${serviceId}].\n\nAhora puedes enviar las fotos y se subirán automáticamente a Geonet.`;
+                  actionsOut = [];
+                } else {
+                  const { text, actions, assistantMetadata: meta } = await prepareAuthSession(session, entity, isClient ? 'client' : 'installation');
+                  assistantMetadata = meta;
+
+                  const clientDetails = buildClientDetails(entity, isClient ? 'client' : 'installation');
+                  finalContent = `${clientDetails}\n\n📡 **Disponibilidad en SmartOLT:**\n${text}\n👇 Selecciona una ONU libre abajo o completa el formulario.`;
+                  actionsOut = actions;
+
+                  if (isClient) {
+                    const insts = await AppDataSource.getRepository(Installation).find({ where: { id_servicio: (entity as Client).id_servicio }, take: 5 });
+                    if (insts.length) {
+                      const iFmt = formatEntityList(insts, 'installation');
+                      finalContent += `\n\n⚠️ **Instalaciones vinculadas encontradas:**`;
+                      actionsOut = [...actionsOut, ...iFmt.actions];
+                    }
+                  }
+                }
             } else {
                 finalContent = `${isClient ? 'Cliente' : 'Instalación'} no encontrada.`;
             }
@@ -837,17 +1334,43 @@ export async function respond(req: any, res: any) {
             if (/^modo\s+b(usqueda|úsqueda)\s+instalacion$/i.test(lower)) { 
                 session.searchMode = 'installation'; session.lastContextType = 'installations'; 
             }
-            let items = await listPendingLocalInstallations(20);
-            if (!items?.length) { await fullSyncInstallations(100, 3).catch(()=>{}); items = await listPendingLocalInstallations(20); }
+            const isRefreshRequest = lower.includes('enseñame las instalaciones pendientes de evidencia para autorizar el alta')
+              || lower.includes('ensename las instalaciones pendientes de evidencia para autorizar el alta');
+
+            if (isRefreshRequest) {
+                console.log('[pending-installations] Refrescar solicitado (payload). Sincronizando desde WispHub API...');
+                await fullSyncInstallations(100, 3).catch((err) => console.error('[pending-installations] Error fullSyncInstallations:', err));
+            }
+
+            console.log('[pending-installations] Iniciando búsqueda local en DB (Installation)');
+            let items = await listAllLocalInstallations(0);
+            console.log(`[pending-installations] Resultados locales: ${items?.length || 0}`);
+            if (!items?.length) {
+                console.log('[pending-installations] Sin resultados locales. Sincronizando desde WispHub API...');
+                await fullSyncInstallations(100, 3).catch((err) => console.error('[pending-installations] Error fullSyncInstallations:', err));
+                console.log('[pending-installations] Reintentando búsqueda local tras sync...');
+              items = await listAllLocalInstallations(0);
+                console.log(`[pending-installations] Resultados locales post-sync: ${items?.length || 0}`);
+            }
             const table = buildInstallationsTable(items || []);
             finalContent = items?.length ? `Instalaciones pendientes:\n\n${table}` : 'No hay instalaciones pendientes.';
             const fmt = formatEntityList(items || [], 'installation');
             actionsOut = [...fmt.actions, { id: 'refresh', type: 'button', label: 'Refrescar', payload: 'Enséñame las instalaciones pendientes de evidencia para autorizar el alta' }];
         }
         else if (lower.match(/actualiza|refresca|no esta/)) {
-            const ctx = session.lastContextType;
-            await (ctx === 'installations' ? fullSyncInstallations() : fullSyncClients());
+          const ctx = session.lastContextType;
+          if (ctx === 'installations') {
+            console.log('[pending-installations] Refrescar solicitado. Sincronizando desde WispHub API...');
+            await fullSyncInstallations(100, 3).catch((err) => console.error('[pending-installations] Error fullSyncInstallations:', err));
+            const items = await listAllLocalInstallations(0);
+            const table = buildInstallationsTable(items || []);
+            finalContent = items?.length ? `Instalaciones pendientes:\n\n${table}` : 'No hay instalaciones pendientes.';
+            const fmt = formatEntityList(items || [], 'installation');
+            actionsOut = [...fmt.actions, { id: 'refresh', type: 'button', label: 'Refrescar', payload: 'Enséñame las instalaciones pendientes de evidencia para autorizar el alta' }];
+          } else {
+            await fullSyncClients();
             finalContent = 'Base de datos sincronizada. Intenta buscar de nuevo.';
+          }
         }
         else {
             const docMatch = prompt.match(/\b(\d{6,20})\b/);
@@ -888,6 +1411,8 @@ export async function respond(req: any, res: any) {
       metadata: assistantMetadata 
   });
   await msgRepo.save(msg);
+
+  await saveChatContext(session, activeSessionId);
   
   return res.json({
       ok: true,
@@ -935,6 +1460,8 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
     
     // --- VERIFICACIÓN EN TABLA INSTALLATION Y GEONET ---
     const session = data._session || {};
+    const planText = session.lastSelectedPlan || session.pendingAuth?.defaults?.name;
+    const isPyme = !!(data.is_pyme || session.lastSelectedIsPyme || (planText ? isPymeText(planText) : false));
     let clientid = targetId;
     if (!clientid) {
         clientid = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
@@ -981,8 +1508,13 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
     else {
         const directActions: any[] = [];
         if (targetId) {
-             directActions.push({ id: 'btn-contrato', type: 'button', label: '📄 Generar Contrato', payload: `generar contrato ${targetId}` });
-            messages.push(`\n\n👇 **Proceso finalizado.** Selecciona una acción:`);
+        if (isPyme) {
+          directActions.push({ id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` });
+          messages.push(`\n\n👇 **Proceso finalizado (PYME).** Selecciona una acción:`);
+        } else {
+          directActions.push({ id: 'btn-contrato', type: 'button', label: '📄 Generar Contrato', payload: `generar contrato ${targetId}` });
+          messages.push(`\n\n👇 **Proceso finalizado.** Selecciona una acción:`);
+        }
         } else {
             messages.push('\n(⚠️ No se detectó ID asociado para generar contrato)');
         }
@@ -997,6 +1529,10 @@ export async function submitAuth(req: any, res: any) {
 
     // Extraemos sessionId del request body para saber dónde guardar la respuesta
     const sessionId = req.body.sessionId; 
+
+    if (sessionId && session?.activeChatContextId !== Number(sessionId)) {
+      await loadChatContext(session, Number(sessionId));
+    }
     
     const state = session.pendingAuth || {};
     const merged = { ...state.defaults, ...state.collected, ...req.body, ...req.body.collected };
@@ -1051,7 +1587,14 @@ export async function submitAuth(req: any, res: any) {
         if (!success) throw new Error(result?.error || result?.message || 'SmartOLT rechazó la solicitud.');
 
         const postResult = await processPostAuthActions({
-            ...merged, onu_external_id: explicitSn, vlan: cleanVlan, address_or_comment: finalAddress, odb_port: cleanOdbPort, onu_type: merged.onu_type, _session: session 
+          ...merged,
+          onu_external_id: explicitSn,
+          vlan: cleanVlan,
+          address_or_comment: finalAddress,
+          odb_port: cleanOdbPort,
+          onu_type: merged.onu_type,
+          is_pyme: state.isPyme || state.defaults?.is_pyme,
+          _session: session 
         }, targetId);
 
         cacheDelete('listOlts');
@@ -1066,6 +1609,8 @@ export async function submitAuth(req: any, res: any) {
             actions: postResult.actions 
         }));
 
+        if (sessionId) await saveChatContext(session, Number(sessionId));
+
         return res.json({ ok: true, message: postResult.message, actions: postResult.actions });
     } catch (e: any) {
         console.error('❌ Error en submitAuth:', e);
@@ -1077,6 +1622,7 @@ export async function submitAuth(req: any, res: any) {
             role: 'assistant', 
             content: `❌ Error al autorizar: ${errorMsg}` 
         }));
+        if (sessionId) await saveChatContext(session, Number(sessionId));
         return res.status(500).json({ ok: false, error: errorMsg });
     }
 }
