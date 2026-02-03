@@ -291,23 +291,54 @@ export async function activarInstalacionGeonet(
   usuarioInstalacion: string
 ): Promise<boolean> {
   try {
-    const cookies = await jar.getCookies('https://admin.geonet.cl');
-    const csrfToken = cookies.find(c => c.key === 'csrftoken')?.value;
+    const ensureAuth = async () => {
+      const ok = await authenticateGeonet();
+      if (!ok) throw new Error('Auth Geonet failed');
+    };
+
+    await ensureAuth();
+
+    let cookies = await jar.getCookies('https://admin.geonet.cl');
+    let csrfToken = cookies.find(c => c.key === 'csrftoken')?.value;
+    if (!csrfToken) {
+      await ensureAuth();
+      cookies = await jar.getCookies('https://admin.geonet.cl');
+      csrfToken = cookies.find(c => c.key === 'csrftoken')?.value;
+    }
 
     const params = new URLSearchParams();
     params.append('csrfmiddlewaretoken', csrfToken || '');
     params.append('edit_facturacion', '0');
 
-    const response = await geonetHttp.post(
-      `/Instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`,
-      params,
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Referer': `https://admin.geonet.cl/Instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`,
+    let response;
+    try {
+      response = await geonetHttp.post(
+        `/Instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`,
+        params,
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Referer': `https://admin.geonet.cl/Instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`,
+          }
         }
+      );
+    } catch (err: any) {
+      if (err?.response?.status === 403) {
+        await ensureAuth();
+        response = await geonetHttp.post(
+          `/Instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`,
+          params,
+          {
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'Referer': `https://admin.geonet.cl/Instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`,
+            }
+          }
+        );
+      } else {
+        throw err;
       }
-    );
+    }
 
     console.log(`Petición de activación enviada para ${instalacionId}. Status: ${response.status}`);
     return response.status === 200;
