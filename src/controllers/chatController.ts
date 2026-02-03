@@ -1085,8 +1085,9 @@ export async function respond(req: any, res: any) {
             } catch (e) { console.error('Error buscando cliente para activar (Installation):', e); }
           }
 
-          const baseName = clienteUsuario || session.lastAuthNameUsed || targetId;
-          const fullGeonetUser = `${baseName}@geonet`;
+          const baseName = String(clienteUsuario || session.lastAuthNameUsed || targetId || '').trim();
+          const hasGeonet = baseName.toLowerCase().includes('@geonet');
+          const fullGeonetUser = hasGeonet ? baseName : `${baseName}@geonet`;
 
           if (!targetId) {
               finalContent = "⚠️ Error: No se detectó ID para activar.";
