@@ -1,4 +1,5 @@
 import axios, { AxiosHeaders } from 'axios';
+import { Brackets } from 'typeorm';
 import { AppDataSource } from '../datasource';
 import { Installation } from '../models/Installation';
 import { WISPHUB } from '../config';
@@ -28,9 +29,15 @@ export type WisphubInstallationItem = {
   [key: string]: any;
 };
 
+const DEFAULT_INSTALLATION_STATES = ['1', '2', '3', '4', '7'];
+
 export async function listInstallationsPage(params: Record<string, any> = {}) {
-  console.log('[wisphub] GET /api/instalaciones/', params);
-  const res = await http.get('/api/instalaciones/', { params });
+  const mergedParams = { ...params } as Record<string, any>;
+  if (mergedParams.estado_instalacion === undefined) {
+    mergedParams.estado_instalacion = DEFAULT_INSTALLATION_STATES;
+  }
+  console.log('[wisphub] GET /api/instalaciones/', mergedParams);
+  const res = await http.get('/api/instalaciones/', { params: mergedParams });
   const count = res?.data?.count ?? 0;
   const resultsLen = Array.isArray(res?.data?.results) ? res.data.results.length : 0;
   console.log(`[wisphub] response instalaciones: count=${count}, results=${resultsLen}`);
@@ -161,9 +168,12 @@ export async function fullSyncInstallations(batchSize = 200, maxPages = 1000, pu
 export async function searchLocalInstallations(term: string, limit = 50) {
   const repo = AppDataSource.getRepository(Installation);
   return repo.createQueryBuilder('i')
-    .where('i.usuario LIKE :q', { q: `%${term}%` })
-    .orWhere('i.nombre LIKE :q', { q: `%${term}%` })
-    .orWhere('i.apellidos LIKE :q', { q: `%${term}%` })
+    .where(new Brackets((qb) => {
+      qb.where('i.usuario LIKE :q', { q: `%${term}%` })
+        .orWhere('i.nombre LIKE :q', { q: `%${term}%` })
+        .orWhere('i.apellidos LIKE :q', { q: `%${term}%` });
+    }))
+    .andWhere('LOWER(i.tipo) NOT LIKE :pre', { pre: '%preinstal%' })
     .limit(limit)
     .getMany();
 }
@@ -173,11 +183,14 @@ export async function listPendingLocalInstallations(limit = 50) {
   console.log(`[db] listPendingLocalInstallations limit=${limit}`);
   // Pending: no fecha_instalacion OR estado/tipo indica preinstalación/pendiente
   let qb = repo.createQueryBuilder('i')
-    .where('i.fecha_instalacion IS NULL')
-    .orWhere('i.fecha_instalacion = :empty', { empty: '' })
-    .orWhere('LOWER(i.estado_instalacion) LIKE :p', { p: '%pend%' })
-    .orWhere('LOWER(i.estado) LIKE :p', { p: '%pend%' })
-    .orWhere('LOWER(i.tipo) LIKE :pre', { pre: '%preinstal%' })
+    .where(new Brackets((sub) => {
+      sub.where('i.fecha_instalacion IS NULL')
+        .orWhere('i.fecha_instalacion = :empty', { empty: '' })
+        .orWhere('LOWER(i.estado_instalacion) LIKE :p', { p: '%pend%' })
+        .orWhere('LOWER(i.estado) LIKE :p', { p: '%pend%' })
+        .orWhere('LOWER(i.tipo) LIKE :pre', { pre: '%preinstal%' });
+    }))
+    .andWhere('LOWER(i.tipo) NOT LIKE :preExclude', { preExclude: '%preinstal%' })
     .orderBy('i.updatedAt', 'DESC');
   if (limit && limit > 0) qb = qb.limit(limit);
   const results = await qb.getMany();
@@ -188,7 +201,9 @@ export async function listPendingLocalInstallations(limit = 50) {
 export async function listAllLocalInstallations(limit = 0) {
   const repo = AppDataSource.getRepository(Installation);
   console.log(`[db] listAllLocalInstallations limit=${limit}`);
-  let qb = repo.createQueryBuilder('i').orderBy('i.updatedAt', 'DESC');
+  let qb = repo.createQueryBuilder('i')
+    .where('LOWER(i.tipo) NOT LIKE :pre', { pre: '%preinstal%' })
+    .orderBy('i.updatedAt', 'DESC');
   if (limit && limit > 0) qb = qb.limit(limit);
   const results = await qb.getMany();
   console.log(`[db] listAllLocalInstallations results=${results.length}`);
