@@ -1,4 +1,7 @@
 import axios from 'axios';
+import { ensureRequestDelay } from '../utils/apiThrottle';
+
+ensureRequestDelay(axios);
 
 const VLLM_URL = process.env.VLLM_URL || 'http://localhost:8000';
 

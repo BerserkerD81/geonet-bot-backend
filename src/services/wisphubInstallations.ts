@@ -4,11 +4,17 @@ import { AppDataSource } from '../datasource';
 import { Installation } from '../models/Installation';
 import { WISPHUB } from '../config';
 import { parseRaw, asString, asDateString, stripHtml } from './rawParser';
+import { ensureRequestDelay } from '../utils/apiThrottle';
 
 const http = axios.create({
   baseURL: WISPHUB.baseUrl.replace(/\/$/, ''),
-  timeout: 15000
+  timeout: 15000,
+  paramsSerializer: {
+    indexes: null
+  }
 });
+
+ensureRequestDelay(http);
 
 http.interceptors.request.use((config) => {
   if (!config.headers) config.headers = new AxiosHeaders();
@@ -31,10 +37,23 @@ export type WisphubInstallationItem = {
 
 const DEFAULT_INSTALLATION_STATES = ['1', '2', '3', '4', '7'];
 
+function coerceEstadoInstalacion(value: unknown): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  const raw = Array.isArray(value) ? value : String(value).split(',');
+  const sanitized = raw
+    .map((item) => (item === undefined || item === null ? '' : String(item).trim()))
+    .filter(Boolean);
+  if (!sanitized.length) return undefined;
+  return Array.from(new Set(sanitized));
+}
+
 export async function listInstallationsPage(params: Record<string, any> = {}) {
   const mergedParams = { ...params } as Record<string, any>;
-  if (mergedParams.estado_instalacion === undefined) {
-    mergedParams.estado_instalacion = DEFAULT_INSTALLATION_STATES;
+  const estado = coerceEstadoInstalacion(mergedParams.estado_instalacion ?? DEFAULT_INSTALLATION_STATES);
+  if (estado && estado.length) {
+    mergedParams.estado_instalacion = estado;
+  } else {
+    delete mergedParams.estado_instalacion;
   }
   console.log('[wisphub] GET /api/instalaciones/', mergedParams);
   const res = await http.get('/api/instalaciones/', { params: mergedParams });

@@ -1,5 +1,8 @@
 import { Request, Response } from 'express';
 import axios from 'axios';
+import { ensureRequestDelay } from '../utils/apiThrottle';
+
+ensureRequestDelay(axios);
 import { checkHealth, getLastFullSyncAt } from '../services/wisphubClient';
 import { SMARTOLT } from '../config';
 // syncRawToColumns endpoint removed; keep startup auto-sync only

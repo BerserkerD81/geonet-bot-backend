@@ -1,6 +1,9 @@
 import axios from 'axios';
 import FormData from 'form-data';
 import { SMARTOLT } from '../config';
+import { ensureRequestDelay } from '../utils/apiThrottle';
+
+ensureRequestDelay(axios);
 
 export type AuthorizeOnuParams = {
   olt_id: number | string;

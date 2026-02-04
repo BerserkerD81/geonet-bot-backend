@@ -9,6 +9,7 @@ import { WISPHUB } from '../config';
 import { parseRaw, asString, asDateString, stripHtml } from './rawParser';
 import * as fs from 'fs';
 import * as path from 'path';
+import { ensureRequestDelay } from '../utils/apiThrottle';
 // ... tus otros imports (axios, wrapper, CookieJar, FormData, etc.)
 // --- UTILIDADES DE FECHA ---
 
@@ -33,6 +34,9 @@ const http = axios.create({
   baseURL: WISPHUB.baseUrl.replace(/\/$/, ''),
   timeout: 15000
 });
+
+ensureRequestDelay(axios);
+ensureRequestDelay(http);
 
 http.interceptors.request.use((config) => {
   if (!config.headers) config.headers = new AxiosHeaders();
@@ -59,6 +63,8 @@ const geonetHttp = wrapper(axios.create({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
   }
 }));
+
+ensureRequestDelay(geonetHttp);
 
 // --- TIPOS Y ESTADO ---
 

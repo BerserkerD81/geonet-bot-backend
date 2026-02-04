@@ -873,6 +873,13 @@ export async function addMessage(req: any, res: any) {
 
 // --- FUNCIÓN PRINCIPAL DEL BOT (RESPOND) ---
 
+function sanitizeSsid(value?: string | null): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed.replace(/\s+/g, '_');
+}
+
 export async function respond(req: any, res: any) {
   const session = req.session as any; // Express Session (state temporal)
   const userId = session?.userId;
@@ -922,11 +929,12 @@ export async function respond(req: any, res: any) {
       else if (content.toLowerCase().startsWith('wifi apply')) {
           const ssidMatch = content.match(/ssid\s+(.+?)(?=\s+pass)/i);
           const passMatch = content.match(/pass\s+(.+?)(?=\s+contract_id|$)/i);
-          const ssid = ssidMatch ? ssidMatch[1] : (req.body.wifi_ssid || '***');
+          const rawSsid = ssidMatch ? ssidMatch[1] : (typeof req.body.wifi_ssid === 'string' ? req.body.wifi_ssid : undefined);
+          const formattedSsid = sanitizeSsid(rawSsid) ?? (rawSsid ? rawSsid.trim() : '***');
           const pass = passMatch ? passMatch[1] : (req.body.wifi_pass || '***');
           
           userMessageActions = [
-              { type: 'input', label: 'SSID Configurado', value: ssid, disabled: true, id: 'wifi_ssid' },
+            { type: 'input', label: 'SSID Configurado', value: formattedSsid, disabled: true, id: 'wifi_ssid' },
               { type: 'input', label: 'Password Configurado', value: pass, disabled: true, id: 'wifi_pass' }
           ];
       }
@@ -1136,7 +1144,8 @@ export async function respond(req: any, res: any) {
             const container = bodyData.collected || bodyData.data || {};
             
             const sn = (snMatch ? snMatch[1].toUpperCase() : null) || container.sn;
-            const ssid = (ssidMatch ? ssidMatch[1].trim() : null) || bodyData.wifi_ssid || container.wifi_ssid;
+            const rawSsidValue = (ssidMatch ? ssidMatch[1] : null) ?? bodyData.wifi_ssid ?? container.wifi_ssid;
+            const ssid = typeof rawSsidValue === 'string' ? sanitizeSsid(rawSsidValue) : undefined;
             const pass = (passMatch ? passMatch[1].trim() : null) || bodyData.wifi_pass || container.wifi_pass;
 
             if (sn && ssid && pass) {
