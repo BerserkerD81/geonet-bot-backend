@@ -1024,7 +1024,7 @@ export async function respond(req: any, res: any) {
         if (lower.includes('quiero agregar fotos') && (lower.includes('instalacion') || lower.includes('instalaicion'))) {
           session.photoFlowMode = true;
           session.pendingPhotoClientSearch = true;
-          finalContent = 'Perfecto. Ingresa el nombre completo y el RUT para buscar al cliente.';
+          finalContent = 'Perfecto. Ingresa el nombre completo y/o el RUT para buscar al cliente.';
           actionsOut = [
             { id: 'photo_fullname', type: 'input', label: 'Nombre Completo', placeholder: 'Ej: Juan Pérez', payload: 'fotos buscar nombre {photo_fullname} rut {photo_rut}' },
             { id: 'photo_rut', type: 'input', label: 'RUT', placeholder: 'Ej: 12.345.678-9', payload: 'fotos buscar nombre {photo_fullname} rut {photo_rut}' },
@@ -1104,7 +1104,7 @@ export async function respond(req: any, res: any) {
               const exito = await activarInstalacionGeonet(targetId, fullGeonetUser);
               
               if (exito) {
-                  finalContent = `🚀 **¡Activación Exitosa!**\nLa instalación **${targetId}** ha sido activada correctamente bajo el usuario \`${fullGeonetUser}\`.`;
+                  finalContent = `🚀 **¡Activación Exitosa!**\nLa instalación **${targetId}** ha sido activada correctamente bajo el usuario \`${fullGeonetUser}\`.\n\nYa puedes cargarle imágenes a la instalación del cliente.`;
 
                   if (session.pendingPhotos && session.pendingPhotos.length > 0) {
                       finalContent += `\n\n📤 **Procesando ${session.pendingPhotos.length} fotos acumuladas...**`;
