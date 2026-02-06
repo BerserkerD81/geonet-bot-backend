@@ -369,10 +369,11 @@ function freezeFormActions(originalActions: any[], submittedData: any): any[] {
 function defaultsFromEntity(entity: any, type: 'client' | 'installation'): Record<string, any> {
   const isInst = type === 'installation';
   const plan = entity.servicio || entity.plan_internet || pickPlanFromRaw(entity.raw);
+  const planForSpeed = entity.plan_internet || entity.servicio || pickPlanFromRaw(entity.raw);
   const clientName = `${entity.nombre || ''} ${entity.apellidos || ''}`.trim();
   const rawString = !plan && entity?.raw ? JSON.stringify(entity.raw) : '';
   const isPyme = isPymeText(plan) || isPymeText(clientName) || (rawString ? isPymeText(rawString) : false);
-  const normalizedSpeed = normalizeSpeedProfileName(plan);
+  const normalizedSpeed = normalizeSpeedProfileName(planForSpeed);
 
     return {
       sn: entity.sn_onu || undefined,
@@ -781,7 +782,7 @@ export async function buildAuthActions(state: any, req?: any) {
     { id: 'auth-odb-port', type: 'input', label: 'Puerto ODB', placeholder: '1', payload: 'auth set odb_port {input}' },
     { id: 'auth-name', type: 'input', label: `Nombre`, placeholder: defaults.name || 'Nombre', payload: 'auth set name {input}' },
     { id: 'auth-address', type: 'input', label: 'Dirección', placeholder: defaults.address_or_comment || 'Dirección', payload: 'auth set address_or_comment {input}' },
-    { id: 'auth-speed', type: 'input', label: 'Velocidad', placeholder: autoSpeed || defaults.download_speed_profile_name || '200M', value: autoSpeed || '', options: speedOptions },
+    { id: 'auth-speed', type: 'input', label: 'Velocidad', placeholder: autoSpeed || defaults.download_speed_profile_name || '200M', value: autoSpeed || defaults.download_speed_profile_name || '', options: speedOptions },
     { id: 'auth-submit', type: 'button', label: 'Autorizar SmartOLT ahora', payload: 'auth submit' }
   ];
 }

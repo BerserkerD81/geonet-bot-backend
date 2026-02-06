@@ -483,36 +483,45 @@ export async function getAutoLoginContractLink(
   usuarioInstalacion: string, 
   instalacionId: number | string
 ): Promise<string | null> {
-  try {
-    // 1. URL donde está el botón (Petición GET)
-    const url = `/clientes/generar-link-contrato/${usuarioInstalacion}/${instalacionId}/`;
-    
-    // 2. Realizamos el GET (Cookies de sesión se envían solas)
-    const response = await geonetHttp.get(url);
-    const html = response.data;
+  const normalizeSpaces = (val: string) => val.trim().replace(/\s+/g, ' ');
+  const baseUser = normalizeSpaces(usuarioInstalacion);
+  const candidates = Array.from(new Set([
+    baseUser,
+    baseUser.replace(/\s+/g, '-'),
+    baseUser.replace(/\s+/g, '_')
+  ]));
 
-    // 3. EXTRACCIÓN CON REGEX
-    // Explicación del Regex: /href="([^"]+)"\s+id='auto-login'/
-    // - href="        : Busca literalmente el texto href="
-    // - ([^"]+)       : Captura todo lo que NO sea comillas dobles (aquí está tu URL larga)
-    // - "\s+          : Busca el cierre de comillas y un espacio
-    // - id='auto-login': Se asegura que sea ESTE botón y no otro
-  const regex = /<a\b[^>]*?href="([^"]+)"[^>]*?id=['"]auto-login['"]/;
-    const match = html.match(regex);
+  for (const usuario of candidates) {
+    try {
+      // 1. URL donde está el botón (Petición GET)
+      const url = `/clientes/generar-link-contrato/${usuario}/${instalacionId}/`;
+      
+      // 2. Realizamos el GET (Cookies de sesión se envían solas)
+      const response = await geonetHttp.get(url);
+      const html = response.data;
 
-    if (match && match[1]) {
-      const link = match[1];
-      console.log(`✅ Link de contrato extraído exitosamente para ${usuarioInstalacion}`);
-      return link; // Retorna la URL larga (https://clientes.portalinternet.app/login-panel/...)
+      // 3. EXTRACCIÓN CON REGEX
+      // Explicación del Regex: /href="([^"]+)"\s+id='auto-login'/
+      // - href="        : Busca literalmente el texto href="
+      // - ([^"]+)       : Captura todo lo que NO sea comillas dobles (aquí está tu URL larga)
+      // - "\s+          : Busca el cierre de comillas y un espacio
+      // - id='auto-login': Se asegura que sea ESTE botón y no otro
+      const regex = /<a\b[^>]*?href="([^"]+)"[^>]*?id=['"]auto-login['"]/;
+      const match = html.match(regex);
+
+      if (match && match[1]) {
+        const link = match[1];
+        console.log(`✅ Link de contrato extraído exitosamente para ${usuario}`);
+        return link; // Retorna la URL larga (https://clientes.portalinternet.app/login-panel/...)
+      }
+
+      console.warn(`⚠️ No se encontró el botón 'auto-login' para ${usuario}`);
+    } catch (error: any) {
+      console.error(`❌ Error obteniendo link contrato ${usuario}:`, error.message);
     }
-
-    console.warn(`⚠️ No se encontró el botón 'auto-login' para ${usuarioInstalacion}`);
-    return null;
-
-  } catch (error: any) {
-    console.error(`❌ Error obteniendo link contrato ${usuarioInstalacion}:`, error.message);
-    return null;
   }
+
+  return null;
 }
 
 // --- CONFIGURACIÓN DE MODELOS ONU ---
