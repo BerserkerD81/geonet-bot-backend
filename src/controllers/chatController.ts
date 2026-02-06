@@ -135,12 +135,97 @@ function saveImageDataUrl(imageDataUrl?: string): { webPath: string; systemPath:
 }
 
 function normalizeSpeedProfileName(val: any): string | undefined {
-  const raw = val === undefined || val === null ? '' : String(val).trim();
+  if (val === undefined || val === null) return undefined;
+
+  const normalizeNumberToken = (token: string): string => {
+    const t = String(token || '').trim();
+    if (!t) return '';
+
+    // Caso típico CL: 1.000 / 15.990 (separador de miles)
+    if (/^\d{1,3}(?:\.\d{3})+$/.test(t)) return t.replace(/\./g, '');
+    if (/^\d{1,3}(?:,\d{3})+$/.test(t)) return t.replace(/,/g, '');
+
+    // Decimal con coma
+    if (/^\d+(?:,\d+)?$/.test(t)) return t.replace(',', '.');
+
+    return t;
+  };
+
+  // A veces el "plan" llega como objeto (p.ej. { name: 'Internet Fibra 600 Mbps' }).
+  // Extraemos texto útil antes de intentar regex.
+  let raw = '';
+  if (typeof val === 'object') {
+    const candidates: any[] = [
+      (val as any).download_speed_profile_name,
+      (val as any).upload_speed_profile_name,
+      (val as any).speed,
+      (val as any).velocidad,
+      (val as any).name,
+      (val as any).nombre,
+      (val as any).label,
+      (val as any).descripcion,
+      (val as any).description,
+      (val as any).plan,
+      (val as any).plan_internet
+    ];
+    raw = pickFirstString(candidates) || '';
+    if (!raw) {
+      try {
+        raw = JSON.stringify(val);
+      } catch {
+        raw = '';
+      }
+    }
+  } else {
+    raw = String(val);
+  }
+
+  raw = raw.trim();
   if (!raw) return undefined;
-  const mbpsMatch = raw.match(/(\d+(?:\.\d+)?)\s*(?:m|mbps|mb)\b/i);
-  if (mbpsMatch) return `${mbpsMatch[1].replace(/\.0+$/, '')}M`;
-  const match = raw.match(/(\d+(?:\.\d+)?)/);
-  return match ? `${match[1].replace(/\.0+$/, '')}M` : raw;
+
+  // Gbps -> convertir a Mbps (1 Gbps = 1000 Mbps)
+  // Acepta: 1 Gbps, 1.0Gb, 1,5 gbps
+  const gbpsMatch = raw.match(/(\d{1,3}(?:[\.,]\d{3})+|\d+(?:[\.,]\d+)?)\s*(?:g|gbps|gb)\b/i);
+  if (gbpsMatch) {
+    const gbps = Number(normalizeNumberToken(gbpsMatch[1]));
+    if (!Number.isNaN(gbps)) return `${String(gbps * 1000).replace(/\.0+$/, '')}M`;
+  }
+
+  // Mbps / Mb / M / megas
+  // Acepta: 600 Mbps, 600Mb/s, 1.000 mbps, 600 megas
+  const mbpsMatch = raw.match(/(\d{1,3}(?:[\.,]\d{3})+|\d+(?:[\.,]\d+)?)\s*(?:mbps|mb\/?s|mb|m|mega|megas)\b/i);
+  if (mbpsMatch) {
+    const n = normalizeNumberToken(mbpsMatch[1]);
+    return `${String(n).replace(/\.0+$/, '')}M`;
+  }
+
+  // Fallback: si hay varios números, tomar el más grande (evita agarrar precio primero)
+  const numbers = Array.from(raw.matchAll(/\d{1,3}(?:[\.,]\d{3})+|\d+(?:[\.,]\d+)?/g)).map(m => normalizeNumberToken(m[0]));
+  const numericCandidates = numbers
+    .map(s => ({ raw: s, n: Number(s) }))
+    .filter(x => !Number.isNaN(x.n));
+  if (numericCandidates.length) {
+    const best = numericCandidates.reduce((a, b) => (b.n > a.n ? b : a));
+    return `${String(best.raw).replace(/\.0+$/, '')}M`;
+  }
+
+  return raw;
+}
+
+const AUTH_SPEED_OPTIONS = ['200M', '400M', '600M', '800M'] as const;
+
+function matchSpeedOption(val: any, options: readonly string[] = AUTH_SPEED_OPTIONS): string | undefined {
+  const normalized = normalizeSpeedProfileName(val);
+  const opts = [...options];
+  return bestMatchOption(normalized, opts) || bestMatchOption(val, opts);
+}
+
+function pickFirstSpeedMatch(candidates: any[], options: readonly string[] = AUTH_SPEED_OPTIONS): string | undefined {
+  for (const c of candidates) {
+    const match = matchSpeedOption(c, options);
+    if (match) return match;
+  }
+  return undefined;
 }
 
 function pickPlanFromRaw(raw: any): string | undefined {
@@ -307,6 +392,21 @@ function bestMatchOption(input: any, options: string[]): string | undefined {
   if (inputNumber) {
     const numeric = normalizedOptions.find(o => o.norm.includes(inputNumber));
     if (numeric) return numeric.raw;
+
+    // Si no hay match exacto por inclusión, elegimos el número más cercano.
+    const inputNumeric = Number(inputNumber);
+    if (!Number.isNaN(inputNumeric)) {
+      let bestNumeric: { raw: string; distance: number } | undefined;
+      for (const opt of normalizedOptions) {
+        const optNumber = opt.norm.match(/\d+(?:\.\d+)?/)?.[0];
+        if (!optNumber) continue;
+        const optNumeric = Number(optNumber);
+        if (Number.isNaN(optNumeric)) continue;
+        const distance = Math.abs(optNumeric - inputNumeric);
+        if (!bestNumeric || distance < bestNumeric.distance) bestNumeric = { raw: opt.raw, distance };
+      }
+      if (bestNumeric) return bestNumeric.raw;
+    }
   }
 
   const inputTokens = new Set(normalizedInput.split(/\s+/).filter(Boolean));
@@ -368,8 +468,17 @@ function freezeFormActions(originalActions: any[], submittedData: any): any[] {
 
 function defaultsFromEntity(entity: any, type: 'client' | 'installation'): Record<string, any> {
   const isInst = type === 'installation';
-  const plan = entity.servicio || entity.plan_internet || pickPlanFromRaw(entity.raw);
-  const planForSpeed = entity.plan_internet || entity.servicio || pickPlanFromRaw(entity.raw);
+  const rawPlan = entity.servicio || entity.plan_internet || pickPlanFromRaw(entity.raw);
+  const plan = typeof rawPlan === 'object'
+    ? pickFirstString([
+        rawPlan?.name,
+        rawPlan?.nombre,
+        rawPlan?.label,
+        rawPlan?.descripcion,
+        rawPlan?.description
+      ])
+    : rawPlan;
+  const planForSpeed = rawPlan;
   const clientName = `${entity.nombre || ''} ${entity.apellidos || ''}`.trim();
   const rawString = !plan && entity?.raw ? JSON.stringify(entity.raw) : '';
   const isPyme = isPymeText(plan) || isPymeText(clientName) || (rawString ? isPymeText(rawString) : false);
@@ -748,13 +857,17 @@ export async function buildAuthActions(state: any, req?: any) {
 
   const odbOptions = ((state.smartoltOdbs || []) as any[]).map(o => o.name || o.id).filter(Boolean);
 
-  const speedOptions = ['200M', '400M', '600M', '800M'];
-  const speedSeed = collected.download_speed_profile_name
-    || defaults.download_speed_profile_name
-    || collected.speed
-    || defaults.speed
-    || defaults.name
-    || collected.name;
+  const speedOptions = [...AUTH_SPEED_OPTIONS];
+  const speedSeedCandidates = [
+    collected.download_speed_profile_name,
+    defaults.download_speed_profile_name,
+    collected.speed,
+    defaults.speed,
+    defaults.name,
+    collected.name,
+    req?.session?.lastSelectedPlan,
+    req?.session?.pendingAuth?.defaults?.name
+  ];
   const vlanSeed = collected.vlan || defaults.vlan || collected.vlan_id || defaults.vlan_id;
   const zoneSeed = collected.zone || defaults.zone || collected.zona || defaults.zona;
 
@@ -762,7 +875,7 @@ export async function buildAuthActions(state: any, req?: any) {
   const zoneBasedVlan = vlanFromZone ? bestMatchOption(vlanFromZone, vlanOptions) || vlanFromZone : undefined;
   const autoVlan = zoneBasedVlan || bestMatchOption(vlanSeed, vlanOptions) || vlanSeed;
   const autoZone = bestMatchOption(zoneSeed, zoneOptions) || zoneSeed;
-  const autoSpeed = bestMatchOption(normalizeSpeedProfileName(speedSeed), speedOptions) || speedSeed;
+  const autoSpeed = pickFirstSpeedMatch(speedSeedCandidates, speedOptions);
 
   if (!collected.vlan && autoVlan) collected.vlan = autoVlan;
   if (!collected.zone && autoZone) collected.zone = autoZone;
@@ -782,7 +895,7 @@ export async function buildAuthActions(state: any, req?: any) {
     { id: 'auth-odb-port', type: 'input', label: 'Puerto ODB', placeholder: '1', payload: 'auth set odb_port {input}' },
     { id: 'auth-name', type: 'input', label: `Nombre`, placeholder: defaults.name || 'Nombre', payload: 'auth set name {input}' },
     { id: 'auth-address', type: 'input', label: 'Dirección', placeholder: defaults.address_or_comment || 'Dirección', payload: 'auth set address_or_comment {input}' },
-    { id: 'auth-speed', type: 'input', label: 'Velocidad', placeholder: autoSpeed || defaults.download_speed_profile_name || '200M', value: autoSpeed || defaults.download_speed_profile_name || '', options: speedOptions },
+    { id: 'auth-speed', type: 'input', label: 'Velocidad', placeholder: autoSpeed || defaults.download_speed_profile_name || '200M', value: autoSpeed || defaults.download_speed_profile_name || '', options: speedOptions, payload: 'auth set download_speed_profile_name {input}' },
     { id: 'auth-submit', type: 'button', label: 'Autorizar SmartOLT ahora', payload: 'auth submit' }
   ];
 }
@@ -1546,7 +1659,19 @@ export async function submitAuth(req: any, res: any) {
     }
     
     const state = session.pendingAuth || {};
-    const merged = { ...state.defaults, ...state.collected, ...req.body, ...req.body.collected };
+    const merged: any = { ...state.defaults, ...state.collected, ...req.body, ...req.body.collected };
+
+    // Normalizar velocidad desde varias llaves posibles del form (auth-speed / speed / download_speed_profile_name)
+    const speedCandidate = merged.download_speed_profile_name
+      ?? merged['auth-speed']
+      ?? merged.speed
+      ?? merged.download_speed
+      ?? merged.downloadSpeed;
+    const matchedSpeed = matchSpeedOption(speedCandidate);
+    if (matchedSpeed) {
+      merged.download_speed_profile_name = matchedSpeed;
+      if (!merged.upload_speed_profile_name) merged.upload_speed_profile_name = matchedSpeed;
+    }
 
     session.lastAuthNameUsed = merged.name || state.defaults?.name;
     const targetId = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
