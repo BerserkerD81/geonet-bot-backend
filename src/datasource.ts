@@ -8,6 +8,8 @@ import { MYSQL } from './config';
 import { SmartoltZone } from './models/SmartoltZone';
 import { SmartoltOdb } from './models/SmartoltOdb';
 import { ChatSession } from './models/ChatSession';
+import { SmartoltOnuSnapshot } from './models/SmartoltOnuSnapshot';
+import { SmartoltOnuDetail } from './models/SmartoltOnuDetail';
 
 export const AppDataSource = new DataSource({
   type: 'mysql',
@@ -16,6 +18,6 @@ export const AppDataSource = new DataSource({
   username: MYSQL.user,
   password: MYSQL.password,
   database: MYSQL.database,
-  entities: [User, ChatMessage, Client, Installation, SmartoltZone, SmartoltOdb, ChatSession],
+  entities: [User, ChatMessage, Client, Installation, SmartoltZone, SmartoltOdb, ChatSession, SmartoltOnuSnapshot, SmartoltOnuDetail],
   synchronize: true
 });

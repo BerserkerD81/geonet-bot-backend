@@ -3,6 +3,7 @@ import { ChatMessage } from '../models/ChatMessage';
 import { ChatSession } from '../models/ChatSession';
 import { SmartoltZone } from '../models/SmartoltZone';
 import { SmartoltOdb } from '../models/SmartoltOdb';
+import { SmartoltOnuDetail } from '../models/SmartoltOnuDetail';
 import { Installation } from '../models/Installation';
 import { Client } from '../models/Client';
 import fs from 'fs';
@@ -19,6 +20,7 @@ import {
   agregarArticuloACliente,
   uploadDocumentoCliente 
 } from '../services/wisphubClient';
+import { getLatestSmartoltOnuSnapshot } from '../services/smartoltOnuSnapshot';
 import { searchLocalInstallations, refreshInstallationsByTerm, listPendingLocalInstallations, listAllLocalInstallations, fullSyncInstallations } from '../services/wisphubInstallations';
 import {
   authorizeOnu, listOlts, type OltInfo, getZones, getOltVlans,
@@ -26,7 +28,10 @@ import {
   setOnuWanModeStaticIp, getAllOnuTypes,
   getAllZones, getVlansByOltId, listGlobalUnconfiguredOnus,
   updateOnuWifi,
-  getInternalOnuIdBySn
+  getInternalOnuIdBySn,
+  updateOnuSn,
+  changeOnuType,
+  getAllOnusDetails
 } from '../services/smartoltClient';
 
 // --- HELPERS: Caching & Utils ---
@@ -45,7 +50,13 @@ const CHAT_CONTEXT_KEYS = [
   'lastSearchTerm',
   'searchMode',
   'photoFlowMode',
-  'pendingPhotoClientSearch'
+  'pendingPhotoClientSearch',
+  'changeOnuFlowMode',
+  'pendingChangeOnuClientSearch',
+  'pendingChangeOnu',
+  'wifiFlowMode',
+  'pendingWifiClientSearch',
+  'pendingWifiChange'
 ];
 
 async function loadChatContext(session: any, sessionId: number) {
@@ -443,7 +454,7 @@ function freezeFormActions(originalActions: any[], submittedData: any): any[] {
       if (submittedData[action.id] !== undefined) {
           val = submittedData[action.id];
       } else {
-          const keyFromId = action.id.replace(/^auth-|^wifi_/, '').replace('-', '_');
+          const keyFromId = action.id.replace(/^auth-|^wifi_|^change-onu-|^change_onu_/, '').replace('-', '_');
           if (submittedData[keyFromId] !== undefined) {
               val = submittedData[keyFromId];
           }
@@ -526,6 +537,23 @@ function buildClientsTable(items: any[]): string {
   return [header, ...rows].join('\n');
 }
 
+function buildUnconfiguredOnusTable(oltAvailability: any[]): string {
+  const header = `| # | OLT | SN | PON | Port | Modelo |\n|---|-----|----|-----|------|--------|`;
+  const rows: string[] = [];
+  let idx = 1;
+  (oltAvailability || []).forEach((olt: any) => {
+    (olt.onus || []).forEach((o: any) => {
+      const sn = o.id || '-';
+      const pon = o.ponType || '-';
+      const port = o.port || '-';
+      const model = o.model || '-';
+      const oltLabel = `${olt.oltName || ''} [${olt.oltId || ''}]`.trim();
+      rows.push(`| ${idx++} | ${oltLabel} | ${sn} | ${pon} | ${port} | ${model} |`);
+    });
+  });
+  return [header, ...(rows.length ? rows : ['| - | - | - | - | - | - |'])].join('\n');
+}
+
 function formatEntityList(items: any[], type: 'client' | 'installation'): { textLines: string[], actions: any[] } {
   const isClient = type === 'client';
   const textLines = items.map((it, i) => {
@@ -567,6 +595,74 @@ function buildClientDetails(entity: any, type: 'client' | 'installation'): strin
 🚀 **Plan:** ${plan}
 ${coords ? `🗺️ **Ubicación:** [Ver en Maps](${mapLink})` : '🗺️ **Ubicación:** No registrada'}
 `.trim();
+}
+
+function normalizeName(value?: string | null): string {
+  if (!value) return '';
+  return String(value)
+    .normalize('NFD')
+    .replace(/\p{Diacritic}/gu, '')
+    .replace(/[^a-zA-Z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function onuMatchesAnyField(onu: any, needle: string): boolean {
+  if (!onu || !needle) return false;
+  const target = normalizeName(needle);
+  if (!target) return false;
+
+  for (const val of Object.values(onu)) {
+    if (val === undefined || val === null) continue;
+    const normalized = normalizeName(String(val));
+    if (normalized && normalized.includes(target)) return true;
+  }
+  return false;
+}
+
+function onuMatchesNameLoose(onu: any, needle: string): boolean {
+  if (!onu || !needle) return false;
+  const target = normalizeName(needle);
+  const name = normalizeName(onu?.name);
+  if (!target || !name) return false;
+  return name.includes(target) || target.includes(name);
+}
+
+function pickActionValue(actions: any[] | undefined, ids: string[]): string | undefined {
+  if (!Array.isArray(actions)) return undefined;
+  for (const id of ids) {
+    const hit = actions.find(a => String(a?.id || '').toLowerCase() === id.toLowerCase());
+    if (hit && hit.value !== undefined && hit.value !== null && String(hit.value).trim() !== '') {
+      return String(hit.value).trim();
+    }
+  }
+  return undefined;
+}
+
+async function findOnuDetailByServiceName(serviceName: string) {
+  if (!serviceName) return null;
+  const repo = AppDataSource.getRepository(SmartoltOnuDetail);
+  const exact = await repo.findOne({
+    where: { name: serviceName },
+    order: { capturedAt: 'DESC' }
+  });
+  if (exact) return exact;
+
+  const normalized = normalizeName(serviceName);
+  if (!normalized) return null;
+
+  const candidates = await repo
+    .createQueryBuilder('o')
+    .where('o.name LIKE :like', { like: `%${serviceName}%` })
+    .orderBy('o.capturedAt', 'DESC')
+    .limit(50)
+    .getMany();
+
+  for (const c of candidates) {
+    if (normalizeName(c.name).includes(normalized) || normalized.includes(normalizeName(c.name))) return c;
+  }
+  return candidates[0] || null;
 }
 
 // --- LOGIC: WispHub Search Strategy ---
@@ -900,6 +996,41 @@ export async function buildAuthActions(state: any, req?: any) {
   ];
 }
 
+export async function buildChangeOnuActions(state: any) {
+  const collected = state.collected || {};
+  const onuTypeOptions = await getAllOnuTypes().catch(() => []);
+
+  const sn = collected.sn || state.sn || state.selectedSn || '';
+  const oldModel = collected.old_model || state.oldModel || state.selectedModel || '';
+  const newModel = collected.new_model || state.newModel || '';
+
+  return [
+    { id: 'change-onu-sn', type: 'input', label: 'SN ONU seleccionada', placeholder: sn || 'SN', value: sn || '', payload: 'cambio onu set sn {input}' },
+    { id: 'change-onu-old-model', type: 'input', label: 'Modelo antiguo (SmartOLT)', placeholder: oldModel || '-', value: oldModel || '-', disabled: true },
+    { id: 'change-onu-new-model', type: 'input', label: 'Modelo nuevo', placeholder: 'Selecciona modelo', value: newModel || '', options: onuTypeOptions, payload: 'cambio onu set new_model {input}' },
+    { id: 'change-onu-submit', type: 'button', label: 'Remplazar', payload: 'cambio onu submit sn {change-onu-sn} new_model {change-onu-new-model} old_model {change-onu-old-model}' }
+  ];
+}
+
+const WIFI_ONU_MODELS = ['ZTEF6600P', 'ZXHNF600P'];
+
+function normalizeOnuModel(value?: string | null): string {
+  return String(value || '').toUpperCase().replace(/[- ]/g, '');
+}
+
+function isWifiCapableModel(model?: string | null): boolean {
+  const normalized = normalizeOnuModel(model);
+  return WIFI_ONU_MODELS.includes(normalized);
+}
+
+function buildWifiChangeActions(sn: string) {
+  return [
+    { id: 'wifi_onu_ssid', type: 'input', label: 'Nombre WiFi (SSID)', placeholder: 'Nuevo Nombre', payload: 'wifi set ssid {input}' },
+    { id: 'wifi_onu_pass', type: 'input', label: 'Contraseña WiFi', placeholder: 'Nueva Clave (min 8)', payload: 'wifi set pass {input}' },
+    { id: 'wifi_onu_apply', type: 'button', label: 'Aplicar Cambios WiFi', payload: `wifi apply sn ${sn} ssid {wifi_onu_ssid} pass {wifi_onu_pass}` }
+  ];
+}
+
 // =========================================================================
 // --- CONTROLLER FUNCTIONS ---
 // =========================================================================
@@ -963,6 +1094,12 @@ export async function addMessage(req: any, res: any) {
       req.session.lastContextType = undefined;
       req.session.lastSearchTerm = undefined;
       req.session.searchMode = undefined;
+      req.session.changeOnuFlowMode = undefined;
+      req.session.pendingChangeOnuClientSearch = undefined;
+      req.session.pendingChangeOnu = undefined;
+      req.session.wifiFlowMode = undefined;
+      req.session.pendingWifiClientSearch = undefined;
+      req.session.pendingWifiChange = undefined;
 
         await saveChatContext(req.session, activeSessionId);
       } else if (req.session?.activeChatContextId !== activeSessionId) {
@@ -1023,6 +1160,12 @@ export async function respond(req: any, res: any) {
       session.lastContextType = undefined;
       session.lastSearchTerm = undefined;
       session.searchMode = undefined;
+      session.changeOnuFlowMode = undefined;
+      session.pendingChangeOnuClientSearch = undefined;
+      session.pendingChangeOnu = undefined;
+      session.wifiFlowMode = undefined;
+      session.pendingWifiClientSearch = undefined;
+      session.pendingWifiChange = undefined;
 
         await saveChatContext(session, activeSessionId);
       } else if (session?.activeChatContextId !== activeSessionId) {
@@ -1043,13 +1186,13 @@ export async function respond(req: any, res: any) {
       else if (content.toLowerCase().startsWith('wifi apply')) {
           const ssidMatch = content.match(/ssid\s+(.+?)(?=\s+pass)/i);
           const passMatch = content.match(/pass\s+(.+?)(?=\s+contract_id|$)/i);
-          const rawSsid = ssidMatch ? ssidMatch[1] : (typeof req.body.wifi_ssid === 'string' ? req.body.wifi_ssid : undefined);
+          const rawSsid = ssidMatch ? ssidMatch[1] : (typeof req.body.wifi_ssid === 'string' ? req.body.wifi_ssid : (typeof req.body.wifi_onu_ssid === 'string' ? req.body.wifi_onu_ssid : undefined));
           const formattedSsid = sanitizeSsid(rawSsid) ?? (rawSsid ? rawSsid.trim() : '***');
-          const pass = passMatch ? passMatch[1] : (req.body.wifi_pass || '***');
-          
+          const pass = passMatch ? passMatch[1] : (req.body.wifi_pass || req.body.wifi_onu_pass || '***');
+
           userMessageActions = [
             { type: 'input', label: 'SSID Configurado', value: formattedSsid, disabled: true, id: 'wifi_ssid' },
-              { type: 'input', label: 'Password Configurado', value: pass, disabled: true, id: 'wifi_pass' }
+            { type: 'input', label: 'Password Configurado', value: pass, disabled: true, id: 'wifi_pass' }
           ];
       }
   }
@@ -1134,8 +1277,116 @@ export async function respond(req: any, res: any) {
         actionsOut = structured.actions as any[];
         assistantMetadata = null;
 
+        // --- CHANGE ONU FLOW: START ---
+        if (/(cambiar\s+onu|cambio\s+onu|cambio\s+de\s+onu)/i.test(lower) && !/(buscar|submit)/i.test(lower)) {
+          session.changeOnuFlowMode = true;
+          session.pendingChangeOnuClientSearch = true;
+          session.pendingChangeOnu = { stage: 'search' };
+          finalContent = 'Perfecto. Ingresa el nombre completo y/o el RUT para buscar al cliente y cambiar la ONU.';
+          actionsOut = [
+            { id: 'change_fullname', type: 'input', label: 'Nombre Completo', placeholder: 'Ej: Juan Pérez', payload: 'cambio onu buscar nombre {change_fullname} rut {change_rut}' },
+            { id: 'change_rut', type: 'input', label: 'RUT', placeholder: 'Ej: 12.345.678-9', payload: 'cambio onu buscar nombre {change_fullname} rut {change_rut}' },
+            { id: 'change_submit', type: 'button', label: 'Buscar Cliente', payload: 'cambio onu buscar nombre {change_fullname} rut {change_rut}' }
+          ];
+        }
+        // --- CHANGE WIFI FLOW: START ---
+        else if (/(cambiar\s+wifi|cambio\s+wifi|cambiar\s+clave\s+wifi|cambiar\s+contrase(n|ñ)a\s+wifi|cambiar\s+password\s+wifi)/i.test(lower) && !/(buscar|submit|apply)/i.test(lower)) {
+          session.wifiFlowMode = true;
+          session.pendingWifiClientSearch = true;
+          session.pendingWifiChange = { stage: 'search' };
+          finalContent = 'Perfecto. Ingresa el nombre completo y/o el RUT para buscar al cliente y cambiar el WiFi.';
+          actionsOut = [
+            { id: 'wifi_search_fullname', type: 'input', label: 'Nombre Completo', placeholder: 'Ej: Juan Pérez', payload: 'wifi buscar nombre {wifi_search_fullname} rut {wifi_search_rut}' },
+            { id: 'wifi_search_rut', type: 'input', label: 'RUT', placeholder: 'Ej: 12.345.678-9', payload: 'wifi buscar nombre {wifi_search_fullname} rut {wifi_search_rut}' },
+            { id: 'wifi_search_submit', type: 'button', label: 'Buscar Cliente', payload: 'wifi buscar nombre {wifi_search_fullname} rut {wifi_search_rut}' }
+          ];
+        }
+        // --- CHANGE WIFI FLOW: SEARCH CLIENT ---
+        else if (lower.startsWith('wifi buscar') || (session.pendingWifiClientSearch && (collected?.wifi_search_fullname || collected?.wifi_search_rut))) {
+          const nameMatch = prompt.match(/nombre\s+(.+?)(?=\s+rut|$)/i);
+          const rutMatch = prompt.match(/rut\s+([^\s]+)/i);
+
+          let fullName = (collected?.wifi_search_fullname || nameMatch?.[1] || '').trim();
+          let rut = (collected?.wifi_search_rut || rutMatch?.[1] || '').trim();
+
+          if (fullName.includes('{wifi_search_fullname}')) fullName = '';
+          if (rut.includes('{wifi_search_rut}')) rut = '';
+
+          if (!fullName && !rut) {
+            finalContent = 'Ingresa nombre completo y/o RUT para buscar al cliente.';
+            actionsOut = [
+                { id: 'wifi_search_fullname', type: 'input', label: 'Nombre Completo', placeholder: 'Ej: Juan Pérez', payload: 'wifi buscar nombre {wifi_search_fullname} rut {wifi_search_rut}' },
+                { id: 'wifi_search_rut', type: 'input', label: 'RUT', placeholder: 'Ej: 12.345.678-9', payload: 'wifi buscar nombre {wifi_search_fullname} rut {wifi_search_rut}' },
+                { id: 'wifi_search_submit', type: 'button', label: 'Buscar Cliente', payload: 'wifi buscar nombre {wifi_search_fullname} rut {wifi_search_rut}' }
+              ];
+            session.pendingWifiClientSearch = true;
+          } else {
+            const clients = await findClientsByNameRutWithSync(fullName, rut);
+            session.pendingWifiClientSearch = false;
+            session.wifiFlowMode = true;
+            session.lastContextType = 'wifi-client-search';
+
+            if (clients.length) {
+              const fmt = formatEntityList(clients, 'client');
+              const table = buildClientsTable(clients);
+              finalContent = `Resultados para "${[fullName, rut].filter(Boolean).join(' / ') || 'búsqueda'}":\n\n${table}`;
+              // Mark these selection payloads as coming from the WiFi flow to avoid cross-flow confusion
+              actionsOut = fmt.actions.map(a => ({
+                ...a,
+                payload: String(a.payload || '').trim() + ' wifi'
+              }));
+            } else {
+              finalContent = 'No encontré clientes con esos datos. Intenta nuevamente.';
+              actionsOut = [
+                { id: 'wifi_search_fullname', type: 'input', label: 'Nombre Completo', placeholder: 'Ej: Juan Pérez', payload: 'wifi buscar nombre {wifi_search_fullname} rut {wifi_search_rut}' },
+                { id: 'wifi_search_rut', type: 'input', label: 'RUT', placeholder: 'Ej: 12.345.678-9', payload: 'wifi buscar nombre {wifi_search_fullname} rut {wifi_search_rut}' },
+                { id: 'wifi_search_submit', type: 'button', label: 'Buscar Cliente', payload: 'wifi buscar nombre {wifi_search_fullname} rut {wifi_search_rut}' }
+              ];
+            }
+          }
+        }
+        // --- CHANGE ONU FLOW: SEARCH CLIENT ---
+        else if (lower.startsWith('cambio onu buscar') || lower.startsWith('cambiar onu buscar') || (session.pendingChangeOnuClientSearch && (collected?.change_fullname || collected?.change_rut))) {
+          const nameMatch = prompt.match(/nombre\s+(.+?)(?=\s+rut|$)/i);
+          const rutMatch = prompt.match(/rut\s+([^\s]+)/i);
+
+          let fullName = (collected?.change_fullname || nameMatch?.[1] || '').trim();
+          let rut = (collected?.change_rut || rutMatch?.[1] || '').trim();
+
+          if (fullName.includes('{change_fullname}')) fullName = '';
+          if (rut.includes('{change_rut}')) rut = '';
+
+          if (!fullName && !rut) {
+            finalContent = 'Ingresa nombre completo y/o RUT para buscar al cliente.';
+            actionsOut = [
+              { id: 'change_fullname', type: 'input', label: 'Nombre Completo', placeholder: 'Ej: Juan Pérez', payload: 'cambio onu buscar nombre {change_fullname} rut {change_rut}' },
+              { id: 'change_rut', type: 'input', label: 'RUT', placeholder: 'Ej: 12.345.678-9', payload: 'cambio onu buscar nombre {change_fullname} rut {change_rut}' },
+              { id: 'change_submit', type: 'button', label: 'Buscar Cliente', payload: 'cambio onu buscar nombre {change_fullname} rut {change_rut}' }
+            ];
+            session.pendingChangeOnuClientSearch = true;
+          } else {
+            const clients = await findClientsByNameRutWithSync(fullName, rut);
+            session.pendingChangeOnuClientSearch = false;
+            session.changeOnuFlowMode = true;
+            session.lastContextType = 'change-onu-client-search';
+
+            if (clients.length) {
+              const fmt = formatEntityList(clients, 'client');
+              const table = buildClientsTable(clients);
+              finalContent = `Resultados para "${[fullName, rut].filter(Boolean).join(' / ') || 'búsqueda'}":\n\n${table}`;
+              actionsOut = [...fmt.actions];
+            } else {
+              finalContent = 'No encontré clientes con esos datos. Intenta nuevamente.';
+              actionsOut = [
+                { id: 'change_fullname', type: 'input', label: 'Nombre Completo', placeholder: 'Ej: Juan Pérez', payload: 'cambio onu buscar nombre {change_fullname} rut {change_rut}' },
+                { id: 'change_rut', type: 'input', label: 'RUT', placeholder: 'Ej: 12.345.678-9', payload: 'cambio onu buscar nombre {change_fullname} rut {change_rut}' },
+                { id: 'change_submit', type: 'button', label: 'Buscar Cliente', payload: 'cambio onu buscar nombre {change_fullname} rut {change_rut}' }
+              ];
+            }
+          }
+        }
         // --- FOTO FLOW: START ---
-        if (lower.includes('quiero agregar fotos') && (lower.includes('instalacion') || lower.includes('instalaicion'))) {
+        else if (lower.includes('quiero agregar fotos') && (lower.includes('instalacion') || lower.includes('instalaicion'))) {
           session.photoFlowMode = true;
           session.pendingPhotoClientSearch = true;
           finalContent = 'Perfecto. Ingresa el nombre completo y/o el RUT para buscar al cliente.';
@@ -1250,13 +1501,17 @@ export async function respond(req: any, res: any) {
           }
         }
         // --- WIFI APPLY ---
-        else if (lower.startsWith('wifi apply')) {
-            const snMatch = prompt.match(/sn\s+([a-zA-Z0-9]+)/i);
-            const ssidMatch = prompt.match(/ssid\s+(.+?)(?=\s+pass)/i); 
-            const passMatch = prompt.match(/pass\s+(.+?)(?=\s+contract_id|$)/i);
+        else if (lower.startsWith('wifi apply') || pickActionValue(req.body?.actions, ['wifi-apply', 'wifi_apply', 'wifi apply', 'wifi_apply_action'])) {
+            const actionWifi = pickActionValue(req.body?.actions, ['wifi-apply', 'wifi_apply', 'wifi apply', 'wifi_apply_action']);
+            const source = actionWifi ? String(actionWifi) : prompt;
+            try { console.log('[wifi apply] source:', source); } catch (e) {}
+
+            const snMatch = source.match(/sn\s+([a-zA-Z0-9]+)/i);
+            const ssidMatch = source.match(/ssid\s+(.+?)(?=\s+pass|$)/i);
+            const passMatch = source.match(/pass\s+(.+?)(?=\s+contract_id|$)/i);
             const bodyData = req.body || {};
             const container = bodyData.collected || bodyData.data || {};
-            
+
             const sn = (snMatch ? snMatch[1].toUpperCase() : null) || container.sn;
             const rawSsidValue = (ssidMatch ? ssidMatch[1] : null) ?? bodyData.wifi_ssid ?? container.wifi_ssid;
             const ssid = typeof rawSsidValue === 'string' ? sanitizeSsid(rawSsidValue) : undefined;
@@ -1271,7 +1526,7 @@ export async function respond(req: any, res: any) {
                         const results = [];
                         try { await updateOnuWifi(internalId, '2.4GHz', ssid, pass, true); results.push('✅ 2.4GHz Configurado'); } catch (e: any) { results.push(`❌ 2.4GHz Falló: ${e.message}`); }
                         try { await updateOnuWifi(internalId, '5GHz', `${ssid}_5G`, pass, true); results.push('✅ 5GHz Configurado'); } catch (e: any) { results.push(`⚠️ 5GHz: ${e.message || 'No disponible'}`); }
-                        
+
                         finalContent = `📡 Resultado WiFi (SN: ${sn}):\nSSID: ${ssid}\nClave: ${pass}\n\n${results.join('\n')}`;
                         actionsOut = [];
                         const targetId = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
@@ -1310,12 +1565,19 @@ export async function respond(req: any, res: any) {
                         }
 
                         if (targetId) {
-                          if (planIsPyme) {
-                            actionsOut.push({ id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` });
-                            finalContent += `\n\n👇 Acciones post-instalación (PYME) para ID ${targetId}:`;
+                          // Evitar mostrar acciones post-instalación si estamos en flujo explícito
+                          // de cambio WiFi o cambio de ONU (evita confusión y colisiones de flujo).
+                          const skipPostActions = !!(session?.wifiFlowMode || session?.changeOnuFlowMode || session?.pendingWifiChange || session?.pendingChangeOnu || String(session?.lastContextType || '').toLowerCase().includes('wifi') || String(session?.lastContextType || '').toLowerCase().includes('onu'));
+                          if (!skipPostActions) {
+                            if (planIsPyme) {
+                              actionsOut.push({ id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` });
+                              finalContent += `\n\n👇 Acciones post-instalación (PYME) para ID ${targetId}:`;
+                            } else {
+                              actionsOut.push({ id: 'btn-contrato', type: 'button', label: '📄 Generar Contrato', payload: `generar contrato ${targetId}` });
+                              finalContent += `\n\n👇 Acciones post-instalación para ID ${targetId}:`;
+                            }
                           } else {
-                            actionsOut.push({ id: 'btn-contrato', type: 'button', label: '📄 Generar Contrato', payload: `generar contrato ${targetId}` });
-                            finalContent += `\n\n👇 Acciones post-instalación para ID ${targetId}:`;
+                            finalContent += `\n\n(ℹ️ Flujo activo: omito acciones post-instalación)`;
                           }
                         } else {
                             finalContent += `\n\n(ℹ️ No se detectó un ID seleccionado previamente para generar el contrato)`;
@@ -1360,11 +1622,204 @@ export async function respond(req: any, res: any) {
             if (!session.pendingAuth) finalContent = 'No hay autorización en curso.';
             else { await submitAuth(req, res); return; }
         }
+        // --- CHANGE ONU SET (Field Update) ---
+        else if (lower.startsWith('cambio onu set') || lower.startsWith('cambiar onu set')) {
+          const match = prompt.match(/cambio\s+onu\s+set\s+([a-zA-Z0-9_\-]+)\s+(.+)/i)
+            || prompt.match(/cambiar\s+onu\s+set\s+([a-zA-Z0-9_\-]+)\s+(.+)/i);
+          if (match) {
+            const key = match[1].replace(/-/g, '_');
+            const value = match[2].trim();
+            session.pendingChangeOnu = session.pendingChangeOnu || { collected: {} };
+            session.pendingChangeOnu.collected = {
+              ...(session.pendingChangeOnu.collected || {}),
+              [key]: value
+            };
+            finalContent = `✅ Campo actualizado: ${key} = ${value}`;
+            actionsOut = await buildChangeOnuActions(session.pendingChangeOnu);
+          } else {
+            finalContent = '⚠️ Formato inválido. Usa: cambio onu set <campo> <valor>';
+          }
+        }
+        // --- CHANGE ONU SUBMIT (Trigger) ---
+        else if (lower.startsWith('cambio onu submit') || lower.startsWith('cambiar onu submit')) {
+          const state = session.pendingChangeOnu || {};
+          const merged: any = { ...state, ...state.collected, ...req.body, ...req.body.collected };
+          const collectedFromState = (session.pendingChangeOnu && session.pendingChangeOnu.collected) || {};
+          try {
+            console.log('[cambio-onu-submit] session.pendingChangeOnu (snapshot):', { pending: !!session.pendingChangeOnu, collected: collectedFromState });
+            console.log('[cambio-onu-submit] initial merged payload snapshot:', merged);
+          } catch (e) { /* ignore logging errors */ }
+
+            const actionSn = pickActionValue(req.body?.actions, ['change-onu-sn', 'change_onu_sn']);
+            const actionNewModel = pickActionValue(req.body?.actions, ['change-onu-new-model', 'change_onu_new_model']);
+            const actionOldModel = pickActionValue(req.body?.actions, ['change-onu-old-model', 'change_onu_old_model']);
+
+            const snMatch = prompt.match(/\bsn\s+(.+?)(?=\s+new_model\b|\s+old_model\b|$)/i);
+            const newModelMatch = prompt.match(/\bnew_model\s+(.+?)(?=\s+old_model\b|$)/i);
+            const oldModelMatch = prompt.match(/\bold_model\s+(.+?)(?=$)/i);
+            const sanitizePromptValue = (val: string) => {
+              const cleaned = String(val || '').trim();
+              if (!cleaned) return '';
+              if (cleaned.includes('{') || cleaned.includes('}')) return '';
+              return cleaned;
+            };
+            const promptSn = sanitizePromptValue(snMatch ? snMatch[1].trim() : '');
+            const promptNewModel = sanitizePromptValue(newModelMatch ? newModelMatch[1].trim() : '');
+            const promptOldModel = sanitizePromptValue(oldModelMatch ? oldModelMatch[1].trim() : '');
+
+            if (req.body?.actions) {
+              try {
+                console.log('[cambio-onu-submit] actions payload:', req.body.actions);
+              } catch (e) {
+                console.error('[cambio-onu-submit] actions log failed:', e);
+              }
+            }
+
+            const sn = merged.sn || merged['change-onu-sn'] || merged.change_onu_sn || actionSn || promptSn || state.sn || collectedFromState.old_sn || collectedFromState.sn || collectedFromState['change-onu-sn'];
+            const oldModel = merged.old_model || merged['change-onu-old-model'] || merged.change_onu_old_model || actionOldModel || promptOldModel || state.oldModel || collectedFromState.old_model;
+            const newModel = merged.new_model || merged['change-onu-new-model'] || merged.change_onu_new_model || actionNewModel || promptNewModel || merged.onu_type || collectedFromState.new_model;
+            const newSn = merged.new_sn || merged.change_onu_new_sn || merged['change-onu-new-sn'] || sn || collectedFromState.new_sn;
+            const onuExternalId = merged.onu_external_id || merged.onuExternalId || state.onuExternalId;
+            const clientName = merged.clientName || state.clientName;
+            const smartoltName = merged.smartoltName || state.smartoltName || clientName;
+
+            try {
+              console.log('[cambio-onu-submit] resolved values', { sn, oldModel, newModel, newSn, onuExternalId, smartoltName });
+            } catch (e) {}
+          if (!sn || !newModel) {
+            // keep the flow active so the user can complete missing fields
+            session.changeOnuFlowMode = true;
+            session.pendingChangeOnu = session.pendingChangeOnu || {};
+            session.pendingChangeOnu.collected = {
+              ...(session.pendingChangeOnu.collected || {}),
+              old_model: oldModel || session.pendingChangeOnu.collected?.old_model,
+              old_sn: sn || session.pendingChangeOnu.collected?.old_sn,
+              new_model: newModel || session.pendingChangeOnu.collected?.new_model,
+            };
+            finalContent = 'Faltan campos para el cambio de ONU. Completa el SN y el modelo nuevo.';
+            actionsOut = await buildChangeOnuActions(session.pendingChangeOnu);
+          } else {
+            try {
+              const onuTypeOptions = await getAllOnuTypes().catch(() => []);
+              const normalizedOnuTypeOptions: string[] = Array.isArray(onuTypeOptions)
+                ? onuTypeOptions.map((opt: any) => String(opt))
+                : [];
+              const newModelText = String(newModel || '').trim();
+              const resolvedNewModel = bestMatchOption(newModelText, normalizedOnuTypeOptions)
+                || (normalizedOnuTypeOptions.includes(newModelText) ? newModelText : undefined);
+
+              if (!resolvedNewModel) {
+                finalContent = '❌ Modelo ONU no válido. Selecciona un modelo válido (como en autorización).';
+                actionsOut = await buildChangeOnuActions({ collected: { sn, old_model: oldModel, new_model: newModel } });
+                return;
+              }
+
+              let targetOnuId = onuExternalId;
+                    if (!targetOnuId && smartoltName) {
+                      try {
+                        const detail = await findOnuDetailByServiceName(smartoltName);
+                        const found = detail?.payload || null;
+                        if (found) {
+                          targetOnuId = found.onu_external_id || found.unique_external_id || found.external_id || found.onu_id || found.id;
+                        }
+                      } catch (err) {
+                        console.error('Error resolviendo ONU por name en smartolt_onu_detail (submit):', err);
+                      }
+                    }
+
+              if (!targetOnuId) {
+                finalContent = `❌ No se encontró la ONU actual del cliente en SmartOLT para ejecutar el cambio.`;
+                actionsOut = await buildChangeOnuActions({ collected: { sn, old_model: oldModel, new_model: newModel } });
+              } else {
+                const results: string[] = [];
+                let typeUpdated = false;
+                try {
+                  const normalizedOldModel = String(oldModel || collectedFromState.old_model || '').trim().toUpperCase().replace(/[- ]/g, '');
+                  const normalizedNewModel = String(resolvedNewModel || '').trim().toUpperCase().replace(/[- ]/g, '');
+                  if (normalizedOldModel && normalizedOldModel === normalizedNewModel) {
+                    results.push(`ℹ️ Modelo igual (${normalizedNewModel}). No se solicita cambio de modelo en SmartOLT.`);
+                    // consider model as effectively "updated" so SN update step can proceed
+                    typeUpdated = true;
+                  } else {
+                    await changeOnuType(targetOnuId, String(resolvedNewModel));
+                    results.push(`✅ Tipo ONU actualizado a ${resolvedNewModel}`);
+                    typeUpdated = true;
+                  }
+                } catch (e: any) {
+                  results.push(`❌ Error cambiando modelo: ${e?.message || 'falló'}`);
+                }
+
+                if (typeUpdated) {
+                  try {
+                    await updateOnuSn(targetOnuId, String(newSn));
+                    results.push(`✅ SN actualizado a ${newSn}`);
+                  } catch (e: any) {
+                    results.push(`❌ Error actualizando SN: ${e?.message || 'falló'}`);
+                  }
+                } else {
+                  results.push('⚠️ SN no actualizado porque el cambio de modelo falló.');
+                }
+
+                finalContent = `🔁 **Cambio de ONU ejecutado**\nONU ID: ${targetOnuId}\nSN nuevo: ${newSn}\nModelo antiguo: ${oldModel || 'N/D'}\nModelo nuevo: ${resolvedNewModel}\n\n${results.join('\n')}`;
+
+                const rawType = String(resolvedNewModel || '').toUpperCase().replace(/[- ]/g, '');
+                const wifiModels = ['ZTEF6600P', 'ZXHNF600P'];
+                if (wifiModels.includes(rawType)) {
+                  actionsOut = [
+                    { id: 'wifi_onu_ssid', type: 'input', label: 'Nombre WiFi (SSID)', placeholder: 'Nuevo Nombre', payload: 'wifi set ssid {input}' },
+                    { id: 'wifi_onu_pass', type: 'input', label: 'Contraseña WiFi', placeholder: 'Nueva Clave (min 8)', payload: 'wifi set pass {input}' },
+                    { id: 'wifi_onu_apply', type: 'button', label: 'Aplicar Cambios WiFi', payload: `wifi apply sn ${newSn} ssid {wifi_onu_ssid} pass {wifi_onu_pass}` }
+                  ];
+                } else {
+                  actionsOut = [];
+                }
+                session.changeOnuFlowMode = false;
+                session.pendingChangeOnuClientSearch = false;
+                session.pendingChangeOnu = undefined;
+              }
+            } catch (err: any) {
+              finalContent = `❌ Error ejecutando cambio de ONU: ${err?.message || 'desconocido'}`;
+              actionsOut = await buildChangeOnuActions({ collected: { sn, old_model: oldModel, new_model: newModel } });
+            }
+          }
+        }
         
         // --- SELECCIONAR CLIENTE/INSTALACION ---
-        else if (/^(seleccionar|select) (cliente|instalación|instalacion)/i.test(lower)) {
-            const isClient = lower.includes('cliente');
-            const id = Number(lower.split(/\s+/).pop());
+        else if (/^(seleccionar|select) (cliente|instalación|instalacion)/i.test(lower) || pickActionValue(req.body?.actions, ['select-client','select_client','seleccionar-cliente','seleccionar_cliente','select','seleccionar'])) {
+          // allow selection via text or via actions payloads
+          const actionSelect = pickActionValue(req.body?.actions, ['select-client','select_client','seleccionar-cliente','seleccionar_cliente','select','seleccionar']);
+          // If frontend sent only the action id (e.g. 'select-client-1205'), try to extract from that as a fallback
+          let rawActionSelect = actionSelect;
+          if (!rawActionSelect && Array.isArray(req.body?.actions)) {
+            const hit = (req.body.actions || []).find((a: any) => typeof a?.id === 'string' && /^select-(client|installation)-\d+/i.test(a.id));
+            if (hit) {
+              // derive a string similar to previous payloads: prefer explicit value/payload, otherwise use id
+              rawActionSelect = String(hit.value || hit.payload || hit.id || '').trim();
+              // if payload contains wifi marker, ensure context reflects wifi-client-search
+              try {
+                if (String(hit.value || hit.payload || '').toLowerCase().includes('wifi')) {
+                  (req.session ||= {}).lastContextType = 'wifi-client-search';
+                }
+              } catch (e) { /* ignore */ }
+            }
+          }
+          let isClient = false;
+          let id: number | null = null;
+          if (rawActionSelect) {
+            const m = String(rawActionSelect).match(/(cliente|instalaci[oó]n|instalacion)?\s*(\d+)/i);
+            if (m) {
+              isClient = /cliente/i.test(m[1] || 'cliente');
+              id = Number(m[2]);
+            } else {
+              // fallback: treat as numeric id
+              const n = String(rawActionSelect).match(/(\d+)/);
+              if (n) id = Number(n[1]);
+            }
+          }
+          if (!id) {
+            isClient = lower.includes('cliente');
+            id = Number(lower.split(/\s+/).pop());
+          }
             
             let entity: any = null;
             if (isClient) {
@@ -1376,6 +1831,22 @@ export async function respond(req: any, res: any) {
             }
 
             if (entity) {
+                 try {
+                   console.log('[select-client] payload:', {
+                     body: req.body,
+                     collected: req.body?.collected,
+                     entity
+                   });
+                  console.log('[select-client] session flags:', {
+                    changeOnuFlowMode: session.changeOnuFlowMode,
+                    wifiFlowMode: session.wifiFlowMode,
+                    lastContextType: session.lastContextType,
+                    pendingChangeOnu: !!session.pendingChangeOnu,
+                    pendingWifiChange: !!session.pendingWifiChange
+                  });
+                 } catch (e) {
+                   console.error('[select-client] log error:', e);
+                 }
                  const serviceId = entity.id_servicio || entity.id; 
                  session.lastSelectedClientIdServicio = serviceId; 
                  if (!isClient) session.lastSelectedInstallationId = entity.id;
@@ -1391,7 +1862,95 @@ export async function respond(req: any, res: any) {
                 const sessionTitle = `${displayName || 'Cliente'} - ${dateLabel}`;
                 await sessionRepo.update({ id: Number(activeSessionId), userId: Number(userId) }, { title: sessionTitle });
 
-                if (isClient && session.photoFlowMode) {
+                if (isClient && (session.changeOnuFlowMode || session.lastContextType === 'change-onu-client-search' || session.pendingChangeOnu || session.pendingChangeOnuClientSearch)) {
+                  // CHANGE-ONU flow: prepare pendingChangeOnu and show unconfigured ONUs table
+                  session.pendingChangeOnuClientSearch = false;
+                  console.log('[select-client] chosen-flow: change-onu');
+                  const clientName = displayName || `Cliente ${serviceId}`;
+                  const smartoltName = entity.servicio || clientName;
+                  session.pendingChangeOnu = {
+                    clientIdServicio: serviceId,
+                    clientName,
+                    smartoltName,
+                    collected: {
+                      client_id: serviceId
+                    }
+                  };
+
+                  let targetOnu: any = null;
+                  try {
+                    const detail = await findOnuDetailByServiceName(smartoltName);
+                    targetOnu = detail?.payload || null;
+                  } catch (err) {
+                    console.error('Error obteniendo ONUs detalles:', err);
+                  }
+
+                  if (targetOnu) {
+                    const onuExternalId = targetOnu.onu_external_id || targetOnu.unique_external_id || targetOnu.external_id || targetOnu.onu_id || targetOnu.id;
+                    const oldSn = targetOnu.sn || targetOnu.serial || targetOnu.onu_sn || '';
+                    const oldModel = targetOnu.onu_type || targetOnu.model || targetOnu.onu_type_name || '';
+                    session.pendingChangeOnu = {
+                      ...session.pendingChangeOnu,
+                      onuExternalId,
+                      oldSn,
+                      oldModel,
+                      collected: {
+                        ...(session.pendingChangeOnu.collected || {}),
+                        old_model: oldModel,
+                        old_sn: oldSn,
+                        onu_external_id: onuExternalId
+                      }
+                    };
+                  }
+                  // Show unconfigured ONUs table so user can pick one for the change
+                  const section = await buildOltAndNetworkSection(serviceId, { skipZonesFetch: true });
+                  const table = buildUnconfiguredOnusTable(section.oltAvailability || []);
+                  finalContent = `✅ Cliente seleccionado para cambio de ONU: **${clientName}** [ID: ${serviceId}].\n\n📡 **ONUs sin autorizar (cambio de ONU):**\n\n${table}\n\n👇 Selecciona una ONU libre para cambiarla.`;
+                  if (!targetOnu) {
+                    finalContent += `\n\n⚠️ No encontré una ONU en smartolt_onu_detail con name = "${smartoltName}". Se intentará nuevamente al confirmar.`;
+                  }
+                  actionsOut = section.actions;
+                } else if (isClient && (session.wifiFlowMode || session.lastContextType === 'wifi-client-search' || session.pendingWifiChange || session.pendingWifiClientSearch)) {
+                  // WIFI flow: try to find ONU details and show WiFi form if possible
+                  session.pendingWifiClientSearch = false;
+                  console.log('[select-client] chosen-flow: wifi');
+                  const clientName = displayName || `Cliente ${serviceId}`;
+                  const smartoltName = entity.servicio || clientName;
+                  session.pendingWifiChange = {
+                    clientIdServicio: serviceId,
+                    clientName,
+                    smartoltName
+                  };
+
+                  let targetOnu: any = null;
+                  try {
+                    const detail = await findOnuDetailByServiceName(smartoltName);
+                    targetOnu = detail?.payload || null;
+                  } catch (err) {
+                    console.error('Error obteniendo ONU para cambio WiFi:', err);
+                  }
+
+                  if (!targetOnu) {
+                    finalContent = '❌ No se encontró la ONU del cliente en SmartOLT.';
+                    actionsOut = [];
+                  } else {
+                    const onuSn = pickFirstString([targetOnu.sn, targetOnu.serial, targetOnu.onu_sn, targetOnu.mac]) || '';
+                    const onuType = pickFirstString([targetOnu.onu_type, targetOnu.model, targetOnu.onu_type_name]) || '';
+
+                    if (!onuSn) {
+                      finalContent = '❌ No se encontró el SN de la ONU en SmartOLT.';
+                      actionsOut = [];
+                    } else if (!isWifiCapableModel(onuType)) {
+                      finalContent = `❌ El modelo de ONU (${onuType || 'desconocido'}) no permite cambio de WiFi.`;
+                      actionsOut = [];
+                    } else {
+                      finalContent = `✅ ONU encontrada: ${onuSn}\nModelo: ${onuType}\nCompleta el formulario para cambiar WiFi.`;
+                      actionsOut = buildWifiChangeActions(onuSn);
+                    }
+                  }
+                  session.wifiFlowMode = false;
+                  session.pendingWifiClientSearch = false;
+                } else if (isClient && session.photoFlowMode) {
                   session.photoFlowMode = false;
                   session.pendingPhotoClientSearch = false;
                   session.lastSelectedInstallationId = undefined;
@@ -1439,15 +1998,41 @@ export async function respond(req: any, res: any) {
                 }
 
                 if (onu) {
-                    session.pendingAuth = session.pendingAuth || { collected: {} };
-                    session.pendingAuth.collected = {
-                        ...session.pendingAuth.collected,
-                        olt_id: onu.olt_id, pon_type: (onu.pon_type || 'gpon').toLowerCase(),
-                        board: onu.board, port: onu.port, sn: onu.sn || onu.serial,
-                        onu_type: onu.onu_type_name || onu.onu_type, onu_mode: 'Routing'
-                    };
-                    finalContent = `ONU ${sn} seleccionada. Formulario prellenado.`;
-                    actionsOut = await buildAuthActions(session.pendingAuth, req);
+                    if (session.changeOnuFlowMode) {
+                      const selectedSn = onu.sn || onu.serial || sn;
+                      const pending = session.pendingChangeOnu || { collected: {} };
+                      const oldModel = pending.oldModel || pending.old_model || pending.collected?.old_model || 'N/D';
+                      const oldSn = pending.oldSn || pending.collected?.old_sn || '';
+
+                      session.pendingChangeOnu = {
+                        ...pending,
+                        newSn: selectedSn,
+                        olt_id: onu.olt_id,
+                        pon_type: (onu.pon_type || 'gpon').toLowerCase(),
+                        board: onu.board,
+                        port: onu.port,
+                        collected: {
+                          ...(pending.collected || {}),
+                          sn: selectedSn,
+                          new_sn: selectedSn,
+                          old_model: oldModel,
+                          old_sn: oldSn
+                        }
+                      };
+
+                      finalContent = `ONU ${selectedSn} seleccionada para **cambio de ONU**.\nModelo antiguo (SmartOLT): **${oldModel}**.\n\nCompleta el modelo nuevo y presiona **Remplazar**.`;
+                      actionsOut = await buildChangeOnuActions(session.pendingChangeOnu);
+                    } else {
+                      session.pendingAuth = session.pendingAuth || { collected: {} };
+                      session.pendingAuth.collected = {
+                          ...session.pendingAuth.collected,
+                          olt_id: onu.olt_id, pon_type: (onu.pon_type || 'gpon').toLowerCase(),
+                          board: onu.board, port: onu.port, sn: onu.sn || onu.serial,
+                          onu_type: onu.onu_type_name || onu.onu_type, onu_mode: 'Routing'
+                      };
+                      finalContent = `ONU ${sn} seleccionada. Formulario prellenado.`;
+                      actionsOut = await buildAuthActions(session.pendingAuth, req);
+                    }
                 } else {
                     finalContent = 'No pude encontrar los detalles de esa ONU.';
                 }
@@ -1630,7 +2215,22 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
         return { message: messages.join(' '), actions: wifiActions };
     } 
     else {
-        const directActions: any[] = [];
+      // Si estamos en un flujo explícito de cambio WiFi, no adjuntar acciones
+      // post-instalación (p. ej. generar contrato). Esto evita confundir al usuario
+      // mostrando botones ajenos al cambio de WiFi.
+      const session = data._session || {};
+      if (
+        session?.wifiFlowMode ||
+        session?.changeOnuFlowMode ||
+        String(session?.lastContextType || '').toLowerCase().includes('wifi') ||
+        String(session?.lastContextType || '').toLowerCase().includes('onu') ||
+        session?.pendingWifiChange ||
+        session?.pendingChangeOnu
+      ) {
+        return { message: messages.join(' '), actions: [] };
+      }
+
+      const directActions: any[] = [];
         if (targetId) {
         if (isPyme) {
           directActions.push({ id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` });

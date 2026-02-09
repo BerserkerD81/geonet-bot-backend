@@ -22,6 +22,7 @@ import odbRoutes from './routes/odb';
 import { ensureDefaultAdmin } from './services/adminBootstrap';
 import { migrateOldMessagesToSessions } from './scripts/migrateSessions';
 import { refreshZoneOdbCache } from './services/zoneOdbCache';
+import { scheduleSmartoltOnuSnapshots } from './services/smartoltOnuSnapshot';
 
 dotenv.config();
 
@@ -146,6 +147,13 @@ AppDataSource.initialize()
 
     } catch (e) { 
       console.warn('Sync scheduler failed', e); 
+    }
+
+    // 3.1. SmartOLT ONU snapshot diario
+    try {
+      scheduleSmartoltOnuSnapshots();
+    } catch (e) {
+      console.warn('SmartOLT ONU snapshot scheduler failed', e);
     }
     
     // 4. Iniciar escucha

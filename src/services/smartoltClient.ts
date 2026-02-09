@@ -593,6 +593,32 @@ export async function getInstallationById(id: string | number) {
   return get(`/api/installations/${encodeURIComponent(String(id))}`);
 }
 
+export async function getAllOnusDetailsRaw(): Promise<any> {
+  let data = await getWithPostFallback<any>(`/api/onu/get_all_onus_details`);
+  try {
+    if (typeof data === 'string') {
+      try {
+        data = JSON.parse(data);
+      } catch (e) {
+      }
+    }
+  } catch (e) {
+  }
+  return data;
+}
+
+export async function getAllOnusDetails(): Promise<SmartOltOnuDetails[]> {
+  const data = await getAllOnusDetailsRaw();
+  const list = Array.isArray((data as any)?.response)
+    ? (data as any).response
+    : Array.isArray((data as any)?.data)
+      ? (data as any).data
+      : Array.isArray(data)
+        ? data
+        : [];
+  return (list || []) as SmartOltOnuDetails[];
+}
+
 export async function updateOnuLocation(onuExternalId: string, params: Record<string, any>) {
   if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
   if (!SMARTOLT.apiKey) throw new Error('SMARTOLT_API_KEY not configured');
@@ -606,6 +632,34 @@ export async function updateOnuLocation(onuExternalId: string, params: Record<st
     }
   }
 
+  const headers = { ...getHeaders(), ...fd.getHeaders() } as Record<string, string>;
+  const res = await axios.post(url, fd as any, { headers, timeout: 20000, maxBodyLength: Infinity, maxContentLength: Infinity });
+  return res.data;
+}
+
+export async function updateOnuSn(onuExternalId: string | number, newSn: string) {
+  if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
+  if (!SMARTOLT.apiKey) throw new Error('SMARTOLT_API_KEY not configured');
+  if (!onuExternalId) throw new Error('onuExternalId required');
+  if (!newSn) throw new Error('newSn required');
+
+  const url = `${baseUrl}/api/onu/update_sn/${encodeURIComponent(String(onuExternalId))}`;
+  const fd = new FormData();
+  fd.append('new_sn', String(newSn));
+  const headers = { ...getHeaders(), ...fd.getHeaders() } as Record<string, string>;
+  const res = await axios.post(url, fd as any, { headers, timeout: 20000, maxBodyLength: Infinity, maxContentLength: Infinity });
+  return res.data;
+}
+
+export async function changeOnuType(onuExternalId: string | number, onuType: string) {
+  if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
+  if (!SMARTOLT.apiKey) throw new Error('SMARTOLT_API_KEY not configured');
+  if (!onuExternalId) throw new Error('onuExternalId required');
+  if (!onuType) throw new Error('onuType required');
+
+  const url = `${baseUrl}/api/onu/change_onu_type/${encodeURIComponent(String(onuExternalId))}`;
+  const fd = new FormData();
+  fd.append('onu_type', String(onuType));
   const headers = { ...getHeaders(), ...fd.getHeaders() } as Record<string, string>;
   const res = await axios.post(url, fd as any, { headers, timeout: 20000, maxBodyLength: Infinity, maxContentLength: Infinity });
   return res.data;
@@ -968,8 +1022,12 @@ export default {
   getCustomerById,
   getServiceById,
   getInstallationById,
+  getAllOnusDetails,
+  getAllOnusDetailsRaw,
   setOnuWanModeStaticIp,
   updateOnuLocation,
+  updateOnuSn,
+  changeOnuType,
   getAvailablePortsForOdb,
   listAllUnconfiguredOnus,
   updateOnuWifi,
