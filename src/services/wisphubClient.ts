@@ -10,6 +10,7 @@ import { parseRaw, asString, asDateString, stripHtml } from './rawParser';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ensureRequestDelay } from '../utils/apiThrottle';
+import { authorizeOnu, getOnuBySerial, updateOnuSn, changeOnuType, updateOnuLocation } from './smartoltClient';
 // ... tus otros imports (axios, wrapper, CookieJar, FormData, etc.)
 // --- UTILIDADES DE FECHA ---
 
@@ -593,43 +594,75 @@ export async function registrarOnuGeonet(model: string, sn: string, mac: string 
     params.append('form-0-num_serie', sn);
     params.append('form-0-mac', mac);
 
-    // 4. ENVIAR PETICIÓN
-    const response = await geonetHttp.post(
-      '/productos-wifi/agregar/', 
-      params, 
-      {
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'Referer': `${BASE_URL}/productos-wifi/agregar/`,
-          'X-CSRFToken': csrfToken
+    // 4. ENVIAR PETICIÓN con reintentos
+    const maxAttempts = 4;
+    let lastErr: any = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const response = await geonetHttp.post(
+          '/productos-wifi/agregar/', 
+          params, 
+          {
+            headers: {
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'Referer': `${BASE_URL}/productos-wifi/agregar/`,
+              'X-CSRFToken': csrfToken,
+              'Origin': BASE_URL,
+              'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+            },
+            timeout: 120000
+          }
+        );
+
+        // 5. VERIFICAR SI LA SESIÓN EXPIRÓ DURANTE EL POST
+        const finalUrl = response.request.res.responseUrl || '';
+        if (finalUrl.includes('/accounts/login/')) {
+           console.warn('⚠️ La sesión expiró durante la petición. Re-intentando operación una vez más...');
+           await authenticateGeonet(); 
+           csrfToken = await getLocalToken();
+           continue; // reintentar
         }
-      }
-    );
 
-    // 5. VERIFICAR SI LA SESIÓN EXPIRÓ DURANTE EL POST
-    // A veces tenemos token, pero es viejo. Geonet redirige al login (status 200, pero URL cambia a /login/)
-    const finalUrl = response.request.res.responseUrl || '';
-    if (finalUrl.includes('/accounts/login/')) {
-       console.warn('⚠️ La sesión expiró durante la petición. Re-intentando operación una vez más...');
-       
-       // Forzamos re-login
-       await authenticateGeonet(); 
-       
-       // Llamada recursiva (solo un nivel de profundidad para evitar bucles infinitos)
-       // Nota: Esto es seguro porque authenticateGeonet renueva las cookies en el 'jar' global
-       return await registrarOnuGeonet(model, sn, mac);
-    }
+        // 6. VALIDAR ÉXITO
+        if (response.status === 200 && !finalUrl.includes('agregar')) {
+            console.log(`✅ ONU Registrada exitosamente: ${sn}`);
+            return true;
+        } else if (response.status === 200 && finalUrl.includes('agregar')) {
+            console.warn(`⚠️ Posible error de validación (SN duplicado o datos incorrectos) para ${sn}.`);
+            return false;
+        }
 
-    // 6. VALIDAR ÉXITO
-    if (response.status === 200 && !finalUrl.includes('agregar')) {
-        console.log(`✅ ONU Registrada exitosamente: ${sn}`);
         return true;
-    } else if (response.status === 200 && finalUrl.includes('agregar')) {
-        console.warn(`⚠️ Posible error de validación (SN duplicado o datos incorrectos) para ${sn}.`);
-        return false;
+      } catch (error: any) {
+        lastErr = error;
+        const status = error?.response?.status;
+        const dataSnippet = error?.response?.data ? String(error.response.data).slice(0, 1000) : error?.message;
+        console.warn(`Intento ${attempt} registrar ONU falló:`, status || error?.code || error?.message);
+        if (dataSnippet) console.warn('Data (trunc):', dataSnippet);
+        // Si es un 403 o 429, esperar exponencialmente y reintentar (salvo si es 403 repetido)
+        if (status === 403) {
+          // Probablemente WAF/CSRF; reintentar un par de veces
+          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+          // intentar re-obtener token y continuar
+          try { await authenticateGeonet(); csrfToken = await getLocalToken(); } catch {}
+          continue;
+        }
+        if (status === 429) {
+          await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+          continue;
+        }
+        // Para timeouts u otros, reintentar tras pequeño delay
+        await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+      }
     }
 
-    return true;
+    // Si llegamos aquí, todos los intentos fallaron
+    console.error(`❌ Error registrando ONU ${sn}:`, lastErr?.message || lastErr);
+    if (lastErr?.response) {
+      console.error('Status:', lastErr.response.status);
+      console.error('Data (trunc):', String(lastErr.response.data).slice(0, 2000));
+    }
+    return false;
 
   } catch (error: any) {
     console.error(`❌ Error registrando ONU ${sn}:`, error.message);
@@ -744,31 +777,49 @@ export async function agregarArticuloACliente(
     // --------------------------------------------------------------------------------
     console.log(`🚀 Asignando artículo ${numSerie} (UUID: ${uuidReal}) a cliente...`);
 
-    const response = await geonetHttp.post(targetUrl, form, {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Referer': refererUrl,
-        'X-CSRFToken': csrfToken,
-        'Origin': 'https://admin.geonet.cl'
-      },
-      // Evitamos que axios siga el redirect automáticamente para poder analizar la URL de respuesta
-      maxRedirects: 5 
-    });
+    // Reintentos en caso de timeout o errores transitorios
+    const maxAttempts = 3;
+    let lastErr: any = null;
+    let response: any = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        response = await geonetHttp.post(targetUrl, form, {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Referer': refererUrl,
+            'X-CSRFToken': csrfToken,
+            'Origin': 'https://admin.geonet.cl'
+          },
+          // Evitamos que axios siga el redirect automáticamente para poder analizar la URL de respuesta
+          maxRedirects: 5,
+          timeout: 120000
+        });
+        break;
+      } catch (err: any) {
+        lastErr = err;
+        console.warn(`agregarArticuloACliente: intento ${attempt} falló:`, err?.code || err?.message || err?.response?.status);
+        if (attempt < maxAttempts) await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
+      }
+    }
 
     // --------------------------------------------------------------------------------
     // 5. VALIDAR RESPUESTA
     // --------------------------------------------------------------------------------
-    const finalUrl = response.request.res.responseUrl || '';
+    const finalUrl = response?.request?.res?.responseUrl || '';
     
     // En Django/WispHub, si hay éxito suele redirigir a la lista de clientes o al perfil (/clientes/1195/...)
     // Si falla, suele devolver 200 OK pero manteniéndose en la misma URL de 'agregar-articulos' pintando el error en HTML.
     
-    if (response.status === 200 && !finalUrl.includes('agregar-articulos')) {
+    if (response && response.status === 200 && !finalUrl.includes('agregar-articulos')) {
       console.log(`✅ ÉXITO: Artículo agregado. Redirigido a: ${finalUrl}`);
       return true;
     } else {
       // Si quieres depurar, podrías imprimir response.data para ver qué error muestra el HTML
       console.warn(`⚠️ FALLO: El servidor no realizó la asignación. URL final: ${finalUrl}`);
+      if (lastErr && lastErr.response) {
+        console.warn('agregarArticuloACliente last error status:', lastErr.response.status);
+        console.warn('agregarArticuloACliente last error data (trunc):', String(lastErr.response.data).slice(0, 1000));
+      }
       return false;
     }
 
@@ -782,6 +833,187 @@ export async function agregarArticuloACliente(
   }
 }
 
+/**
+ * Busca el UUID de un producto WiFi (ONU) en la página `/productos-wifi/` por su número de serie.
+ */
+export async function getWifiProductUuidBySerial(serial: string): Promise<string | null> {
+  try {
+    const res = await geonetHttp.get('/productos-wifi/');
+    const html = String(res.data || '');
+    const esc = serial.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // Intento 1: buscar la fila <tr> que contiene el serial y extraer un UUID dentro de ella
+    const trRe = new RegExp(`<tr[\\s\\S]*?${esc}[\\s\\S]*?<\/tr>`, 'i');
+    const trMatch = html.match(trRe);
+    const uuidRe = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+    if (trMatch) {
+      const u = trMatch[0].match(uuidRe);
+      if (u) return u[0];
+      const inputMatch = trMatch[0].match(/<input[^>]+value=["']([0-9a-f-]{36})["'][^>]*>/i);
+      if (inputMatch) return inputMatch[1];
+    }
+
+    // Intento 2: buscar el serial en el HTML y examinar una ventana alrededor para encontrar un UUID
+    const idx = html.search(new RegExp(esc, 'i'));
+    if (idx >= 0) {
+      const start = Math.max(0, idx - 800);
+      const window = html.slice(start, idx + 800);
+      const u2 = window.match(uuidRe);
+      if (u2) return u2[0];
+    }
+
+    // No encontrado
+    return null;
+  } catch (err: any) {
+    console.error('Error buscando UUID por serial:', err?.message || err);
+    return null;
+  }
+}
+
+/**
+ * Borra un producto WiFi en Geonet usando su UUID mediante el endpoint de acciones.
+ */
+export async function deleteWifiProductByUuid(uuid: string): Promise<boolean> {
+  try {
+    // Necesitamos obtener CSRF token desde la página (o cookies)
+    const page = await geonetHttp.get('/productos-wifi/');
+    const html = String(page.data || '');
+    let csrf = extractCsrfToken(html) || '';
+    if (!csrf) {
+      const cookies = await jar.getCookies('https://admin.geonet.cl');
+      csrf = cookies.find((c: any) => c.key === 'csrftoken')?.value || '';
+    }
+
+    const params = new URLSearchParams();
+    params.append('csrfmiddlewaretoken', csrf || '');
+    params.append('accion_select', 'delete_selected');
+    params.append('lista_productos_wifi', '1');
+    params.append('uuid_producto_wifi', uuid);
+    params.append('form-acciones', '');
+
+    const resp = await geonetHttp.post('/productos-wifi/acciones/', params.toString(), {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': 'https://admin.geonet.cl/productos-wifi/'
+      }
+    });
+
+    return resp.status === 200 || resp.status === 302;
+  } catch (err: any) {
+    console.error('Error borrando producto wifi uuid=', uuid, err?.message || err);
+    return false;
+  }
+}
+
+/**
+ * Flujo completo: busca y borra la ONU antigua por serial (si existe), registra la nueva ONU
+ * y la asigna al cliente seleccionado.
+ */
+export type SmartOltReplaceOptions = {
+  // Si se quiere autorizar la nueva ONU en SmartOLT antes de tocar Geonet
+  authorizeParams?: Parameters<typeof authorizeOnu>[0];
+  // Opcional: actualizar la ONU existente en SmartOLT (por external id o por búsqueda por serial)
+  updateExisting?: {
+    onuExternalId?: string | number; // si no se provee, se intenta obtener desde getOnuBySerial(oldSerial)
+    newSn?: string;
+    newOnuType?: string;
+    locationParams?: Record<string, any>;
+  };
+};
+
+export async function replaceOnuForClient(
+  clienteId: number | string,
+  clienteUsuario: string,
+  oldSerial: string,
+  newModel: string,
+  newSn: string,
+  newMac: string = '',
+  options?: SmartOltReplaceOptions
+): Promise<boolean> {
+  console.log(`[geonet] replaceOnuForClient: iniciar flujo para cliente=${clienteId}, oldSerial=${oldSerial}`);
+
+  try {
+    // 1) Ejecutar llamadas a SmartOLT primero (si se han pedido)
+    if (options?.updateExisting) {
+      let onuExternalId = options.updateExisting.onuExternalId;
+      if (!onuExternalId && oldSerial) {
+        try {
+          const info = await getOnuBySerial(oldSerial);
+          // SmartOLT puede devolver diferentes shapes; intentamos extraer external id
+          onuExternalId = info?.unique_external_id ?? info?.external_id ?? info?.onu_external_id ?? info?.id ?? info?.onu_id;
+          if (!onuExternalId && Array.isArray(info) && info.length) {
+            const first = info[0] as any;
+            onuExternalId = first?.unique_external_id ?? first?.external_id ?? first?.onu_external_id ?? first?.id ?? first?.onu_id;
+          }
+        } catch (e) {
+          console.warn('SmartOLT: error buscando ONU por serial:', (e as any)?.message || e);
+        }
+      }
+
+      if (onuExternalId) {
+        try {
+          if (options.updateExisting.newSn) {
+            await updateOnuSn(onuExternalId, options.updateExisting.newSn);
+            console.log('[smartolt] updateOnuSn OK for', onuExternalId);
+          }
+          if (options.updateExisting.newOnuType) {
+            await changeOnuType(onuExternalId, options.updateExisting.newOnuType);
+            console.log('[smartolt] changeOnuType OK for', onuExternalId);
+          }
+          if (options.updateExisting.locationParams) {
+            await updateOnuLocation(String(onuExternalId), options.updateExisting.locationParams);
+            console.log('[smartolt] updateOnuLocation OK for', onuExternalId);
+          }
+        } catch (e) {
+          console.warn('SmartOLT: fallo actualizando ONU existente:', (e as any)?.message || e);
+        }
+      } else {
+        console.log('[smartolt] No se encontró onuExternalId para actualizar en SmartOLT');
+      }
+    }
+
+    if (options?.authorizeParams) {
+      try {
+        const authRes = await authorizeOnu(options.authorizeParams as any);
+        const ok = authRes && (authRes.status === true || authRes?.success || authRes?.ok || authRes?.response);
+        if (!ok) {
+          console.error('[smartolt] authorizeOnu falló:', JSON.stringify(authRes).slice(0, 300));
+          return false;
+        }
+        console.log('[smartolt] authorizeOnu OK');
+      } catch (e) {
+        console.error('[smartolt] authorizeOnu excepción:', (e as any)?.message || e);
+        return false;
+      }
+    }
+
+    // 2) Luego, ejecutar las operaciones en Geonet (borrar antigua, registrar nueva, asignar)
+    const uuid = await getWifiProductUuidBySerial(oldSerial);
+    if (uuid) {
+      console.log(`[geonet] UUID encontrado para serial ${oldSerial}: ${uuid} — intentando borrar`);
+      const deleted = await deleteWifiProductByUuid(uuid);
+      if (!deleted) console.warn(`[geonet] No se pudo borrar el producto wifi uuid=${uuid}`);
+    } else {
+      console.log(`[geonet] No se encontró UUID para serial ${oldSerial}, se continuará con registro`);
+    }
+
+    // Registrar nueva ONU en el inventario de Geonet
+    const registered = await registrarOnuGeonet(newModel, newSn, newMac);
+    if (!registered) {
+      console.error('[geonet] Error registrando nueva ONU en inventario');
+      return false;
+    }
+
+    // Asignar el artículo (ONU) al cliente
+    const assigned = await agregarArticuloACliente(clienteId, clienteUsuario, newSn, newMac);
+    if (!assigned) console.error('[geonet] Error asignando la nueva ONU al cliente');
+
+    return !!assigned;
+  } catch (err: any) {
+    console.error('Error en replaceOnuForClient:', err?.message || err);
+    return false;
+  }
+}
 
 export async function searchLocal(term: string, limit = 50) {
   const repo = AppDataSource.getRepository(Client);

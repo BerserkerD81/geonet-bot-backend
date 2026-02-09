@@ -20,6 +20,7 @@ import {
   agregarArticuloACliente,
   uploadDocumentoCliente 
 } from '../services/wisphubClient';
+import { replaceOnuForClient } from '../services/wisphubClient';
 import { getLatestSmartoltOnuSnapshot } from '../services/smartoltOnuSnapshot';
 import { searchLocalInstallations, refreshInstallationsByTerm, listPendingLocalInstallations, listAllLocalInstallations, fullSyncInstallations } from '../services/wisphubInstallations';
 import {
@@ -1761,6 +1762,38 @@ export async function respond(req: any, res: any) {
                 }
 
                 finalContent = `🔁 **Cambio de ONU ejecutado**\nONU ID: ${targetOnuId}\nSN nuevo: ${newSn}\nModelo antiguo: ${oldModel || 'N/D'}\nModelo nuevo: ${resolvedNewModel}\n\n${results.join('\n')}`;
+
+                // Después de ejecutar los cambios en SmartOLT (tipo + SN), intentamos sincronizar/realizar
+                // el reemplazo en Geonet (borrar ONU vieja, registrar nueva y asignar al cliente).
+                try {
+                  const clientIdServicio = merged.clientIdServicio || session.pendingChangeOnu?.clientIdServicio || session.lastSelectedClientIdServicio;
+                  let clienteUsuario: string | undefined = merged.clienteUsuario || session.pendingChangeOnu?.clientUser || session.pendingChangeOnu?.clientUsuario;
+                  if (clientIdServicio && !clienteUsuario) {
+                    try {
+                      const repo = AppDataSource.getRepository(Client);
+                      const clientEntity = await repo.findOne({ where: { id_servicio: Number(clientIdServicio) } });
+                      if (clientEntity) clienteUsuario = clientEntity.usuario || `${clientEntity.id_servicio}@geonet`;
+                    } catch (e) {
+                      console.warn('No se pudo obtener cliente desde DB para replaceOnuForClient:', (e as any)?.message || e);
+                    }
+                  }
+
+                  if (clientIdServicio && clienteUsuario) {
+                    const oldSerialToUse = merged.old_sn || merged.oldSn || collectedFromState.old_sn || session.pendingChangeOnu?.oldSn || session.pendingChangeOnu?.old_sn || sn;
+                    const replaced = await replaceOnuForClient(clientIdServicio, clienteUsuario, oldSerialToUse, resolvedNewModel || newModel, newSn, '');
+                    results.push(replaced ? '✅ Reemplazo en Geonet completado' : '⚠️ Reemplazo en Geonet falló');
+                    // actualizar finalContent con el resultado actualizado
+                    finalContent = `🔁 **Cambio de ONU ejecutado**\nONU ID: ${targetOnuId}\nSN nuevo: ${newSn}\nModelo antiguo: ${oldModel || 'N/D'}\nModelo nuevo: ${resolvedNewModel}\n\n${results.join('\n')}`;
+                  } else {
+                    results.push('⚠️ No se intentó reemplazo en Geonet (falta cliente o cliente.usuario)');
+                    finalContent = `🔁 **Cambio de ONU ejecutado**\nONU ID: ${targetOnuId}\nSN nuevo: ${newSn}\nModelo antiguo: ${oldModel || 'N/D'}\nModelo nuevo: ${resolvedNewModel}\n\n${results.join('\n')}`;
+                  }
+                } catch (e) {
+                  console.error('Error ejecutando replaceOnuForClient:', (e as any)?.message || e);
+                  // no hacemos throw; sólo añadimos aviso a resultados
+                  try { results.push('❌ Excepción al intentar reemplazo en Geonet'); } catch {};
+                  finalContent = `🔁 **Cambio de ONU ejecutado**\nONU ID: ${targetOnuId}\nSN nuevo: ${newSn}\nModelo antiguo: ${oldModel || 'N/D'}\nModelo nuevo: ${resolvedNewModel}\n\n${results.join('\n')}`;
+                }
 
                 const rawType = String(resolvedNewModel || '').toUpperCase().replace(/[- ]/g, '');
                 const wifiModels = ['ZTEF6600P', 'ZXHNF600P'];
