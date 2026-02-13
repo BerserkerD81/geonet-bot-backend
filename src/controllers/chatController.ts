@@ -225,7 +225,7 @@ function normalizeSpeedProfileName(val: any): string | undefined {
   return raw;
 }
 
-const AUTH_SPEED_OPTIONS = ['200M', '400M', '600M', '800M','700M','940M'] as const;
+const AUTH_SPEED_OPTIONS = ['200M', '400M', '600M','800M','700M','940M'] as const;
 
 function matchSpeedOption(val: any, options: readonly string[] = AUTH_SPEED_OPTIONS): string | undefined {
   const normalized = normalizeSpeedProfileName(val);
@@ -1465,14 +1465,14 @@ export async function respond(req: any, res: any) {
           const hasGeonet = baseName.toLowerCase().includes('@geonet');
           const fullGeonetUser = hasGeonet ? baseName : `${baseName}@geonet`;
 
-          if (!targetId) {
+            if (!targetId) {
               finalContent = "⚠️ Error: No se detectó ID para activar.";
-          } else {
+            } else {
               finalContent = `⏳ Activando servicio en Geonet para **${fullGeonetUser}**...`;
-              const exito = await activarInstalacionGeonet(targetId, fullGeonetUser);
+              const actRes = await activarInstalacionGeonet(targetId, fullGeonetUser);
               
-              if (exito) {
-                  finalContent = `🚀 **¡Activación Exitosa!**\nLa instalación **${targetId}** ha sido activada correctamente bajo el usuario \`${fullGeonetUser}\`.\n\nYa puedes cargarle imágenes a la instalación del cliente.`;
+              if (actRes?.ok) {
+                finalContent = `🚀 **¡Activación Exitosa!**\nLa instalación **${targetId}** ha sido activada correctamente bajo el usuario \`${fullGeonetUser}\`.\n\nYa puedes cargarle imágenes a la instalación del cliente.`;
 
                   if (session.pendingPhotos && session.pendingPhotos.length > 0) {
                       finalContent += `\n\n📤 **Procesando ${session.pendingPhotos.length} fotos acumuladas...**`;
@@ -1497,9 +1497,13 @@ export async function respond(req: any, res: any) {
                       }
                   }
                   
-              } else {
+                  } else {
                   finalContent = `❌ **Error en Activación**\nNo se pudo activar el usuario \`${fullGeonetUser}\`. Por favor, verifique el panel de Geonet.`;
+                  // Si fue rate-limit, sugerir reintento (frontend puede respetar delays)
                   actionsOut = [{ id: 'retry', type: 'button', label: '🔄 Reintentar', payload: `wisphub activate ${targetId}` }];
+                  if (actRes?.status === 429) {
+                    finalContent += `\n\n⚠️ Respuesta 429 (rate limit) desde el servidor. Intenta nuevamente en unos segundos.`;
+                  }
               }
           }
         }
@@ -1619,11 +1623,41 @@ export async function respond(req: any, res: any) {
                 try {
                   const clienteUsuario = String(session.lastAuthNameUsed || `${baseName}@geonet`).trim();
                   const fullUser = clienteUsuario.toLowerCase().includes('@geonet') ? clienteUsuario : `${clienteUsuario}@geonet`;
-                  const activated = await activarInstalacionGeonet(targetId, fullUser);
+
+                  const sleep = (ms: number) => new Promise<void>(res => setTimeout(res, ms));
+                  const maxAttempts = 4;
+                  let attempt = 0;
+                  let activated = false;
+                  let delayMs = 2000;
+                  let lastStatus: number | undefined = undefined;
+
+                  for (attempt = 1; attempt <= maxAttempts; attempt++) {
+                    try {
+                      const res = await activarInstalacionGeonet(targetId, fullUser);
+                      if (res && res.ok) {
+                        activated = true;
+                        break;
+                      }
+                      lastStatus = res?.status;
+                      if (lastStatus === 429) {
+                        finalContent += `\nIntento ${attempt} falló por rate limit (429). Esperando ${Math.round(delayMs/1000)}s antes de reintentar...`;
+                        await sleep(delayMs);
+                        delayMs *= 2; // backoff exponencial para 429
+                      } else {
+                        finalContent += `\nIntento ${attempt} falló (status: ${lastStatus ?? 'unknown'}). Reintentando en 2s...`;
+                        await sleep(2000);
+                      }
+                    } catch (err) {
+                      console.error('Error auto-activating in WispHub (attempt):', err);
+                      await sleep(2000);
+                    }
+                  }
+
                   if (activated) {
                     finalContent += `\n\n🚀 Activación en WispHub completada para ${fullUser}.`;
                   } else {
-                    finalContent += `\n\n⚠️ No se pudo activar automáticamente en WispHub.`;
+                    finalContent += `\n\n⚠️ No se pudo activar automáticamente en WispHub tras ${maxAttempts} intentos.`;
+                    if (lastStatus === 429) finalContent += `\n⚠️ Se detectaron errores 429 (rate limit). Espera antes de reintentar.`;
                   }
                 } catch (err) {
                   console.error('Error auto-activating in WispHub:', err);

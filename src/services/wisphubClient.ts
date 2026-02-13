@@ -294,9 +294,9 @@ export async function downloadContratoGeonet(instalacionId: number | string): Pr
  * Activa una instalación específica
  */
 export async function activarInstalacionGeonet(
-  instalacionId: number | string, 
+  instalacionId: number | string,
   usuarioInstalacion: string
-): Promise<boolean> {
+): Promise<{ ok: boolean; status?: number; error?: string }> {
   try {
     const ensureAuth = async () => {
       const ok = await authenticateGeonet();
@@ -348,10 +348,13 @@ export async function activarInstalacionGeonet(
     }
 
     console.log(`Petición de activación enviada para ${instalacionId}. Status: ${response.status}`);
-    return response.status === 200;
+    return { ok: response.status === 200, status: response.status };
   } catch (error: any) {
-    console.error(`Error al activar instalación ${instalacionId}:`, error.message);
-    return false;
+    console.error(`Error al activar instalación ${instalacionId}:`, error?.message || error);
+    if (error && error.response && error.response.status) {
+      return { ok: false, status: error.response.status, error: String(error.message || '') };
+    }
+    return { ok: false, error: String(error?.message || 'unknown') };
   }
 }
 
