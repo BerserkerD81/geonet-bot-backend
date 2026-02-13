@@ -18,7 +18,8 @@ import {
   getAutoLoginContractLink,
   registrarOnuGeonet,
   agregarArticuloACliente,
-  uploadDocumentoCliente 
+  uploadDocumentoCliente, 
+  _placeholder
 } from '../services/wisphubClient';
 import { replaceOnuForClient } from '../services/wisphubClient';
 import { getLatestSmartoltOnuSnapshot } from '../services/smartoltOnuSnapshot';
@@ -991,7 +992,7 @@ export async function buildAuthActions(state: any, req?: any) {
     { id: 'auth-odb', type: 'input', label: `ODB ${defaults.odb ? `(curr: ${defaults.odb})` : ''}`, placeholder: 'Selecciona ODB', options: odbOptions, payload: 'auth set odb {input}' },
     { id: 'auth-odb-port', type: 'input', label: 'Puerto ODB', placeholder: '1', payload: 'auth set odb_port {input}' },
     { id: 'auth-name', type: 'input', label: `Nombre`, placeholder: defaults.name || 'Nombre', payload: 'auth set name {input}' },
-    { id: 'auth-address', type: 'input', label: 'Dirección', placeholder: defaults.address_or_comment || 'Dirección', payload: 'auth set address_or_comment {input}' },
+    { id: 'auth-address', type: 'input', label: 'Etiqueta Roja',  _placeholder:'E134332', payload: 'auth set address_or_comment {input}' },
     { id: 'auth-speed', type: 'input', label: 'Velocidad', placeholder: autoSpeed || defaults.download_speed_profile_name || '200M', value: autoSpeed || defaults.download_speed_profile_name || '', options: speedOptions, payload: 'auth set download_speed_profile_name {input}' },
     { id: 'auth-submit', type: 'button', label: 'Autorizar SmartOLT ahora', payload: 'auth submit' }
   ];
