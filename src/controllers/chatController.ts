@@ -225,7 +225,7 @@ function normalizeSpeedProfileName(val: any): string | undefined {
   return raw;
 }
 
-const AUTH_SPEED_OPTIONS = ['200M', '400M', '600M', '800M'] as const;
+const AUTH_SPEED_OPTIONS = ['200M', '400M', '600M', '800M','700M','940M'] as const;
 
 function matchSpeedOption(val: any, options: readonly string[] = AUTH_SPEED_OPTIONS): string | undefined {
   const normalized = normalizeSpeedProfileName(val);
@@ -297,7 +297,8 @@ function normalizeComparableText(value: string): string {
 function isPymeText(value: any): boolean {
   if (!value) return false;
   const norm = normalizeComparableText(String(value));
-  return norm.includes('pyme');
+  // Considerar 'pyme' o 'empresa' (y derivados) como indicador de cliente PyME
+  return norm.includes('pyme') || norm.includes('empresa');
 }
 
 async function resolveIsPyme(session: any, targetId?: number | string): Promise<boolean> {
@@ -1575,7 +1576,8 @@ export async function respond(req: any, res: any) {
                               actionsOut.push({ id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` });
                               finalContent += `\n\n👇 Acciones post-instalación (PYME) para ID ${targetId}:`;
                             } else {
-                              actionsOut.push({ id: 'btn-contrato', type: 'button', label: '📄 Generar Contrato', payload: `generar contrato ${targetId}` });
+                              // Botón combinado: generar contrato y activar en WispHub
+                              actionsOut.push({ id: 'btn-contrato', type: 'button', label: '📄 Generar Contrato y Activar en WispHub', payload: `generar contrato activar ${targetId}` });
                               finalContent += `\n\n👇 Acciones post-instalación para ID ${targetId}:`;
                             }
                           } else {
@@ -1594,11 +1596,13 @@ export async function respond(req: any, res: any) {
         }
         // --- GENERAR CONTRATO ---
         else if (lower.startsWith('generar contrato')) {
-          const idMatch = prompt.match(/generar contrato\s+(\d+)/i);
+          const idMatch = prompt.match(/generar contrato(?:\s+activar)?\s+(\d+)/i);
           const targetId = idMatch ? idMatch[1] : null;
+          const wantsActivate = /activar/i.test(prompt);
           if (targetId) {
             const isPyme = await resolveIsPyme(session, targetId);
-            if (isPyme) {
+            if (isPyme && !wantsActivate) {
+              // Para PYME sin petición de activar, mantener comportamiento: ofrecer activar
               finalContent = `✅ Cliente PYME detectado. Omitiendo contrato.`;
               actionsOut = [
                 { id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` }
@@ -1608,11 +1612,30 @@ export async function respond(req: any, res: any) {
               await processContractUpdate(targetId).catch(err => console.error('Error generating contract:', err));
               const baseName = session.lastAuthNameUsed || targetId;
               let contratourl = await getAutoLoginContractLink(`${baseName}@geonet`, targetId);
-                  
-              finalContent = `✅ Contrato generado:`;
+
+              // Si el botón solicitó activación, ejecutar activación ahora y anexar resultado
+              if (wantsActivate) {
+                finalContent = `✅ Contrato generado e intentando activación en WispHub...`;
+                try {
+                  const clienteUsuario = String(session.lastAuthNameUsed || `${baseName}@geonet`).trim();
+                  const fullUser = clienteUsuario.toLowerCase().includes('@geonet') ? clienteUsuario : `${clienteUsuario}@geonet`;
+                  const activated = await activarInstalacionGeonet(targetId, fullUser);
+                  if (activated) {
+                    finalContent += `\n\n🚀 Activación en WispHub completada para ${fullUser}.`;
+                  } else {
+                    finalContent += `\n\n⚠️ No se pudo activar automáticamente en WispHub.`;
+                  }
+                } catch (err) {
+                  console.error('Error auto-activating in WispHub:', err);
+                  finalContent += `\n\n⚠️ Error al intentar activar en WispHub.`;
+                }
+              } else {
+                finalContent = `✅ Contrato generado:`;
+              }
+
+              // Mostrar solamente el link para copiar contrato (no mostrar botón separado de activar)
               actionsOut = [
-                 { id: 'btn-contrato', type: 'link', label: '📄 Copiar Contrato', url: `${contratourl}` },
-                 { id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` }
+                 { id: 'btn-contrato', type: 'link', label: '📄 Copiar Contrato', url: `${contratourl}` }
               ];
             }
           } else {
@@ -2270,7 +2293,7 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
           directActions.push({ id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` });
           messages.push(`\n\n👇 **Proceso finalizado (PYME).** Selecciona una acción:`);
         } else {
-          directActions.push({ id: 'btn-contrato', type: 'button', label: '📄 Generar Contrato', payload: `generar contrato ${targetId}` });
+          directActions.push({ id: 'btn-contrato', type: 'button', label: '📄 Generar Contrato y Activar en WispHub', payload: `generar contrato activar ${targetId}` });
           messages.push(`\n\n👇 **Proceso finalizado.** Selecciona una acción:`);
         }
         } else {
