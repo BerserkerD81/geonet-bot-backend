@@ -46,7 +46,25 @@ const CHAT_CONTEXT_KEYS = [
   'lastSelectedIsPyme',
   'lastSelectedPlan',
   'pendingAuth',
+  // IPs
+  'ipv4',
+  'ipv4_address',
+  // Drafts / uploads
+  'lastMessageDraft',
+  'lastImageSystemPath',
   'pendingPhotos',
+  // Forms / flows
+  'pendingForm',
+  'pendingFormFields',
+  'pendingWanConfig',
+  'pendingWifiConfig',
+  'pendingChangeOnu',
+  'pendingActionQueue',
+  'lastBotStep',
+  // Selections / search
+  'lastSelectedOltId',
+  'lastSelectedOnuSn',
+  'lastSearchResults',
   'lastAuthNameUsed',
   'lastContextType',
   'lastSearchTerm',
@@ -55,10 +73,17 @@ const CHAT_CONTEXT_KEYS = [
   'pendingPhotoClientSearch',
   'changeOnuFlowMode',
   'pendingChangeOnuClientSearch',
-  'pendingChangeOnu',
-  'wifiFlowMode',
   'pendingWifiClientSearch',
-  'pendingWifiChange'
+  'pendingWifiChange',
+  // Assistant metadata and housekeeping
+  'assistantMetadata',
+  'sessionExpiresAt',
+  'contextVersion',
+  'locale',
+  'timezone',
+  // Security / attempts
+  'authAttempts',
+  'otpPending'
 ];
 
 async function loadChatContext(session: any, sessionId: number) {
@@ -96,12 +121,48 @@ async function saveChatContext(session: any, sessionId: number) {
   session.chatContexts[String(sessionId)] = snapshot;
   session.activeChatContextId = sessionId;
 
+  // Antes de persistir en DB, sanitizar/maskear datos sensibles
   try {
     const sessionRepo = AppDataSource.getRepository(ChatSession);
-    await sessionRepo.update({ id: Number(sessionId) }, { context: snapshot });
+    const sanitized = sanitizeContextForDb(snapshot);
+    await sessionRepo.update({ id: Number(sessionId) }, { context: sanitized });
   } catch (e) {
     console.error('Error guardando contexto en DB:', e);
   }
+}
+
+// Sanitiza snapshot de contexto antes de guardar en DB: enmascara claves sensibles
+function sanitizeContextForDb(snapshot: any) {
+  const sensitiveKeyRegex = /pass(word)?|pwd|token|secret|otp|ssn|credit|card|cvv|clave/i;
+
+  function cloneAndMask(val: any): any {
+    if (val === null || val === undefined) return val;
+    if (typeof val === 'string') return val;
+    if (typeof val === 'number' || typeof val === 'boolean') return val;
+    if (Array.isArray(val)) return val.map(cloneAndMask);
+    if (typeof val === 'object') {
+      const out: any = {};
+      for (const [k, v] of Object.entries(val)) {
+        try {
+          if (sensitiveKeyRegex.test(k)) {
+            out[k] = '***';
+            continue;
+          }
+        } catch {}
+        // Protección específica: no guardar contraseñas WiFi en claro
+        if ((k === 'pass' || k === 'password' || k === 'wifi_password') && typeof v === 'string') {
+          out[k] = '***';
+          continue;
+        }
+
+        out[k] = cloneAndMask(v);
+      }
+      return out;
+    }
+    return val;
+  }
+
+  return cloneAndMask(snapshot);
 }
 
 async function cacheGet<T>(key: string, ttlSeconds: number, fetcher: () => Promise<T>): Promise<T> {
@@ -150,87 +211,99 @@ function saveImageDataUrl(imageDataUrl?: string): { webPath: string; systemPath:
 function normalizeSpeedProfileName(val: any): string | undefined {
   if (val === undefined || val === null) return undefined;
 
-  const normalizeNumberToken = (token: string): string => {
-    const t = String(token || '').trim();
-    if (!t) return '';
-
-    // Caso típico CL: 1.000 / 15.990 (separador de miles)
-    if (/^\d{1,3}(?:\.\d{3})+$/.test(t)) return t.replace(/\./g, '');
-    if (/^\d{1,3}(?:,\d{3})+$/.test(t)) return t.replace(/,/g, '');
-
-    // Decimal con coma
-    if (/^\d+(?:,\d+)?$/.test(t)) return t.replace(',', '.');
-
-    return t;
-  };
-
-  // A veces el "plan" llega como objeto (p.ej. { name: 'Internet Fibra 600 Mbps' }).
-  // Extraemos texto útil antes de intentar regex.
+  // Limpieza básica
   let raw = '';
   if (typeof val === 'object') {
-    const candidates: any[] = [
-      (val as any).download_speed_profile_name,
-      (val as any).upload_speed_profile_name,
-      (val as any).speed,
-      (val as any).velocidad,
-      (val as any).name,
-      (val as any).nombre,
-      (val as any).label,
-      (val as any).descripcion,
-      (val as any).description,
-      (val as any).plan,
-      (val as any).plan_internet
-    ];
-    raw = pickFirstString(candidates) || '';
-    if (!raw) {
-      try {
-        raw = JSON.stringify(val);
-      } catch {
-        raw = '';
-      }
-    }
+     // Intenta sacar el nombre del plan de objetos complejos
+     raw = val.download_speed_profile_name || val.name || val.plan_internet || val.plan || '';
   } else {
-    raw = String(val);
+     raw = String(val);
   }
-
   raw = raw.trim();
   if (!raw) return undefined;
+  try { console.log('[normalizeSpeedProfileName] input raw:', { raw }); } catch (e) {}
 
-  // Gbps -> convertir a Mbps (1 Gbps = 1000 Mbps)
-  // Acepta: 1 Gbps, 1.0Gb, 1,5 gbps
-  const gbpsMatch = raw.match(/(\d{1,3}(?:[\.,]\d{3})+|\d+(?:[\.,]\d+)?)\s*(?:g|gbps|gb)\b/i);
+  const normalizeNumberToken = (token: string): string => {
+    const t = token.trim();
+    // Elimina separadores de miles (puntos en 1.000 o comas en 1,000 si no son decimales obvios)
+    if (/^\d{1,3}(?:\.\d{3})+$/.test(t)) return t.replace(/\./g, ''); 
+    return t.replace(',', '.'); // Estandarizar decimales
+  };
+
+  // 1. PRIORIDAD: Buscar Gbps (ej: 1 Gbps, 2.5 Gb)
+  const gbpsMatch = raw.match(/(\d+(?:[\.,]\d+)?)\s*(?:g|gbps|gb)\b/i);
   if (gbpsMatch) {
+    try { console.log('[normalizeSpeedProfileName] gbpsMatch:', { gbpsMatch: gbpsMatch[1] }); } catch (e) {}
     const gbps = Number(normalizeNumberToken(gbpsMatch[1]));
-    if (!Number.isNaN(gbps)) return `${String(gbps * 1000).replace(/\.0+$/, '')}M`;
+    if (!Number.isNaN(gbps)) return `${gbps * 1000}M`;
   }
 
-  // Mbps / Mb / M / megas
-  // Acepta: 600 Mbps, 600Mb/s, 1.000 mbps, 600 megas
-  const mbpsMatch = raw.match(/(\d{1,3}(?:[\.,]\d{3})+|\d+(?:[\.,]\d+)?)\s*(?:mbps|mb\/?s|mb|m|mega|megas)\b/i);
+  // 2. PRIORIDAD: Buscar Mbps (ej: 600 Mbps, 300 Megas)
+  // Esto evita confundirse con el precio "$15.990" porque busca la palabra "Mb/Mega"
+  const mbpsMatch = raw.match(/(\d+(?:[\.,]\d+)?)\s*(?:mbps|mb|m|mega|megas)\b/i);
   if (mbpsMatch) {
+    try { console.log('[normalizeSpeedProfileName] mbpsMatch:', { mbpsMatch: mbpsMatch[1] }); } catch (e) {}
     const n = normalizeNumberToken(mbpsMatch[1]);
-    return `${String(n).replace(/\.0+$/, '')}M`;
+    return `${Number(n)}M`; // "600M"
   }
 
-  // Fallback: si hay varios números, tomar el más grande (evita agarrar precio primero)
-  const numbers = Array.from(raw.matchAll(/\d{1,3}(?:[\.,]\d{3})+|\d+(?:[\.,]\d+)?/g)).map(m => normalizeNumberToken(m[0]));
-  const numericCandidates = numbers
-    .map(s => ({ raw: s, n: Number(s) }))
-    .filter(x => !Number.isNaN(x.n));
-  if (numericCandidates.length) {
-    const best = numericCandidates.reduce((a, b) => (b.n > a.n ? b : a));
-    return `${String(best.raw).replace(/\.0+$/, '')}M`;
+  // 3. FALLBACK: Si solo hay números sin unidad, tomamos el más lógico
+  // (Aquí sí podría confundirse con precios, pero el paso 1 y 2 deberían haber capturado el plan)
+  const numbers = Array.from(raw.matchAll(/\d+/g)).map(m => Number(m[0]));
+  if (numbers.length) {
+     // Filtros heurísticos: Velocidades comunes suelen ser 50, 100, 200... 1000.
+     // Precios suelen ser > 2000 (en CLP).
+     const candidates = numbers.filter(n => n < 2000 && n > 10); 
+     if (candidates.length) return `${Math.max(...candidates)}M`;
   }
 
-  return raw;
+  return raw; // Retorna el valor original si no pudo parsear
 }
 
+// Extrae solo el número de velocidad (ej. '600' desde 'Plan ... 600 Mbps')
+function extractSpeedNumber(val: any): string | undefined {
+  if (val === undefined || val === null) return undefined;
+  const s = typeof val === 'string' ? val : (typeof val === 'object' ? JSON.stringify(val) : String(val));
+  const raw = String(s).trim();
+  if (!raw) return undefined;
+
+  // Buscar tokens en Gbps o Mbps, preferir Mbps
+  const gbpsMatch = raw.match(/(\d{1,3}(?:[\.,]\d{3})+|\d+(?:[\.,]\d+)?)\s*(?:g|gbps|gb)\b/i);
+  if (gbpsMatch) {
+    try { console.log('[extractSpeedNumber] gbpsMatch:', { raw, match: gbpsMatch[1] }); } catch (e) {}
+    const num = gbpsMatch[1].replace(/\./g, '').replace(/,/g, '.');
+    const n = Number(num);
+    if (!Number.isNaN(n)) return String(Math.round(n * 1000)); // Gbps -> Mbps
+  }
+
+  const mbpsMatch = raw.match(/(\d{1,3}(?:[\.,]\d{3})+|\d+(?:[\.,]\d+)?)\s*(?:mbps|mb\/?s|mb|m|mega|megas)\b/i);
+  if (mbpsMatch) {
+    try { console.log('[extractSpeedNumber] mbpsMatch:', { raw, match: mbpsMatch[1] }); } catch (e) {}
+    const num = mbpsMatch[1].replace(/\./g, '').replace(/,/g, '.');
+    const n = Number(num);
+    if (!Number.isNaN(n)) return String(Math.round(n));
+  }
+
+  // Fallback: tomar el número más grande encontrado
+  const numbers = Array.from(raw.matchAll(/\d{1,3}(?:[\.,]\d{3})+|\d+(?:[\.,]\d+)?/g)).map(m => m[0].replace(/\./g, '').replace(/,/g, '\.'));
+  const numericCandidates = numbers.map(s => ({ raw: s, n: Number(s) })).filter(x => !Number.isNaN(x.n));
+  if (numericCandidates.length) {
+    try { console.log('[extractSpeedNumber] numericCandidates:', { raw, numericCandidates }); } catch (e) {}
+    const best = numericCandidates.reduce((a, b) => (b.n > a.n ? b : a));
+    return String(Math.round(best.n));
+  }
+
+  return undefined;
+}
 const AUTH_SPEED_OPTIONS = ['200M', '400M', '600M','800M','700M','940M'] as const;
 
 function matchSpeedOption(val: any, options: readonly string[] = AUTH_SPEED_OPTIONS): string | undefined {
   const normalized = normalizeSpeedProfileName(val);
   const opts = [...options];
-  return bestMatchOption(normalized, opts) || bestMatchOption(val, opts);
+  try { console.log('[matchSpeedOption] val, normalized, options:', { val, normalized, options: opts }); } catch (e) {}
+  const matched = bestMatchOption(normalized, opts) || bestMatchOption(val, opts);
+  try { console.log('[matchSpeedOption] matched:', { matched }); } catch (e) {}
+  return matched;
 }
 
 function pickFirstSpeedMatch(candidates: any[], options: readonly string[] = AUTH_SPEED_OPTIONS): string | undefined {
@@ -482,7 +555,8 @@ function freezeFormActions(originalActions: any[], submittedData: any): any[] {
 
 function defaultsFromEntity(entity: any, type: 'client' | 'installation'): Record<string, any> {
   const isInst = type === 'installation';
-  const rawPlan = entity.servicio || entity.plan_internet || pickPlanFromRaw(entity.raw);
+  // Priorizar `plan_internet` (el nombre del plan) por sobre `servicio` (nombre de servicio/usuario)
+  const rawPlan = entity.plan_internet || entity.servicio || pickPlanFromRaw(entity.raw);
   const plan = typeof rawPlan === 'object'
     ? pickFirstString([
         rawPlan?.name,
@@ -946,6 +1020,7 @@ export async function buildAuthActions(state: any, req?: any) {
   const defaults = state.defaults || {};
   const collected = state.collected || {};
 
+  // --- OBTENCION DE DATOS DE CONTEXTO ---
   const onuTypeOptions = await getAllOnuTypes().catch(() => []);
   const zoneOptions = await getAllZones().catch(() => []);
   let vlanOptions: string[] = [];
@@ -953,29 +1028,71 @@ export async function buildAuthActions(state: any, req?: any) {
     const vlansRaw = await getVlansByOltId(collected.olt_id).catch(() => []);
     vlanOptions = normalizeVlanValues(vlansRaw);
   }
-
   const odbOptions = ((state.smartoltOdbs || []) as any[]).map(o => o.name || o.id).filter(Boolean);
 
-  const speedOptions = [...AUTH_SPEED_OPTIONS];
-  const speedSeedCandidates = [
-    collected.download_speed_profile_name,
-    defaults.download_speed_profile_name,
-    collected.speed,
-    defaults.speed,
-    defaults.name,
-    collected.name,
-    req?.session?.lastSelectedPlan,
-    req?.session?.pendingAuth?.defaults?.name
-  ];
+  // --- LOGICA MEJORADA DE VELOCIDAD ---
+  const speedOptions = [...AUTH_SPEED_OPTIONS]; // Copia de la lista base ['200M', '400M', etc]
+
+  // 1. Buscamos el texto del plan en la sesión (donde se guardó al seleccionar cliente)
+  const planNameSource = req?.session?.lastSelectedPlan || state.defaults?.name || collected.name;
+
+  // 2. Extraemos SOLO el número de velocidad (ej: '600' desde '600 Mbps')
+  const extractedNumber = extractSpeedNumber(planNameSource);
+
+  // LOG: traza del proceso de extracción y matching de velocidad
+  try {
+    console.log('[buildAuthActions] planNameSource:', { planNameSource });
+    console.log('[buildAuthActions] extractedNumber:', { extractedNumber });
+  } catch (e) {}
+
+  // 3. Determinamos el valor a usar (Prioridad: Recolectado > Extraído del Plan > Default)
+  //    Pero NO inyectamos nuevos elementos en la lista de opciones. Si extraemos '600',
+  //    intentamos hacer match con las opciones conocidas (p.ej. '600M').
+  let autoSpeed: string | undefined = undefined;
+  if (collected.download_speed_profile_name) {
+    autoSpeed = collected.download_speed_profile_name;
+  } else if (extractedNumber) {
+    // Asegurarse que el token tenga la 'M' al final (ej: '600' -> '600M')
+    const token = String(extractedNumber).trim();
+    const withMSuffix = /^\d+(?:[.,]\d+)?$/i.test(token) ? `${Number(token.replace(/,/g, '.'))}M` : token;
+    let matched = matchSpeedOption(withMSuffix, speedOptions) || matchSpeedOption(token, speedOptions);
+    try { console.log('[buildAuthActions] speed token:', { token, withMSuffix, matched }); } catch (e) {}
+
+    // Si no hay match, añadimos la opción detectada (como cadena, p.ej. '600M') al inicio
+    if (!matched && typeof withMSuffix === 'string' && withMSuffix) {
+      const exists = speedOptions.find(s => String(s).toLowerCase() === String(withMSuffix).toLowerCase());
+      if (!exists) {
+        speedOptions.unshift(withMSuffix as typeof AUTH_SPEED_OPTIONS[number]);
+        matched = withMSuffix as typeof AUTH_SPEED_OPTIONS[number];
+      } else {
+        matched = exists;
+      }
+    }
+    autoSpeed = matched || undefined;
+  } else if (defaults.download_speed_profile_name) {
+    autoSpeed = defaults.download_speed_profile_name;
+  }
+
+  if (autoSpeed && typeof autoSpeed === 'string') autoSpeed = autoSpeed.trim();
+
+  // Si detectamos una velocidad, movemos esa opción al principio
+  if (autoSpeed && typeof autoSpeed === 'string') {
+    const idx = speedOptions.findIndex(s => String(s).toLowerCase() === String(autoSpeed).toLowerCase());
+    if (idx > 0) {
+      const found = speedOptions.splice(idx, 1)[0];
+      speedOptions.unshift(found);
+    }
+  }
+
+  // --- LOGICA VLAN / ZONE (Igual que antes) ---
   const vlanSeed = collected.vlan || defaults.vlan || collected.vlan_id || defaults.vlan_id;
   const zoneSeed = collected.zone || defaults.zone || collected.zona || defaults.zona;
-
   const vlanFromZone = extractVlanFromZoneLabel(zoneSeed);
   const zoneBasedVlan = vlanFromZone ? bestMatchOption(vlanFromZone, vlanOptions) || vlanFromZone : undefined;
   const autoVlan = zoneBasedVlan || bestMatchOption(vlanSeed, vlanOptions) || vlanSeed;
   const autoZone = bestMatchOption(zoneSeed, zoneOptions) || zoneSeed;
-  const autoSpeed = pickFirstSpeedMatch(speedSeedCandidates, speedOptions);
 
+  // Prellenado de collected para que el input muestre el value
   if (!collected.vlan && autoVlan) collected.vlan = autoVlan;
   if (!collected.zone && autoZone) collected.zone = autoZone;
   if (!collected.download_speed_profile_name && autoSpeed) collected.download_speed_profile_name = autoSpeed;
@@ -994,7 +1111,16 @@ export async function buildAuthActions(state: any, req?: any) {
     { id: 'auth-odb-port', type: 'input', label: 'Puerto ODB', placeholder: '1', payload: 'auth set odb_port {input}' },
     { id: 'auth-name', type: 'input', label: `Nombre`, placeholder: defaults.name || 'Nombre', payload: 'auth set name {input}' },
     { id: 'auth-address', type: 'input', label: 'Etiqueta Roja',  _placeholder:'E134332', payload: 'auth set address_or_comment {input}' },
-    { id: 'auth-speed', type: 'input', label: 'Velocidad', placeholder: autoSpeed || defaults.download_speed_profile_name || '200M', value: autoSpeed || defaults.download_speed_profile_name || '', options: speedOptions, payload: 'auth set download_speed_profile_name {input}' },
+    // INPUT DE VELOCIDAD ACTUALIZADO
+    { 
+      id: 'auth-speed', 
+      type: 'input', 
+      label: `Velocidad ${extractedNumber ? '(Detectada)' : ''}`, // Feedback visual extra
+      placeholder: (collected.download_speed_profile_name || autoSpeed) || '200M', 
+      value: (collected.download_speed_profile_name || autoSpeed) || '', 
+      options: speedOptions, 
+      payload: 'auth set download_speed_profile_name {input}' 
+    },
     { id: 'auth-submit', type: 'button', label: 'Autorizar SmartOLT ahora', payload: 'auth submit' }
   ];
 }
@@ -2130,12 +2256,32 @@ export async function respond(req: any, res: any) {
             }
         }
         // --- LISTADOS Y BUSQUEDA ---
+        
+        // Acción: sincronizar instalaciones manualmente (desde botón o comando)
+        else if (lower === 'instalaciones sync' || lower === 'sync instalaciones' || Boolean(pickActionValue(req.body?.actions, ['instalaciones sync', 'instalaciones_sync', 'sync instalaciones', 'sync_installations', 'refresh']))) {
+          finalContent = '🔄 Iniciando sincronización de instalaciones...';
+          try {
+            await fullSyncInstallations(100, 3);
+            const itemsAfter = await listAllLocalInstallations(0);
+                const tableAfter = buildInstallationsTable(itemsAfter || []);
+                // Mantener mismo formato que el comando 'instalaciones pendientes'
+                session.searchMode = 'installation';
+                session.lastContextType = 'installations';
+                finalContent = itemsAfter?.length ? `Instalaciones pendientes:\n\n${tableAfter}` : 'No hay instalaciones pendientes.';
+                const fmtAfter = formatEntityList(itemsAfter || [], 'installation');
+                actionsOut = [...fmtAfter.actions, { id: 'refresh', type: 'button', label: 'Refrescar', payload: 'instalaciones sync' }];
+          } catch (err: any) {
+            console.error('[instalaciones sync] Error fullSyncInstallations:', err);
+            finalContent = '❌ Falló la sincronización de instalaciones.';
+          }
+        }
         else if (lower.includes('instalaciones pendientes') || /^modo\s+b(usqueda|úsqueda)\s+instalacion$/i.test(lower)) {
             if (/^modo\s+b(usqueda|úsqueda)\s+instalacion$/i.test(lower)) { 
                 session.searchMode = 'installation'; session.lastContextType = 'installations'; 
             }
             const isRefreshRequest = lower.includes('enseñame las instalaciones pendientes de evidencia para autorizar el alta')
-              || lower.includes('ensename las instalaciones pendientes de evidencia para autorizar el alta');
+              || lower.includes('ensename las instalaciones pendientes de evidencia para autorizar el alta')
+              || Boolean(pickActionValue(req.body?.actions, ['refresh', 'instalaciones sync', 'sync instalaciones', 'sync_installations']));
 
             if (isRefreshRequest) {
                 console.log('[pending-installations] Refrescar solicitado (payload). Sincronizando desde WispHub API...');
@@ -2155,7 +2301,7 @@ export async function respond(req: any, res: any) {
             const table = buildInstallationsTable(items || []);
             finalContent = items?.length ? `Instalaciones pendientes:\n\n${table}` : 'No hay instalaciones pendientes.';
             const fmt = formatEntityList(items || [], 'installation');
-            actionsOut = [...fmt.actions, { id: 'refresh', type: 'button', label: 'Refrescar', payload: 'Enséñame las instalaciones pendientes de evidencia para autorizar el alta' }];
+            actionsOut = [...fmt.actions, { id: 'refresh', type: 'button', label: 'Refrescar', payload: 'instalaciones sync' }];
         }
         else if (lower.match(/actualiza|refresca|no esta/)) {
           const ctx = session.lastContextType;
@@ -2166,7 +2312,7 @@ export async function respond(req: any, res: any) {
             const table = buildInstallationsTable(items || []);
             finalContent = items?.length ? `Instalaciones pendientes:\n\n${table}` : 'No hay instalaciones pendientes.';
             const fmt = formatEntityList(items || [], 'installation');
-            actionsOut = [...fmt.actions, { id: 'refresh', type: 'button', label: 'Refrescar', payload: 'Enséñame las instalaciones pendientes de evidencia para autorizar el alta' }];
+            actionsOut = [...fmt.actions, { id: 'refresh', type: 'button', label: 'Refrescar', payload: 'instalaciones sync' }];
           } else {
             await fullSyncClients();
             finalContent = 'Base de datos sincronizada. Intenta buscar de nuevo.';
@@ -2298,13 +2444,25 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
     const wifiModels = ['ZTEF6600P', 'ZXHNF600P'];
 
     if (wifiModels.includes(rawType)) {
-        const wifiActions = [
+        // Botón para saltar la configuración WiFi y continuar con generación/activación
+        const skipPayload = (clientid || clientid === 0)
+          ? `generar contrato activar ${clientid}`
+          : undefined;
+
+        const wifiActions: any[] = [
             { id: 'wifi_ssid', type: 'input', label: 'Nombre WiFi (SSID)', placeholder: 'Nuevo Nombre', payload: 'wifi set ssid {input}' },
             { id: 'wifi_pass', type: 'input', label: 'Contraseña WiFi', placeholder: 'Nueva Clave (min 8)', payload: 'wifi set pass {input}' },
             { id: 'wifi_submit', type: 'button', label: 'Aplicar Cambios WiFi', payload: `wifi apply sn ${onuId} ssid {wifi_ssid} pass {wifi_pass}` }
         ];
+
+        if (skipPayload) {
+          wifiActions.push({ id: 'wifi_skip_generate', type: 'button', label: 'Saltar configuración WiFi y Generar Contrato', payload: skipPayload });
+        } else {
+          wifiActions.push({ id: 'wifi_skip_generate_disabled', type: 'button', label: 'Saltar configuración WiFi y Generar Contrato', disabled: true, helperText: 'No se detectó ID de cliente/instalación' });
+        }
+
         return { message: messages.join(' '), actions: wifiActions };
-    } 
+    }
     else {
       // Si estamos en un flujo explícito de cambio WiFi, no adjuntar acciones
       // post-instalación (p. ej. generar contrato). Esto evita confundir al usuario
