@@ -124,6 +124,26 @@ export async function shutdownBrowser(): Promise<void> {
 }
 
 /**
+ * Abre una nueva pestaña (Page) con reintentos si el browser compartido está caído.
+ * Retorna tanto el `browser` como el `page` para permitir el cierre/`disconnect` desde el caller.
+ */
+export async function openPage(): Promise<{ browser: Browser; page: Page }> {
+  let browser = await getBrowser();
+  try {
+    const page = await browser.newPage();
+    return { browser, page };
+  } catch (err: any) {
+    console.warn('[Puppeteer] newPage falló, intentando reconectar...', err?.message || err);
+    try {
+      await shutdownBrowser();
+    } catch (e) {}
+    browser = await getBrowser();
+    const page = await browser.newPage();
+    return { browser, page };
+  }
+}
+
+/**
  * Gestiona el Login y la sesión en Geonet internamente.
  * Reutiliza cookies para no loguearse en cada petición.
  */
@@ -179,8 +199,7 @@ async function ensureSession(page: Page): Promise<boolean> {
  * Función pública para verificar autenticación (usada por rutas externas como chat.ts).
  */
 export async function authenticateGeonet(): Promise<boolean> {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+  const { browser, page } = await openPage();
   try {
     // Solo intentamos asegurar sesión. Si retorna true, es que logueó correctamente.
     return await ensureSession(page);
@@ -331,8 +350,7 @@ export async function refreshClientsByTerm(term: string): Promise<number> {
 export async function processContractUpdate(instalacionId: number | string): Promise<boolean> {
   const start = Date.now();
   console.log(`[Puppeteer] Iniciando renovación de contrato: ${instalacionId}`);
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+  const { browser, page } = await openPage();
 
   try {
     if (!await ensureSession(page)) return false;
@@ -382,8 +400,7 @@ export async function processContractUpdate(instalacionId: number | string): Pro
  */
 export async function downloadContratoGeonet(instalacionId: number | string): Promise<Buffer> {
   const start = Date.now();
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+  const { browser, page } = await openPage();
   try {
     if (!await ensureSession(page)) throw new Error('Auth falló');
 
@@ -412,54 +429,53 @@ export async function activarInstalacionGeonet(
   usuarioInstalacion: string
 ): Promise<{ ok: boolean; status?: number; error?: string }> {
   const start = Date.now();
-  const browser = await getBrowser();
-  const page = await browser.newPage();
-  
-  // URL de la pantalla de confirmación (usar minúsculas para evitar redirecciones inesperadas)
-  const targetUrl = `${GEONET_BASE_URL}/instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`;
+  const { browser, page } = await openPage();
+
+  const targetUrl = `${GEONET_BASE_URL}/Instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`;
+  console.log(`[Puppeteer] Navegando a: ${targetUrl}`);
 
   try {
     if (!await ensureSession(page)) throw new Error('Auth falló');
 
-    console.log(`[Puppeteer] Navegando a activación: ${instalacionId}`);
+    // 1. Cargar la página
+    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-    // 1. CARGAR PÁGINA DE CONFIRMACIÓN
-    const response = await page.goto(targetUrl, { waitUntil: 'networkidle2' });
+    // 2. PREPARACIÓN DEL TERRENO
+    // Borramos el GIF de carga para evitar intercepciones de click
+    await page.evaluate(() => {
+        const gif = document.getElementById('content-loading-gif');
+        if (gif) gif.remove();
+        
+        const backdrop = document.querySelector('.modal-backdrop');
+        if (backdrop) backdrop.remove();
+    });
 
-    // Validar carga
-    if (!response || response.status() >= 400) {
-        // Si da 403 aquí, es que el usuario no tiene permisos
-        return { ok: false, status: response?.status(), error: `Error cargando página: ${response?.statusText()}` };
+    // 3. BUSCAR EL BOTÓN (Sintaxis compatible Puppeteer reciente)
+    // Usamos el prefijo 'xpath/' seguido de '//button...'
+    const selectorXpath = "xpath///button[contains(text(), 'Activar Instalación') and not(contains(text(), 'Editar'))]";
+    
+    const botonActivacion = await page.waitForSelector(selectorXpath, { visible: true, timeout: 5000 });
+
+    if (!botonActivacion) {
+        throw new Error("No se encontró el botón específico de activación.");
     }
 
-    // 2. VERIFICAR FORMULARIO
-    // Tu HTML muestra <form id="activar_cliente_form">
-    try {
-        await page.waitForSelector('#activar_cliente_form', { visible: true, timeout: 5000 });
-    } catch (e) {
-        // Si no hay formulario, revisamos si ya dice "Activo"
-        const text = await page.evaluate(() => document.body.innerText);
-        if (text.includes('correctamente') || text.includes('activo')) {
-             console.log('✅ Instalación ya estaba activa o se activó previamente.');
-             return { ok: true, status: 200 };
-        }
-        return { ok: false, error: 'Formulario de activación no encontrado.' };
-    }
+    console.log('[Puppeteer] Botón encontrado. Haciendo CLICK físico...');
 
-    // 3. HACER CLIC EN EL BOTÓN
-    // El botón está dentro del form: <button type="submit" class="btn btn-primary">Activar Instalación</button>
-    console.log('[Puppeteer] Confirmando activación...');
-
+    // 4. CLICK Y CONFIRMACIÓN INMEDIATA
     await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle2' }),
-        page.click('#activar_cliente_form button[type="submit"]')
+        // Esperamos brevemente por si hay navegación, pero no bloqueamos el éxito
+        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 5000 }).catch(() => null),
+        botonActivacion.click()
     ]);
-    console.log(`✅ Activación ${instalacionId} completada.`);
-    console.log(`[Puppeteer] activarInstalacionGeonet tiempo total: ${Date.now() - start}ms`);
+
+    // 5. RETORNO DE ÉXITO
+    // Si llegamos aquí, el click se realizó sin lanzar error.
+    console.log(`✅ Activación enviada correctamente (Click realizado).`);
     return { ok: true, status: 200 };
 
   } catch (error: any) {
-    console.error(`Error activarInstalacionGeonet: ${error.message}`);
+    console.error(`❌ Error activarInstalacionGeonet: ${error.message}`);
     return { ok: false, error: error.message };
   } finally {
     await page.close();
@@ -470,8 +486,7 @@ export async function getAutoLoginContractLink(
   usuarioInstalacion: string, 
   instalacionId: number | string
 ): Promise<string | null> {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+  const { browser, page } = await openPage();
   try {
     if (!await ensureSession(page)) return null;
 
@@ -519,8 +534,7 @@ const MODEL_MAP: Record<string, string> = {
 
 export async function registrarOnuGeonet(model: string, sn: string, mac: string = ''): Promise<boolean> {
   const start = Date.now();
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+  const { browser, page } = await openPage();
   try {
     if (!await ensureSession(page)) return false;
 
@@ -642,8 +656,7 @@ export async function agregarArticuloACliente(
   categoria: string = 'Productos Wifi'
 ): Promise<boolean> {
   const start = Date.now();
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+  const { browser, page } = await openPage();
 
   try {
     if (!await ensureSession(page)) return false;
@@ -798,8 +811,7 @@ export async function agregarArticuloACliente(
 }
 export async function getWifiProductUuidBySerial(serial: string): Promise<string | null> {
   const start = Date.now();
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+  const { browser, page } = await openPage();
     try {
         if (!await ensureSession(page)) return null;
 
@@ -833,8 +845,7 @@ export async function getWifiProductUuidBySerial(serial: string): Promise<string
 }
 
 export async function deleteWifiProductByUuid(uuid: string): Promise<boolean> {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+  const { browser, page } = await openPage();
   try {
     if (!await ensureSession(page)) return false;
 
@@ -951,8 +962,7 @@ export async function uploadDocumentoCliente(
   descripcion: string = 'Carga automática via Bot',
   visible: boolean = true
 ): Promise<boolean> {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
+  const { browser, page } = await openPage();
   
   // Normalizar ruta (Es vital para Docker)
   let systemPath = filePath;

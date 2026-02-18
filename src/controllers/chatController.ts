@@ -2461,7 +2461,7 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
         // la instalación (no generar contrato). Para clientes residenciales se
         // permite "Generar Contrato y Activar".
         const skipPayload = (clientid || clientid === 0)
-          ? (isPyme ? `activar ${clientid}` : `generar contrato activar ${clientid}`)
+          ? (isPyme ? `wisphub activate ${clientid}` : `generar contrato activar ${clientid}`)
           : undefined;
         const skipLabel = isPyme ? 'Saltar configuración WiFi y Activar Instalación' : 'Saltar configuración WiFi y Generar Contrato';
 
