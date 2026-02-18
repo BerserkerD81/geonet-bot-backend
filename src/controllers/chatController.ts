@@ -574,7 +574,10 @@ function defaultsFromEntity(entity: any, type: 'client' | 'installation'): Recor
 
     return {
       sn: entity.sn_onu || undefined,
-      name: plan || clientName || undefined, 
+      // Priorizar el identificador del servicio (`servicio`) para el campo 'name'
+      // Esto preserva la lógica de extracción de velocidad pero asegura que
+      // el `auth-name` muestre el usuario/servicio como '1256_jorge' cuando exista.
+      name: entity.servicio || plan || clientName || undefined,
       zone: entity.zona || entity.ciudad || entity.localidad || undefined,
       address_or_comment: entity.direccion || undefined,
       ipv4_address: entity.ipv4_address || entity.ip || entity.ip_publica || (isInst ? entity.ip_cliente : entity.ip_cliente) || undefined,
@@ -1034,7 +1037,16 @@ export async function buildAuthActions(state: any, req?: any) {
   const speedOptions = [...AUTH_SPEED_OPTIONS]; // Copia de la lista base ['200M', '400M', etc]
 
   // 1. Buscamos el texto del plan en la sesión (donde se guardó al seleccionar cliente)
-  const planNameSource = req?.session?.lastSelectedPlan || state.defaults?.name || collected.name;
+  // Priorizar los campos relacionados al plan (`plan_internet`, `plan`) para
+  // la extracción de la velocidad; `defaults.name` puede contener el servicio
+  // (ej. '1256_jorge') y NO debe usarse para parsear la velocidad.
+  const planNameSource = req?.session?.lastSelectedPlan
+    || state.defaults?.plan_internet
+    || state.defaults?.plan
+    || collected?.plan
+    || collected?.plan_internet
+    || state.defaults?.name
+    || collected?.name;
 
   // 2. Extraemos SOLO el número de velocidad (ej: '600' desde '600 Mbps')
   const extractedNumber = extractSpeedNumber(planNameSource);
@@ -2445,9 +2457,13 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
 
     if (wifiModels.includes(rawType)) {
         // Botón para saltar la configuración WiFi y continuar con generación/activación
+        // Payload y etiqueta varían si el cliente es PyME: para PyME solo activamos
+        // la instalación (no generar contrato). Para clientes residenciales se
+        // permite "Generar Contrato y Activar".
         const skipPayload = (clientid || clientid === 0)
-          ? `generar contrato activar ${clientid}`
+          ? (isPyme ? `activar ${clientid}` : `generar contrato activar ${clientid}`)
           : undefined;
+        const skipLabel = isPyme ? 'Saltar configuración WiFi y Activar Instalación' : 'Saltar configuración WiFi y Generar Contrato';
 
         const wifiActions: any[] = [
             { id: 'wifi_ssid', type: 'input', label: 'Nombre WiFi (SSID)', placeholder: 'Nuevo Nombre', payload: 'wifi set ssid {input}' },
@@ -2456,9 +2472,9 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
         ];
 
         if (skipPayload) {
-          wifiActions.push({ id: 'wifi_skip_generate', type: 'button', label: 'Saltar configuración WiFi y Generar Contrato', payload: skipPayload });
+          wifiActions.push({ id: 'wifi_skip_generate', type: 'button', label: skipLabel, payload: skipPayload });
         } else {
-          wifiActions.push({ id: 'wifi_skip_generate_disabled', type: 'button', label: 'Saltar configuración WiFi y Generar Contrato', disabled: true, helperText: 'No se detectó ID de cliente/instalación' });
+          wifiActions.push({ id: 'wifi_skip_generate_disabled', type: 'button', label: skipLabel, disabled: true, helperText: 'No se detectó ID de cliente/instalación' });
         }
 
         return { message: messages.join(' '), actions: wifiActions };
