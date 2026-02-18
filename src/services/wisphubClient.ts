@@ -131,6 +131,44 @@ export async function openPage(): Promise<{ browser: Browser; page: Page }> {
   let browser = await getBrowser();
   try {
     const page = await browser.newPage();
+
+    // Set a reasonable default navigation timeout
+    page.setDefaultNavigationTimeout(45000);
+
+    // Intercept requests to block images, fonts, styles and tracking scripts
+    try {
+      await page.setRequestInterception(true);
+      const blockedResourceTypes = new Set(['image', 'stylesheet', 'font']);
+      const blockedUrlPatterns = [
+        'google-analytics',
+        'googletagmanager',
+        'doubleclick',
+        'analytics.js',
+        'gtag/js',
+        'adsystem.com',
+        'ads.google',
+        'facebook.net',
+        'connect.facebook.net',
+        'hotjar',
+        'mixpanel',
+        'matomo'
+      ];
+
+      page.on('request', (req) => {
+        try {
+          const url = req.url().toLowerCase();
+          const rType = req.resourceType();
+          if (blockedResourceTypes.has(rType)) return req.abort();
+          for (const p of blockedUrlPatterns) if (url.includes(p)) return req.abort();
+          return req.continue();
+        } catch (e) {
+          try { req.continue(); } catch (_) {}
+        }
+      });
+    } catch (e) {
+      // Ignore if interception not available
+    }
+
     return { browser, page };
   } catch (err: any) {
     console.warn('[Puppeteer] newPage falló, intentando reconectar...', err?.message || err);
@@ -144,50 +182,79 @@ export async function openPage(): Promise<{ browser: Browser; page: Page }> {
 }
 
 /**
+ * Intenta navegar y si somos redirigidos al login hace login y reintenta.
+ * Opcional: esperar por un selector tras la navegación.
+ */
+async function safeGoto(page: Page, url: string, opts?: { waitForSelector?: string; timeout?: number }): Promise<any> {
+  const timeout = opts?.timeout ?? 30000;
+  let response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+
+  // Si la navegación nos lleva al login, forzamos login y reintentamos
+  if (page.url().includes('/accounts/login/')) {
+    const ok = await ensureSession(page, { force: true });
+    if (!ok) throw new Error('No se pudo autenticar en Geonet');
+    response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+  }
+
+  if (opts?.waitForSelector) {
+    await page.waitForSelector(opts.waitForSelector, { timeout: 10000 }).catch(() => null);
+  }
+
+  return response;
+}
+
+/**
  * Gestiona el Login y la sesión en Geonet internamente.
  * Reutiliza cookies para no loguearse en cada petición.
  */
-async function ensureSession(page: Page): Promise<boolean> {
+async function ensureSession(page: Page, opts?: { force?: boolean }): Promise<boolean> {
   const start = Date.now();
   try {
-    const isCookieFresh = (Date.now() - cookiesTimestamp) < 1000 * 60 * 45; // 45 min de validez aprox
+    const isCookieFresh = (Date.now() - cookiesTimestamp) < 1000 * 60 * 45; // 45 min
 
-    // 1. Inyectar cookies cacheadas si existen
-    if (cachedCookies && cachedCookies.length > 0 && isCookieFresh) {
+    // 1. Si tenemos cookies frescas y no forzamos, inyectamos y confiamos en ellas (optimistic)
+    if (!opts?.force && cachedCookies && cachedCookies.length > 0 && isCookieFresh) {
       await page.setCookie(...cachedCookies);
+      return true;
     }
 
-    // 2. Navegar al panel. Si la cookie es válida, entrará directo. Si no, redirige a login.
-    await page.goto(`${GEONET_BASE_URL}/panel/`, { waitUntil: 'networkidle2', timeout: 60000 });
+    // 2. Si forzamos o no tenemos cookies válidas, navegar al login y hacer login rápido
+    console.log('[Puppeteer] No hay cookie válida o se forzó renovación. Realizando login...');
 
-    // 3. Detectar si estamos en el login
-    if (page.url().includes('/accounts/login/')) {
-      console.log('[Puppeteer] Iniciando sesión en Geonet (Credenciales)...');
-      
-      await page.waitForSelector('input[name="login"]', { timeout: 10000 });
-      // Aquí podrías usar process.env.GEONET_USER y process.env.GEONET_PASS
-      await page.type('input[name="login"]', 'Jorgeprac@geonet');
-      await page.type('input[name="password"]', 'JorgePrac');
-      
-      // Click en submit y esperar navegación
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle2' }),
-        page.click('button[type="submit"]') // Ajustar si Geonet cambia el selector del botón
-      ]);
+    // Ir directo a la pantalla de login (más rápido que esperar una redirección desde /panel/)
+    await page.goto(`${GEONET_BASE_URL}/accounts/login/`, { waitUntil: 'domcontentloaded', timeout: 15000 });
 
-      // Verificar éxito
-      if (page.url().includes('/panel/')) {
-        console.log('[Puppeteer] Login exitoso.');
-        cachedCookies = await page.cookies();
-        cookiesTimestamp = Date.now();
-        return true;
-      } else {
-        console.error('[Puppeteer] Login fallido. URL actual: ' + page.url());
-        return false;
-      }
+    // Esperar los inputs de login
+    await page.waitForSelector('input[name="login"]', { timeout: 10000 });
+
+    const user = process.env.GEONET_USER || 'Jorgeprac@geonet';
+    const pass = process.env.GEONET_PASS || 'JorgePrac';
+
+    await page.evaluate(() => {
+      (document.querySelector('input[name="login"]') as HTMLInputElement)?.focus?.();
+    }).catch(() => null);
+
+    await page.click('input[name="login"]', { clickCount: 3 });
+    await page.type('input[name="login"]', user);
+    await page.click('input[name="password"]', { clickCount: 3 });
+    await page.type('input[name="password"]', pass);
+
+    // Click en submit y esperar navegación mínima
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }).catch(() => null),
+      page.click('button[type="submit"]')
+    ]);
+
+    // Verificar éxito aproximado (si estamos en panel o no en login)
+    if (!page.url().includes('/accounts/login/')) {
+      cachedCookies = await page.cookies();
+      cookiesTimestamp = Date.now();
+      console.log('[Puppeteer] Login exitoso.');
+      return true;
     }
-    console.log(`[Puppeteer] ensureSession tiempo: ${Date.now() - start}ms`);
-    return true; // Ya estábamos logueados
+
+    console.error('[Puppeteer] Login fallido. URL actual: ' + page.url());
+    return false;
   } catch (error: any) {
     console.error(`[Puppeteer] Error crítico de sesión: ${error.message}`);
     console.log(`[Puppeteer] ensureSession tiempo (error): ${Date.now() - start}ms`);
@@ -357,7 +424,7 @@ export async function processContractUpdate(instalacionId: number | string): Pro
 
     // 1. Ir al formulario
     const url = `${GEONET_BASE_URL}/instalaciones/agregar-contrato/${instalacionId}/`;
-    await page.goto(url, { waitUntil: 'networkidle2' });
+    await safeGoto(page, url, { waitForSelector: 'input[name="contrato-fecha_inicio"]', timeout: 60000 });
 
     // 2. Definir fechas
     const now = new Date();
@@ -378,7 +445,7 @@ export async function processContractUpdate(instalacionId: number | string): Pro
     if (!submitBtn) throw new Error('Botón guardar no encontrado');
 
     await Promise.all([
-      page.waitForNavigation({ waitUntil: 'networkidle2' }),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
       submitBtn.click()
     ]);
 
@@ -406,7 +473,7 @@ export async function downloadContratoGeonet(instalacionId: number | string): Pr
 
     const url = `${GEONET_BASE_URL}/instalaciones/imprimir-contrato/${instalacionId}/`;
     const t0 = Date.now();
-    const response = await page.goto(url, { waitUntil: 'networkidle2' });
+    const response = await safeGoto(page, url, { timeout: 60000 });
     console.log(`[Puppeteer] downloadContratoGeonet goto time: ${Date.now() - t0}ms`);
     const buffer = await response?.buffer();
 
@@ -438,7 +505,7 @@ export async function activarInstalacionGeonet(
     if (!await ensureSession(page)) throw new Error('Auth falló');
 
     // 1. Cargar la página
-    await page.goto(targetUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await safeGoto(page, targetUrl, { timeout: 30000 });
 
     // 2. PREPARACIÓN DEL TERRENO
     // Borramos el GIF de carga para evitar intercepciones de click
@@ -540,7 +607,7 @@ export async function registrarOnuGeonet(model: string, sn: string, mac: string 
 
     const url = `${GEONET_BASE_URL}/productos-wifi/agregar/`;
     const t0 = Date.now();
-    await page.goto(url, { waitUntil: 'networkidle2' });
+    await safeGoto(page, url, { waitForSelector: '#id_dwifi-producto' });
     console.log(`[Puppeteer] registrarOnuGeonet goto time: ${Date.now() - t0}ms`);
     
     // Esperar a que el formulario esté listo
@@ -625,7 +692,7 @@ export async function registrarOnuGeonet(model: string, sn: string, mac: string 
 
     // Click en Guardar (es un <a id="submit-button">)
     await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle2' }),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
         page.click('#submit-button')
     ]);
 
@@ -665,19 +732,50 @@ export async function agregarArticuloACliente(
 
     // 1. OBTENER DATOS (UUID) VIA API
     const inventoryUrl = `${GEONET_BASE_URL}/autocomplete-almacen/?exclude_services`;
-    
+
     // Hacemos fetch desde el navegador para aprovechar la cookie de sesión
-    const itemData = await page.evaluate(async (url, serial) => {
+    // Busqueda más robusta: normalizamos serials, comprobamos varios campos y reintentamos brevemente si no está aún indexado
+    let itemData: any = null;
+    const maxAttempts = 4;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      itemData = await page.evaluate(async (url, serial) => {
+        const normalize = (v: any) => {
+          if (v === null || v === undefined) return '';
+          return String(v).replace(/[^0-9A-Za-z]/g, '').toUpperCase();
+        };
+        const target = normalize(serial);
         try {
-            const r = await fetch(url);
-            const d = await r.json();
-            return d.find((i: any) => i.num_serie && i.num_serie.trim().toUpperCase() === serial.trim().toUpperCase());
+          const r = await fetch(url);
+          const d = await r.json();
+          if (!Array.isArray(d)) return null;
+
+          return d.find((i: any) => {
+            // candidate fields that may contain the serial or mac
+            const fields = [i.num_serie, i.serial, i.value, i.mac, i.mac_address, i.numserie, i.display];
+            for (const f of fields) {
+              const n = normalize(f);
+              if (!n) continue;
+              if (n === target) return true;
+              if (n.includes(target) || target.includes(n)) return true;
+            }
+
+            // also check visible labels or description
+            const txt = (i.label || i.text || i.display || i.descripcion || '').toString().toUpperCase();
+            if (txt && txt.includes(String(serial).trim().toUpperCase())) return true;
+
+            return false;
+          }) || null;
         } catch (e) { return null; }
-    }, inventoryUrl, numSerie);
+      }, inventoryUrl, numSerie);
+
+      if (itemData) break;
+      // Wait briefly to allow Geonet to index newly created product (common race)
+      await new Promise(res => setTimeout(res, 1000));
+    }
 
     if (!itemData) {
-        console.error(`❌ Equipo ${numSerie} no disponible en almacén.`);
-        return false;
+      console.error(`❌ Equipo ${numSerie} no disponible en almacén.`);
+      return false;
     }
 
     const uuid = itemData.value;
@@ -689,7 +787,7 @@ export async function agregarArticuloACliente(
     // 2. IR A LA PÁGINA
     const url = `${GEONET_BASE_URL}/clientes/agregar-articulos/${clienteUsuario}/${clienteId}/`;
     const t0 = Date.now();
-    await page.goto(url, { waitUntil: 'networkidle2' });
+    await safeGoto(page, url, { waitForSelector: 'form' });
     console.log(`[Puppeteer] agregarArticuloACliente goto time: ${Date.now() - t0}ms`);
 
     // 3. REGENERAR FORMULARIO E INYECTAR DATOS (CRÍTICO)
@@ -754,14 +852,14 @@ export async function agregarArticuloACliente(
 
     if (submitHandle) {
       await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle2' }),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
         submitHandle.click()
       ]);
     } else if (await page.$('form')) {
       // Fallback: enviar el primer formulario de la página
       console.log('[Puppeteer] Submit no encontrado; enviando formulario vía DOM.submit()');
       await Promise.all([
-        page.waitForNavigation({ waitUntil: 'networkidle2' }),
+        page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
         page.evaluate(() => {
           const f = document.querySelector('form') as HTMLFormElement | null;
           if (f) f.submit();
@@ -782,7 +880,7 @@ export async function agregarArticuloACliente(
         return false;
       });
       if (!clicked) throw new Error('Botón guardar no encontrado');
-      await page.waitForNavigation({ waitUntil: 'networkidle2' });
+      await page.waitForNavigation({ waitUntil: 'domcontentloaded' });
     }
 
     // 5. VALIDAR
@@ -817,7 +915,7 @@ export async function getWifiProductUuidBySerial(serial: string): Promise<string
 
         // Usamos el buscador de Geonet
     const t0 = Date.now();
-    await page.goto(`${GEONET_BASE_URL}/productos-wifi/?q=${serial}`, { waitUntil: 'domcontentloaded' });
+    await safeGoto(page, `${GEONET_BASE_URL}/productos-wifi/?q=${serial}`, { timeout: 20000 });
     console.log(`[Puppeteer] getWifiProductUuidBySerial goto time: ${Date.now() - t0}ms`);
         
         const content = await page.content();
@@ -984,7 +1082,7 @@ export async function uploadDocumentoCliente(
     if (!await ensureSession(page)) return false;
 
     const url = `${GEONET_BASE_URL}/clientes/agregar-documento/${clienteUsuario}/`;
-    await page.goto(url, { waitUntil: 'networkidle2' });
+    await safeGoto(page, url, { waitForSelector: 'input[name="titulo"]' });
 
     await page.type('input[name="titulo"]', titulo || path.basename(systemPath));
     await page.type('textarea[name="descripcion"]', descripcion);
@@ -1008,7 +1106,7 @@ export async function uploadDocumentoCliente(
     const submitBtn = await page.$('button[type="submit"]') || await page.$('input[type="submit"]');
     if (submitBtn) {
         await Promise.all([
-            page.waitForNavigation({ waitUntil: 'networkidle2' }),
+            page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
             submitBtn.click()
         ]);
         console.log('✅ Documento subido.');
