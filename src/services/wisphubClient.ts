@@ -128,6 +128,7 @@ export async function shutdownBrowser(): Promise<void> {
  * Reutiliza cookies para no loguearse en cada petición.
  */
 async function ensureSession(page: Page): Promise<boolean> {
+  const start = Date.now();
   try {
     const isCookieFresh = (Date.now() - cookiesTimestamp) < 1000 * 60 * 45; // 45 min de validez aprox
 
@@ -165,9 +166,11 @@ async function ensureSession(page: Page): Promise<boolean> {
         return false;
       }
     }
+    console.log(`[Puppeteer] ensureSession tiempo: ${Date.now() - start}ms`);
     return true; // Ya estábamos logueados
   } catch (error: any) {
     console.error(`[Puppeteer] Error crítico de sesión: ${error.message}`);
+    console.log(`[Puppeteer] ensureSession tiempo (error): ${Date.now() - start}ms`);
     return false;
   }
 }
@@ -326,6 +329,7 @@ export async function refreshClientsByTerm(term: string): Promise<number> {
  * Renueva el contrato mediante Puppeteer.
  */
 export async function processContractUpdate(instalacionId: number | string): Promise<boolean> {
+  const start = Date.now();
   console.log(`[Puppeteer] Iniciando renovación de contrato: ${instalacionId}`);
   const browser = await getBrowser();
   const page = await browser.newPage();
@@ -361,6 +365,7 @@ export async function processContractUpdate(instalacionId: number | string): Pro
     ]);
 
     console.log(`✅ Contrato actualizado para ${instalacionId}`);
+    console.log(`[Puppeteer] processContractUpdate tiempo total: ${Date.now() - start}ms`);
     return true;
 
   } catch (error: any) {
@@ -376,17 +381,20 @@ export async function processContractUpdate(instalacionId: number | string): Pro
  * Descarga el PDF del contrato
  */
 export async function downloadContratoGeonet(instalacionId: number | string): Promise<Buffer> {
+  const start = Date.now();
   const browser = await getBrowser();
   const page = await browser.newPage();
   try {
     if (!await ensureSession(page)) throw new Error('Auth falló');
 
     const url = `${GEONET_BASE_URL}/instalaciones/imprimir-contrato/${instalacionId}/`;
-    
+    const t0 = Date.now();
     const response = await page.goto(url, { waitUntil: 'networkidle2' });
+    console.log(`[Puppeteer] downloadContratoGeonet goto time: ${Date.now() - t0}ms`);
     const buffer = await response?.buffer();
 
     if (!buffer) throw new Error('No se recibió buffer del PDF');
+    console.log(`[Puppeteer] downloadContratoGeonet tiempo total: ${Date.now() - start}ms`);
     return buffer;
 
   } catch (error: any) {
@@ -403,6 +411,7 @@ export async function activarInstalacionGeonet(
   instalacionId: number | string,
   usuarioInstalacion: string
 ): Promise<{ ok: boolean; status?: number; error?: string }> {
+  const start = Date.now();
   const browser = await getBrowser();
   const page = await browser.newPage();
   
@@ -446,6 +455,7 @@ export async function activarInstalacionGeonet(
         page.click('#activar_cliente_form button[type="submit"]')
     ]);
     console.log(`✅ Activación ${instalacionId} completada.`);
+    console.log(`[Puppeteer] activarInstalacionGeonet tiempo total: ${Date.now() - start}ms`);
     return { ok: true, status: 200 };
 
   } catch (error: any) {
@@ -508,13 +518,16 @@ const MODEL_MAP: Record<string, string> = {
 // --- GESTIÓN DE ONUs ---
 
 export async function registrarOnuGeonet(model: string, sn: string, mac: string = ''): Promise<boolean> {
+  const start = Date.now();
   const browser = await getBrowser();
   const page = await browser.newPage();
   try {
     if (!await ensureSession(page)) return false;
 
     const url = `${GEONET_BASE_URL}/productos-wifi/agregar/`;
+    const t0 = Date.now();
     await page.goto(url, { waitUntil: 'networkidle2' });
+    console.log(`[Puppeteer] registrarOnuGeonet goto time: ${Date.now() - t0}ms`);
     
     // Esperar a que el formulario esté listo
     await page.waitForSelector('#id_dwifi-producto', { visible: true });
@@ -609,6 +622,7 @@ export async function registrarOnuGeonet(model: string, sn: string, mac: string 
     }
 
     console.log(`✅ ONU ${sn} registrada correctamente.`);
+    console.log(`[Puppeteer] registrarOnuGeonet tiempo total: ${Date.now() - start}ms`);
     return true;
 
   } catch (error: any) {
@@ -627,6 +641,7 @@ export async function agregarArticuloACliente(
   mac: string = '',
   categoria: string = 'Productos Wifi'
 ): Promise<boolean> {
+  const start = Date.now();
   const browser = await getBrowser();
   const page = await browser.newPage();
 
@@ -660,7 +675,9 @@ export async function agregarArticuloACliente(
 
     // 2. IR A LA PÁGINA
     const url = `${GEONET_BASE_URL}/clientes/agregar-articulos/${clienteUsuario}/${clienteId}/`;
+    const t0 = Date.now();
     await page.goto(url, { waitUntil: 'networkidle2' });
+    console.log(`[Puppeteer] agregarArticuloACliente goto time: ${Date.now() - t0}ms`);
 
     // 3. REGENERAR FORMULARIO E INYECTAR DATOS (CRÍTICO)
     // El HTML tiene un script que borra la fila al cargar. Debemos recrearla.
@@ -768,6 +785,7 @@ export async function agregarArticuloACliente(
     }
 
     console.log(`✅ Artículo asignado correctamente.`);
+    console.log(`[Puppeteer] agregarArticuloACliente tiempo total: ${Date.now() - start}ms`);
     return true;
 
   } catch (error: any) {
@@ -779,13 +797,16 @@ export async function agregarArticuloACliente(
   }
 }
 export async function getWifiProductUuidBySerial(serial: string): Promise<string | null> {
-    const browser = await getBrowser();
-    const page = await browser.newPage();
+  const start = Date.now();
+  const browser = await getBrowser();
+  const page = await browser.newPage();
     try {
         if (!await ensureSession(page)) return null;
 
         // Usamos el buscador de Geonet
-        await page.goto(`${GEONET_BASE_URL}/productos-wifi/?q=${serial}`, { waitUntil: 'networkidle2' });
+    const t0 = Date.now();
+    await page.goto(`${GEONET_BASE_URL}/productos-wifi/?q=${serial}`, { waitUntil: 'domcontentloaded' });
+    console.log(`[Puppeteer] getWifiProductUuidBySerial goto time: ${Date.now() - t0}ms`);
         
         const content = await page.content();
         
@@ -801,6 +822,7 @@ export async function getWifiProductUuidBySerial(serial: string): Promise<string
             const inputMatch = trMatch[0].match(/<input[^>]+value=["']([0-9a-f-]{36})["'][^>]*>/i);
             if (inputMatch) return inputMatch[1];
         }
+        console.log(`[Puppeteer] getWifiProductUuidBySerial tiempo total: ${Date.now() - start}ms`);
         return null;
     } catch {
         return null;

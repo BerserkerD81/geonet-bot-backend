@@ -166,3 +166,20 @@ AppDataSource.initialize()
     console.error('DataSource init error', err);
     process.exit(1);
   });
+
+// Shutdown hooks: cerrar conexión compartida a Browserless si existe
+import('./services/wisphubClient').then(mod => {
+  const shutdown = async () => {
+    try {
+      await mod.shutdownBrowser();
+      console.log('[Shutdown] Browserless connection closed.');
+    } catch (e: any) {
+      console.warn('[Shutdown] Error closing browser:', e?.message || e);
+    }
+    process.exit(0);
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  process.on('beforeExit', async () => { await mod.shutdownBrowser(); });
+}).catch(() => {});
