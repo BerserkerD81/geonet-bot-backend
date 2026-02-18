@@ -74,11 +74,53 @@ export type WisphubClientListItem = {
  * Conecta al contenedor Browserless
  */
 async function getBrowser(): Promise<Browser> {
-  // console.log(`[Puppeteer] Conectando a ${BROWSER_WS}...`);
-  return await puppeteer.connect({
-    browserWSEndpoint: BROWSER_WS,
-    defaultViewport: { width: 1920, height: 1080 }
-  });
+  // Reutilizar una única conexión a Browserless para evitar overhead de conectar/desconectar
+  // Implementamos reintentos y sobreescribimos `disconnect` para que sea no-op
+  // (usar `shutdownBrowser()` para cerrar realmente la conexión en shutdown)
+  if ((global as any).__sharedBrowser) {
+    try {
+      return (global as any).__sharedBrowser as Browser;
+    } catch {
+      // continue to reconnect
+    }
+  }
+
+  const MAX_ATTEMPTS = 3;
+  let lastErr: any = null;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      console.log(`[Puppeteer] Conectando a ${BROWSER_WS} (intento ${attempt})...`);
+      const browser = await puppeteer.connect({
+        browserWSEndpoint: BROWSER_WS,
+        defaultViewport: { width: 1920, height: 1080 }
+      });
+
+      // Guardar el disconnect real y reemplazar por noop para reutilización
+      (browser as any).__realDisconnect = (browser as any).disconnect?.bind(browser) || null;
+      (browser as any).disconnect = async () => { /* noop: conexión compartida */ };
+
+      (global as any).__sharedBrowser = browser;
+      return browser;
+    } catch (err: any) {
+      lastErr = err;
+      console.warn(`[Puppeteer] Error conectando a browserless: ${err.message || err}. Reintentando...`);
+      await new Promise((res) => setTimeout(res, 1000 * attempt));
+    }
+  }
+  throw new Error(`No se pudo conectar a Browserless: ${lastErr?.message || lastErr}`);
+}
+
+/** Cierra la conexión compartida al browser (usar en shutdown del proceso) */
+export async function shutdownBrowser(): Promise<void> {
+  const shared = (global as any).__sharedBrowser as Browser | undefined;
+  if (!shared) return;
+  const real = (shared as any).__realDisconnect;
+  try {
+    if (real) await real();
+  } catch (e: any) {
+    console.warn('[Puppeteer] Error cerrando browser:', e?.message || e);
+  }
+  (global as any).__sharedBrowser = null;
 }
 
 /**
@@ -364,8 +406,8 @@ export async function activarInstalacionGeonet(
   const browser = await getBrowser();
   const page = await browser.newPage();
   
-  // URL de la pantalla de confirmación
-  const targetUrl = `${GEONET_BASE_URL}/Instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`;
+  // URL de la pantalla de confirmación (usar minúsculas para evitar redirecciones inesperadas)
+  const targetUrl = `${GEONET_BASE_URL}/instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`;
 
   try {
     if (!await ensureSession(page)) throw new Error('Auth falló');
@@ -669,13 +711,49 @@ export async function agregarArticuloACliente(
     }, uuid, cat, numSerie, finalMac);
 
     // 4. GUARDAR
-    const submitBtn = await page.$('#submit-button');
-    if(!submitBtn) throw new Error('Botón guardar no encontrado');
+    // Intentar múltiples selectores comunes para el botón de guardar
+    const submitSelectors = ['#submit-button', 'button[type="submit"]', 'input[type="submit"]', '.btn-primary', 'a.btn.btn-primary', '.submit-button'];
+    let submitHandle = null;
+    for (const sel of submitSelectors) {
+      submitHandle = await page.$(sel);
+      if (submitHandle) {
+        console.log(`[Puppeteer] Usando selector de submit: ${sel}`);
+        break;
+      }
+    }
 
-    await Promise.all([
+    if (submitHandle) {
+      await Promise.all([
         page.waitForNavigation({ waitUntil: 'networkidle2' }),
-        submitBtn.click()
-    ]);
+        submitHandle.click()
+      ]);
+    } else if (await page.$('form')) {
+      // Fallback: enviar el primer formulario de la página
+      console.log('[Puppeteer] Submit no encontrado; enviando formulario vía DOM.submit()');
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: 'networkidle2' }),
+        page.evaluate(() => {
+          const f = document.querySelector('form') as HTMLFormElement | null;
+          if (f) f.submit();
+        })
+      ]);
+    } else {
+      // Último recurso: buscar botón por texto y hacer click
+      const clicked = await page.evaluate(() => {
+        const candidates = Array.from(document.querySelectorAll('button, a, input')) as HTMLElement[];
+        const re = /guardar|guardar cambios|save|asignar|assign|submit/i;
+        for (const el of candidates) {
+          const txt = ((el.textContent || '') + ' ' + ((el as HTMLInputElement).value || '')).trim();
+          if (re.test(txt)) {
+            el.click();
+            return true;
+          }
+        }
+        return false;
+      });
+      if (!clicked) throw new Error('Botón guardar no encontrado');
+      await page.waitForNavigation({ waitUntil: 'networkidle2' });
+    }
 
     // 5. VALIDAR
     if (page.url().includes('agregar-articulos')) {
