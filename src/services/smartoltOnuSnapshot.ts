@@ -40,6 +40,7 @@ export async function captureSmartoltOnuSnapshot() {
       try {
         const uniqueId = item?.unique_external_id || item?.onu_external_id || item?.external_id || null;
         const sn = item?.sn || item?.serial || item?.onu_sn || null;
+        const ip = item?.ip_address || item?.address || item?.wan_ip || item?.ip || null;
 
         // Try to find an existing detail row and update it instead of creating duplicates
         let existing: any = null;
@@ -53,6 +54,7 @@ export async function captureSmartoltOnuSnapshot() {
         if (existing) {
           existing.capturedAt = capturedAt;
           existing.sn = sn || existing.sn;
+          existing.ipAddress = ip || existing.ipAddress;
           existing.name = item?.name || existing.name;
           existing.payload = item;
           await detailRepo.save(existing);
@@ -61,6 +63,7 @@ export async function captureSmartoltOnuSnapshot() {
             capturedAt,
             uniqueExternalId: uniqueId,
             sn: sn,
+            ipAddress: ip,
             name: item?.name || null,
             payload: item
           });

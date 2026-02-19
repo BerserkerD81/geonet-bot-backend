@@ -21,6 +21,10 @@ export class SmartoltOnuDetail {
   sn?: string | null;
 
   @Index()
+  @Column({ type: 'varchar', length: 45, nullable: true })
+  ipAddress?: string | null;
+
+  @Index()
   @Column({ type: 'varchar', length: 255, nullable: true })
   name?: string | null;
 

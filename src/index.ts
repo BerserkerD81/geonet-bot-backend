@@ -141,8 +141,8 @@ AppDataSource.initialize()
 
       // Sincronización horaria
       setInterval(() => {
-        fullSyncClients().catch((e) => console.error('Hourly WispHub sync failed', e?.message));
-        fullSyncInstallations().catch((e) => console.error('Hourly Installations sync failed', e?.message));
+        fullSyncClients().catch((e) => console.error('Hourly WispHub sync failed', (e as any)?.message || e));
+        fullSyncInstallations().catch((e) => console.error('Hourly Installations sync failed', (e as any)?.message || e));
       }, 60 * 60 * 1000);
 
     } catch (e) { 

@@ -82,7 +82,7 @@ export async function listClients(req: Request, res: Response) {
       await fullSyncClients();
     } else {
       // Start a background full sync to keep cache updated
-      fullSyncClients().catch((e) => console.error('Background fullSyncClients failed', e?.message || e));
+      fullSyncClients().catch((e) => console.error('Background fullSyncClients failed', (e as any)?.message || e));
     }
     const [items, count] = await repo.findAndCount({ take, skip, order: { updatedAt: 'DESC' } });
     return res.json({ count, results: items.map(enrichClientEntity) });

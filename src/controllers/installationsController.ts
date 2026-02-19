@@ -72,7 +72,7 @@ export async function listInstallations(req: Request, res: Response) {
       await wisphubInst.fullSyncInstallations();
     } else {
       // background sync
-      wisphubInst.fullSyncInstallations().catch((e) => console.error('Background installations sync failed', e?.message || e));
+      wisphubInst.fullSyncInstallations().catch((e) => console.error('Background installations sync failed', (e as any)?.message || e));
     }
     if (onlyPending) {
       const items = await wisphubInst.listPendingLocalInstallations(limit);

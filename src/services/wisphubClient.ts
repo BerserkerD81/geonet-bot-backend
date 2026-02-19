@@ -1,5 +1,5 @@
 import axios, { AxiosHeaders } from 'axios';
-import puppeteer, { Browser, Page, Protocol } from 'puppeteer-core';
+import puppeteer, { Browser, Page, Protocol, ElementHandle } from 'puppeteer-core';
 import { AppDataSource } from '../datasource';
 import { Client } from '../models/Client';
 import { WISPHUB } from '../config';
@@ -720,7 +720,7 @@ export async function agregarArticuloACliente(
   clienteUsuario: string,
   numSerie: string,
   mac: string = '',
-  categoria: string = 'Productos Wifi'
+  categoria: string = 'Productos Wifi' // Este parámetro es menos relevante ahora porque la API lo decide, pero lo mantenemos por compatibilidad
 ): Promise<boolean> {
   const start = Date.now();
   const { browser, page } = await openPage();
@@ -728,179 +728,116 @@ export async function agregarArticuloACliente(
   try {
     if (!await ensureSession(page)) return false;
 
-    console.log(`[Puppeteer] Buscando ${numSerie} en inventario...`);
+    // 1. IR A LA PÁGINA
+    // Nota: El HTML sugiere que la URL tiene el formato /clientes/agregar-articulos/USUARIO/ID/
+    const url = `${GEONET_BASE_URL}/clientes/agregar-articulos/${clienteUsuario}/${clienteId}/`;
+    
+    console.log(`[Puppeteer] Navegando a asignar artículo: ${url}`);
+    await safeGoto(page, url, { waitForSelector: '.lista-productos-wifi' });
 
-    // 1. OBTENER DATOS (UUID) VIA API
-    const inventoryUrl = `${GEONET_BASE_URL}/autocomplete-almacen/?exclude_services`;
+    // 2. INTERACTUAR CON EL BUSCADOR (AUTOCOMPLETE)
+    console.log(`[Puppeteer] Buscando equipo por serial: ${numSerie}`);
+    
+    // Enfocar y limpiar el input por seguridad
+    await page.click('.lista-productos-wifi', { clickCount: 3 });
+    await page.keyboard.press('Backspace');
+    
+    // Escribir el serial simulando tipeo humano (delay ayuda a que jQuery UI reaccione)
+    await page.type('.lista-productos-wifi', numSerie, { delay: 100 });
 
-    // Hacemos fetch desde el navegador para aprovechar la cookie de sesión
-    // Busqueda más robusta: normalizamos serials, comprobamos varios campos y reintentamos brevemente si no está aún indexado
-    let itemData: any = null;
-    const maxAttempts = 4;
-    for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      itemData = await page.evaluate(async (url, serial) => {
-        const normalize = (v: any) => {
-          if (v === null || v === undefined) return '';
-          return String(v).replace(/[^0-9A-Za-z]/g, '').toUpperCase();
-        };
-        const target = normalize(serial);
-        try {
-          const r = await fetch(url);
-          const d = await r.json();
-          if (!Array.isArray(d)) return null;
+    // 3. ESPERAR Y SELECCIONAR DEL DROPDOWN
+    // El HTML usa jQuery UI, que genera una lista ul.ui-autocomplete
+    try {
+      // Esperamos a que aparezca el item del menú que contiene el serial o texto del producto
+      const selectorItemMenu = `ul.ui-autocomplete li.ui-menu-item`;
+      
+      await page.waitForSelector(selectorItemMenu, { visible: true, timeout: 10000 });
 
-          return d.find((i: any) => {
-            // candidate fields that may contain the serial or mac
-            const fields = [i.num_serie, i.serial, i.value, i.mac, i.mac_address, i.numserie, i.display];
-            for (const f of fields) {
-              const n = normalize(f);
-              if (!n) continue;
-              if (n === target) return true;
-              if (n.includes(target) || target.includes(n)) return true;
-            }
+      // Buscamos el elemento específico que contenga el serial (para evitar seleccionar otro parecido)
+      const itemEncontrado = await page.evaluateHandle((selector, serial) => {
+        const items = document.querySelectorAll(selector);
+        for (const item of items) {
+          // El texto suele ser "Modelo - Serial" o similar según tu script
+          if (item.textContent?.toUpperCase().includes(serial.toUpperCase())) {
+            return item;
+          }
+        }
+        return items[0]; // Fallback: devolver el primero si no hay coincidencia exacta de texto pero sí resultados
+      }, selectorItemMenu, numSerie);
 
-            // also check visible labels or description
-            const txt = (i.label || i.text || i.display || i.descripcion || '').toString().toUpperCase();
-            if (txt && txt.includes(String(serial).trim().toUpperCase())) return true;
+      if (!itemEncontrado) throw new Error("Elemento no encontrado en el dropdown");
 
-            return false;
-          }) || null;
-        } catch (e) { return null; }
-      }, inventoryUrl, numSerie);
+      console.log('[Puppeteer] Elemento encontrado en inventario. Haciendo click...');
+      const elementHandle = itemEncontrado.asElement() as ElementHandle<Element> | null;
+      if (elementHandle) {
+        await elementHandle.click();
+      } else {
+        throw new Error("Elemento no es un ElementHandle<Element>");
+      }
 
-      if (itemData) break;
-      // Wait briefly to allow Geonet to index newly created product (common race)
-      await new Promise(res => setTimeout(res, 1000));
-    }
-
-    if (!itemData) {
-      console.error(`❌ Equipo ${numSerie} no disponible en almacén.`);
+    } catch (e) {
+      console.error(`❌ No se encontró el equipo ${numSerie} en el autocompletado.`);
       return false;
     }
 
-    const uuid = itemData.value;
-    const cat = itemData.categoria || categoria;
-    const finalMac = mac || itemData.mac || '';
+    // 4. ESPERAR A QUE LA FILA SE AGREGUE Y RELLENE
+    // El script de la página hace $(".add-row").click() y luego rellena los campos.
+    // Esperamos a que el input de serie tenga valor.
+    const inputSerieSelector = 'input[name$="-num_serie"]'; // Selector genérico para formsets (form-0-num_serie, form-1...)
+    
+    await page.waitForFunction((selector, serial) => {
+      const inputs = document.querySelectorAll(selector);
+      // Buscamos el último input agregado
+      const lastInput = inputs[inputs.length - 1] as HTMLInputElement;
+      return lastInput && lastInput.value.includes(serial);
+    }, { timeout: 5000 }, inputSerieSelector, numSerie);
 
-    console.log(`✅ Equipo encontrado: UUID=${uuid}`);
-
-    // 2. IR A LA PÁGINA
-    const url = `${GEONET_BASE_URL}/clientes/agregar-articulos/${clienteUsuario}/${clienteId}/`;
-    const t0 = Date.now();
-    await safeGoto(page, url, { waitForSelector: 'form' });
-    console.log(`[Puppeteer] agregarArticuloACliente goto time: ${Date.now() - t0}ms`);
-
-    // 3. REGENERAR FORMULARIO E INYECTAR DATOS (CRÍTICO)
-    // El HTML tiene un script que borra la fila al cargar. Debemos recrearla.
-    await page.evaluate((uuidVal, catVal, snVal, macVal) => {
-        // A. REGENERAR LA FILA (Simulamos lo que hace el autocomplete al seleccionar)
-        // Usamos jQuery porque la página lo usa para gestionar el formset
-        // @ts-ignore
-        if (typeof $ !== 'undefined') {
-             // @ts-ignore
-             $(".add-row").click(); 
-        } else {
-             // Fallback nativo por si acaso
-             const addBtn = document.querySelector('.add-row') as HTMLElement;
-             if(addBtn) addBtn.click();
+    // 5. (OPCIONAL) MODIFICAR MAC SI SE PROVEE
+    if (mac) {
+      console.log(`[Puppeteer] Sobreescribiendo MAC con: ${mac}`);
+      // Buscamos el último input de MAC generado
+      await page.evaluate((macVal) => {
+        const macInputs = document.querySelectorAll('input.mac-address');
+        const lastMacInput = macInputs[macInputs.length - 1] as HTMLInputElement;
+        if (lastMacInput) {
+          lastMacInput.value = macVal;
+          // Disparar eventos para que validadores de JS (si los hay) se enteren
+          lastMacInput.dispatchEvent(new Event('change', { bubbles: true }));
+          lastMacInput.dispatchEvent(new Event('input', { bubbles: true }));
         }
-
-        // B. ESPERAR UN MICRO-MOMENTO Y LLENAR (Por si la animación tarda)
-        // Helper para setear valor y disparar eventos
-        const setVal = (selector: string, val: string) => {
-            // Buscamos el ÚLTIMO elemento creado (en caso de que haya multiples form-X)
-            // Como limpiamos, debería ser form-0, pero por seguridad usamos el ID directo si existe
-            const el = document.querySelector(selector) as HTMLInputElement;
-            if (el) {
-                el.value = val;
-                el.dispatchEvent(new Event('change', { bubbles: true }));
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-            }
-        };
-
-        // Inputs Ocultos
-        setVal('#id_form-0-uuid', uuidVal);
-        setVal('#id_form-0-categoria', catVal);
-
-        // Inputs Visibles
-        setVal('#id_form-0-num_serie', snVal);
-        setVal('#id_form-0-mac', macVal);
-        setVal('#id_form-0-cantidad', '1');
-        setVal('#id_form-0-accion_equipo', '0'); // 0=No copiar MAC
-
-        // C. FORZAR CONTADOR DE FORMULARIOS
-        const totalForms = document.querySelector('#id_form-TOTAL_FORMS') as HTMLInputElement;
-        if(totalForms) totalForms.value = '1';
-
-        // Actualizar visualmente la etiqueta (opcional, para debug visual en browserless)
-        const label = document.querySelector('.label-item');
-        if(label) label.textContent = `Asignado: ${snVal}`;
-
-    }, uuid, cat, numSerie, finalMac);
-
-    // 4. GUARDAR
-    // Intentar múltiples selectores comunes para el botón de guardar
-    const submitSelectors = ['#submit-button', 'button[type="submit"]', 'input[type="submit"]', '.btn-primary', 'a.btn.btn-primary', '.submit-button'];
-    let submitHandle = null;
-    for (const sel of submitSelectors) {
-      submitHandle = await page.$(sel);
-      if (submitHandle) {
-        console.log(`[Puppeteer] Usando selector de submit: ${sel}`);
-        break;
-      }
+      }, mac);
     }
 
-    if (submitHandle) {
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
-        submitHandle.click()
-      ]);
-    } else if (await page.$('form')) {
-      // Fallback: enviar el primer formulario de la página
-      console.log('[Puppeteer] Submit no encontrado; enviando formulario vía DOM.submit()');
-      await Promise.all([
-        page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
-        page.evaluate(() => {
-          const f = document.querySelector('form') as HTMLFormElement | null;
-          if (f) f.submit();
-        })
-      ]);
-    } else {
-      // Último recurso: buscar botón por texto y hacer click
-      const clicked = await page.evaluate(() => {
-        const candidates = Array.from(document.querySelectorAll('button, a, input')) as HTMLElement[];
-        const re = /guardar|guardar cambios|save|asignar|assign|submit/i;
-        for (const el of candidates) {
-          const txt = ((el.textContent || '') + ' ' + ((el as HTMLInputElement).value || '')).trim();
-          if (re.test(txt)) {
-            el.click();
-            return true;
-          }
-        }
-        return false;
-      });
-      if (!clicked) throw new Error('Botón guardar no encontrado');
-      await page.waitForNavigation({ waitUntil: 'domcontentloaded' });
-    }
+    // 6. ENVIAR FORMULARIO
+    console.log('[Puppeteer] Guardando asignación...');
+    
+    const submitBtn = await page.$('#submit-button');
+    if (!submitBtn) throw new Error('Botón guardar no encontrado');
 
-    // 5. VALIDAR
+    await Promise.all([
+        page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
+        submitBtn.click()
+    ]);
+
+    // 7. VALIDACIÓN FINAL DE ÉXITO
+    // Si la URL sigue siendo la de agregar-articulos, algo falló (validación de Django)
     if (page.url().includes('agregar-articulos')) {
-        // Buscar el mensaje de error específico
-        const errorText = await page.evaluate(() => {
-            return document.querySelector('.errorlist li')?.textContent || 
-                   document.querySelector('.alert-danger')?.textContent ||
+        const errorMsg = await page.evaluate(() => {
+            // Buscar alertas de error comunes en Django/Bootstrap
+            return document.querySelector('.alert-danger')?.textContent?.trim() || 
+                   document.querySelector('.errorlist')?.textContent?.trim() ||
                    "Error de validación desconocido";
         });
-        console.warn(`⚠️ Fallo asignación en Geonet: ${errorText}`);
+        console.warn(`⚠️ Geonet rechazó la asignación: ${errorMsg}`);
         return false;
     }
 
-    console.log(`✅ Artículo asignado correctamente.`);
-    console.log(`[Puppeteer] agregarArticuloACliente tiempo total: ${Date.now() - start}ms`);
+    console.log(`✅ Artículo ${numSerie} asignado correctamente.`);
+    console.log(`[Puppeteer] Tiempo total: ${Date.now() - start}ms`);
     return true;
 
   } catch (error: any) {
-    console.error(`Error agregarArticuloACliente: ${error.message}`);
+    console.error(`❌ Error critico en agregarArticuloACliente: ${error.message}`);
     return false;
   } finally {
     await page.close();
@@ -1050,8 +987,6 @@ export async function replaceOnuForClient(
   return await agregarArticuloACliente(clienteId, clienteUsuario, newSn, newMac);
 }
 
-// --- SUBIDA DE ARCHIVOS ---
-
 export async function uploadDocumentoCliente(
   clienteId: number | string,
   clienteUsuario: string,
@@ -1062,7 +997,7 @@ export async function uploadDocumentoCliente(
 ): Promise<boolean> {
   const { browser, page } = await openPage();
   
-  // Normalizar ruta (Es vital para Docker)
+  // 1. Resolver y leer el archivo localmente
   let systemPath = filePath;
   if (filePath.startsWith('/')) {
       if (!fs.existsSync(filePath)) {
@@ -1074,55 +1009,108 @@ export async function uploadDocumentoCliente(
   }
 
   if (!fs.existsSync(systemPath)) {
-    console.error(`❌ Archivo no encontrado: ${systemPath}`);
+    console.error(`❌ Archivo no encontrado en disco: ${systemPath}`);
+    await page.close();
+    await browser.disconnect();
     return false;
   }
+
+  // Convertimos el archivo a Base64 para inyectarlo en el navegador
+  const fileBuffer = fs.readFileSync(systemPath);
+  const fileBase64 = fileBuffer.toString('base64');
+  const fileName = path.basename(systemPath);
+  
+  // Adivinar MimeType básico
+  let mimeType = 'application/octet-stream';
+  const lowerName = fileName.toLowerCase();
+  if (lowerName.endsWith('.jpg') || lowerName.endsWith('.jpeg')) mimeType = 'image/jpeg';
+  else if (lowerName.endsWith('.png')) mimeType = 'image/png';
+  else if (lowerName.endsWith('.pdf')) mimeType = 'application/pdf';
 
   try {
     if (!await ensureSession(page)) return false;
 
     const url = `${GEONET_BASE_URL}/clientes/agregar-documento/${clienteUsuario}/`;
-    await safeGoto(page, url, { waitForSelector: 'input[name="titulo"]' });
+    console.log(`[Puppeteer] Accediendo a URL base: ${url}`);
 
-    await page.type('input[name="titulo"]', titulo || path.basename(systemPath));
-    await page.type('textarea[name="descripcion"]', descripcion);
-    
-    const chk = await page.$('input[name="visible"]');
-    if (chk) {
-        const isChecked = await (await chk.getProperty('checked')).jsonValue();
-        if (visible && !isChecked) await chk.click();
-        if (!visible && isChecked) await chk.click();
+    // Solo esperamos a que cargue el token de seguridad, no importa si la interfaz gráfica termina de renderizar
+    await safeGoto(page, url, { waitForSelector: 'input[name="csrfmiddlewaretoken"]', timeout: 30000 });
+
+    console.log('[Puppeteer] Inyectando archivo y forzando envío directo (Fetch)...');
+
+    // 2. SUBIDA DIRECTA VIA FETCH (Ignora todo el código defectuoso de la página web)
+    const result = await page.evaluate(async (args) => {
+        try {
+            // Extraer el token de seguridad obligatorio de Django
+            const csrf = (document.querySelector('input[name="csrfmiddlewaretoken"]') as HTMLInputElement)?.value || '';
+
+            // Reconstruir el archivo desde Base64 a un objeto File/Blob en el navegador
+            const byteCharacters = atob(args.b64);
+            const byteNumbers = new Array(byteCharacters.length);
+            for (let i = 0; i < byteCharacters.length; i++) {
+                byteNumbers[i] = byteCharacters.charCodeAt(i);
+            }
+            const byteArray = new Uint8Array(byteNumbers);
+            const blob = new Blob([byteArray], { type: args.mime });
+
+            // Construir el formulario invisible
+            const formData = new FormData();
+            formData.append('csrfmiddlewaretoken', csrf);
+            formData.append('titulo', args.title);
+            formData.append('descripcion', args.desc);
+            formData.append('archivo', blob, args.name);
+            
+            if (args.isVisible) {
+                formData.append('visible', 'on');
+            }
+
+            // Disparar la petición directo al backend de Geonet
+            const res = await fetch(window.location.href, {
+                method: 'POST',
+                body: formData,
+                redirect: 'follow'
+            });
+
+            return {
+                ok: res.ok,
+                status: res.status,
+                url: res.url,
+                error: null
+            };
+        } catch (e: any) {
+            return { ok: false, status: 0, url: '', error: e.toString() };
+        }
+    }, {
+        b64: fileBase64,
+        name: fileName,
+        mime: mimeType,
+        title: titulo || fileName,
+        desc: descripcion,
+        isVisible: visible
+    });
+
+    // 3. VALIDAR RESULTADO
+    if (result.error) {
+        throw new Error(`Error inyectado en Frontend: ${result.error}`);
     }
 
-    // Puppeteer maneja la subida remota mágicamente
-    const inputUpload = await page.$('input[type="file"]');
-    if (inputUpload) {
-        await inputUpload.uploadFile(systemPath);
+    // Geonet redirige a la vista del cliente tras una subida exitosa.
+    if (result.ok && !result.url.includes('agregar-documento')) {
+        console.log(`✅ Documento subido super rápido vía Fetch. Redireccionado a: ${result.url}`);
+        return true;
     } else {
-        console.error('No input file found');
+        console.error(`⚠️ Fallo la subida en el servidor. Status: ${result.status}, URL: ${result.url}`);
         return false;
     }
 
-    const submitBtn = await page.$('button[type="submit"]') || await page.$('input[type="submit"]');
-    if (submitBtn) {
-        await Promise.all([
-            page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
-            submitBtn.click()
-        ]);
-        console.log('✅ Documento subido.');
-        return true;
-    }
-    return false;
-
   } catch (error: any) {
-    console.error(`Error upload: ${error.message}`);
+    console.error(`❌ Error crítico en uploadDocumentoCliente: ${error.message}`);
     return false;
   } finally {
     await page.close();
     await browser.disconnect();
   }
 }
-
 // --- BÚSQUEDA LOCAL DB (SIN CAMBIOS) ---
 
 export async function searchLocal(term: string, limit = 50) {
