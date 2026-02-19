@@ -62,10 +62,26 @@ export async function searchClients(req: Request, res: Response) {
   if (!term) return res.status(400).json({ error: 'Missing term' });
 
   try {
-    // Always refresh from Wisphub for this term to keep results up-to-date
-    await refreshClientsByTerm(term);
+    const force = !!req.query.sync;
+
+    // If caller explicitly requests sync, perform refresh first (slow path)
+    if (force) {
+      await refreshClientsByTerm(term);
+      const results = await searchLocal(term, 50);
+      return res.json({ results: results.map(enrichClientEntity), refreshed: true });
+    }
+
+    // Fast path: search local DB first to keep latency low.
     const results = await searchLocal(term, 50);
-    return res.json({ results: results.map(enrichClientEntity), refreshed: true });
+    if (results && results.length > 0) {
+      // Trigger a background refresh to keep cache updated but don't await it.
+      refreshClientsByTerm(term).catch((e) => console.error('Background refreshClientsByTerm failed', (e as any)?.message || e));
+      return res.json({ results: results.map(enrichClientEntity), refreshed: false });
+    }
+
+    // No local results: trigger background refresh but reply immediately (fast negative response).
+    refreshClientsByTerm(term).catch((e) => console.error('Background refreshClientsByTerm failed', (e as any)?.message || e));
+    return res.json({ results: [], refreshed: false });
   } catch (err: any) {
     return res.status(500).json({ error: err?.message || 'Search failed' });
   }
