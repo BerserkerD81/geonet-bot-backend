@@ -1038,15 +1038,16 @@
           ...actions
         ];
       }
-      return { 
+        return { 
           text: section.text, 
           actions,
           assistantMetadata: { 
-              smartoltAvailability: { olts: section.oltAvailability, suggestedVlan: section.suggestedVlan, suggestedZone: section.suggestedZone },
-              smartoltOdbs: section.odbs,
-              smartoltZones: section.zones
+            flow: 'authorization',
+            smartoltAvailability: { olts: section.oltAvailability, suggestedVlan: section.suggestedVlan, suggestedZone: section.suggestedZone },
+            smartoltOdbs: section.odbs,
+            smartoltZones: section.zones
           }
-      };
+        };
   }
 
   export async function buildAuthActions(state: any, req?: any) {
@@ -1894,50 +1895,68 @@
           }
           // --- AUTH REFRESH ONU LIST (Botón de refresh de ONUs libres) ---
           else if (lower === 'auth refresh onu-list') {
-            // Refresca la lista de ONUs y muestra el mismo formato que al seleccionar cliente/instalación
+            // Refresca la lista de ONUs sin autorizar y la envía al chat (fast, no autoriza)
             if (!session.pendingAuth) {
               finalContent = 'No hay autorización en curso.';
               actionsOut = [];
             } else {
+              // intentar obtener entidad relacionada (client o installation)
               const entityType = session.pendingAuth.installationId ? 'installation' : 'client';
               const entityId = session.pendingAuth.installationId || session.pendingAuth.clientIdServicio;
-              let entity = null;
+              let entity: any = null;
               if (entityType === 'client') {
-                try {
-                  const repo = AppDataSource.getRepository(Client);
-                  entity = await repo.findOne({ where: { id_servicio: entityId } });
-                } catch {}
+                try { entity = await AppDataSource.getRepository(Client).findOne({ where: { id_servicio: entityId } }); } catch {}
               } else {
-                try {
-                  const repo = AppDataSource.getRepository(Installation);
-                  entity = await repo.findOne({ where: { id: entityId } });
-                } catch {}
+                try { entity = await AppDataSource.getRepository(Installation).findOne({ where: { id: entityId } }); } catch {}
               }
+
               if (!entity) {
                 finalContent = 'No se encontró el cliente o instalación para refrescar.';
                 actionsOut = [];
               } else {
-                await prepareAuthSession(session, entity, entityType);
-                const details = buildClientDetails(entity, entityType);
-                let entityKey: number | undefined;
-                if (entityType === 'client') {
-                  entityKey = (entity as any).id_servicio;
-                } else {
-                  entityKey = (entity as any).id;
-                }
-                const section = await buildOltAndNetworkSection(entityKey, { skipZonesFetch: false, forceUnconfiguredFetch: true });
-                // Construir tabla de ONUs exactamente como en la selección inicial
-                let onuTable = '';
-                if (section.oltAvailability && section.oltAvailability.length) {
-                  onuTable = buildUnconfiguredOnusTable(section.oltAvailability);
-                }
-                finalContent = `\n${details}\n\n📡 **Disponibilidad en SmartOLT:**\n\n👇 Selecciona una ONU libre abajo o completa el formulario.\n${onuTable}`;
-                actionsOut = section.actions;
+                // Forzar fetch fresco de ONUs no configuradas (cache bypass)
+                const allOnus = (await listGlobalUnconfiguredOnus({ cacheTtlMs: 0 }).catch(() => [])) as any[];
+
+                // Agrupar por OLT y preparar estructura para la tabla
+                const byOlt = new Map<string, any[]>();
+                (allOnus || []).forEach(o => {
+                  const k = String(o.olt_id || o.oltId || o.olt || '');
+                  if (!k) return;
+                  if (!byOlt.has(k)) byOlt.set(k, []);
+                  byOlt.get(k)!.push(o);
+                });
+
+                const oltAvailability: any[] = [];
+                const onuActions: any[] = [];
+                Array.from(byOlt.entries()).forEach(([oltId, onus]) => {
+                  const oltName = onus[0]?.olt_name || `OLT ${oltId}`;
+                  const entry: any = { oltId: String(oltId), oltName, availableCount: onus.length, onus: [] };
+                  (onus || []).slice(0, 8).forEach((o: any, idx: number) => {
+                    const id = (o.sn || o.serial || o.onu_sn || `ONU${idx}`).toString();
+                    const pon = (o.pon_type || o.pon || 'gpon').toLowerCase();
+                    const port = o.port || o.port_id || o.slot || '-';
+                    const model = o.onu_type_name || o.onu_type || o.model || '-';
+                    const payload = `seleccionar onu ${id} olt ${oltId} pon ${pon} port ${port}${model !== '-' ? ` model ${model}` : ''}`;
+                    entry.onus.push({ id, label: id, ponType: pon, port, model, actionPayload: payload });
+                    onuActions.push({ id: `select-onu-${oltId}-${idx}`, type: 'button', label: id, payload });
+                  });
+                  if (entry.onus.length) oltAvailability.push(entry);
+                });
+
+                const details = buildClientDetails(entity, entityType as any);
+                const onuTable = buildUnconfiguredOnusTable(oltAvailability);
+                assistantMetadata = { flow: 'authorization', smartoltAvailability: { olts: oltAvailability } };
+                finalContent = `\n${details}\n\n🔁 **Flujo:** Autorización\n\n📡 **ONUs sin autorizar (frescas):**\n\n${onuTable}`;
+
+                // Actions: include refresh + per-onu select buttons
+                const actions = [ { id: 'refresh-unconfigured-onus', type: 'button', label: '🔄 Refrescar ONUs libres', payload: 'auth refresh onu-list' }, ...onuActions ];
+                actionsOut = actions;
               }
             }
           }
           // --- CHANGE-ONU REFRESH ---
           else if (lower === 'change refresh onu-list') {
+            // Similar to auth refresh: for change-ONU flow, fetch fresh unconfigured ONUs and send table
             if (!session.pendingChangeOnu) {
               finalContent = 'No hay flujo de cambio de ONU en curso.';
               actionsOut = [];
@@ -1947,33 +1966,47 @@
                 finalContent = 'No hay cliente o instalación seleccionada para refrescar.';
                 actionsOut = [];
               } else {
+                // Try to fetch entity metadata for display
                 let entity: any = null;
-                try {
-                  const repo = AppDataSource.getRepository(Client);
-                  entity = await repo.findOne({ where: { id_servicio: serviceId } });
-                } catch (e) {}
+                try { entity = await AppDataSource.getRepository(Client).findOne({ where: { id_servicio: serviceId } }); } catch (e) {}
                 if (!entity) {
-                  try {
-                    const repo = AppDataSource.getRepository(Installation);
-                    entity = await repo.findOne({ where: { id: serviceId } });
-                  } catch (e) {}
+                  try { entity = await AppDataSource.getRepository(Installation).findOne({ where: { id: serviceId } }); } catch (e) {}
                 }
                 if (!entity) {
                   finalContent = 'No se encontró el cliente o instalación para refrescar.';
                   actionsOut = [];
                 } else {
                   try {
-                    const section = await buildOltAndNetworkSection(serviceId, { skipZonesFetch: true, forceUnconfiguredFetch: true });
-                    let onuTable = '';
-                    if (section.oltAvailability && section.oltAvailability.length) {
-                      onuTable = buildUnconfiguredOnusTable(section.oltAvailability);
-                    }
-                    finalContent = `\n✅ Lista de ONUs refrescada para **${session.pendingChangeOnu.clientName || ''}**:\n\n${onuTable}`;
-                    let actions = section.actions || [];
-                    const hasRefresh = actions.some((a: any) => a.id === 'refresh-change-onus');
-                    if (!hasRefresh) {
-                      actions = [{ id: 'refresh-change-onus', type: 'button', label: '🔄 Refrescar ONUs libres', payload: 'change refresh onu-list' }, ...actions];
-                    }
+                    const allOnus = (await listGlobalUnconfiguredOnus({ cacheTtlMs: 0 }).catch(() => [])) as any[];
+                    const byOlt = new Map<string, any[]>();
+                    (allOnus || []).forEach(o => {
+                      const k = String(o.olt_id || o.oltId || o.olt || '');
+                      if (!k) return;
+                      if (!byOlt.has(k)) byOlt.set(k, []);
+                      byOlt.get(k)!.push(o);
+                    });
+
+                    const oltAvailability: any[] = [];
+                    const onuActions: any[] = [];
+                    Array.from(byOlt.entries()).forEach(([oltId, onus]) => {
+                      const oltName = onus[0]?.olt_name || `OLT ${oltId}`;
+                      const entry: any = { oltId: String(oltId), oltName, availableCount: onus.length, onus: [] };
+                      (onus || []).slice(0, 8).forEach((o: any, idx: number) => {
+                        const id = (o.sn || o.serial || o.onu_sn || `ONU${idx}`).toString();
+                        const pon = (o.pon_type || o.pon || 'gpon').toLowerCase();
+                        const port = o.port || o.port_id || o.slot || '-';
+                        const model = o.onu_type_name || o.onu_type || o.model || '-';
+                        const payload = `seleccionar onu ${id} olt ${oltId} pon ${pon} port ${port}${model !== '-' ? ` model ${model}` : ''}`;
+                        entry.onus.push({ id, label: id, ponType: pon, port, model, actionPayload: payload });
+                        onuActions.push({ id: `select-onu-${oltId}-${idx}`, type: 'button', label: id, payload });
+                      });
+                      if (entry.onus.length) oltAvailability.push(entry);
+                    });
+
+                    const onuTable = buildUnconfiguredOnusTable(oltAvailability);
+                    assistantMetadata = { flow: 'change-onu', smartoltAvailability: { olts: oltAvailability } };
+                    finalContent = `\n🔁 **Flujo:** Cambio de ONU\n\n✅ Lista de ONUs refrescada para **${session.pendingChangeOnu.clientName || ''}**:\n\n${onuTable}`;
+                    const actions = [{ id: 'refresh-change-onus', type: 'button', label: '🔄 Refrescar ONUs libres', payload: 'change refresh onu-list' }, ...onuActions];
                     actionsOut = actions;
                   } catch (err) {
                     console.error('[change refresh onu-list] Error refreshing ONUs:', err);
@@ -2302,7 +2335,8 @@
                     // Show unconfigured ONUs table so user can pick one for the change
                     const section = await buildOltAndNetworkSection(serviceId, { skipZonesFetch: true });
                     const table = buildUnconfiguredOnusTable(section.oltAvailability || []);
-                    finalContent = `✅ Cliente seleccionado para cambio de ONU: **${clientName}** [ID: ${serviceId}].\n\n📡 **ONUs sin autorizar (cambio de ONU):**\n\n${table}\n\n👇 Selecciona una ONU libre para cambiarla.`;
+                    assistantMetadata = { flow: 'change-onu', smartoltAvailability: { olts: section.oltAvailability || [] } };
+                    finalContent = `🔁 **Flujo:** Cambio de ONU\n\n✅ Cliente seleccionado para cambio de ONU: **${clientName}** [ID: ${serviceId}].\n\n📡 **ONUs sin autorizar (cambio de ONU):**\n\n${table}\n\n👇 Selecciona una ONU libre para cambiarla.`;
                     if (!targetOnu) {
                       finalContent += `\n\n⚠️ No encontré una ONU en smartolt_onu_detail con name = "${smartoltName}". Se intentará nuevamente al confirmar.`;
                     }
@@ -2365,7 +2399,7 @@
                     assistantMetadata = meta;
 
                     const clientDetails = buildClientDetails(entity, isClient ? 'client' : 'installation');
-                    finalContent = `${clientDetails}\n\n📡 **Disponibilidad en SmartOLT:**\n${text}\n👇 Selecciona una ONU libre abajo o completa el formulario.`;
+                    finalContent = `${clientDetails}\n\n🔁 **Flujo:** Autorización\n\n📡 **Disponibilidad en SmartOLT:**\n${text}\n👇 Selecciona una ONU libre abajo o completa el formulario.`;
                     actionsOut = actions;
 
                     if (isClient) {
