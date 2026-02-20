@@ -1413,6 +1413,7 @@ export async function respond(req: any, res: any) {
         finalContent = `📸 Imagen recibida. Subiendo a Geonet (ID: ${targetId})...`;
 
         // Intentar obtener el usuario asociado al cliente (campo `usuario`) para usarlo en Geonet
+        // PRIORIDAD: si la sesión actual corresponde al target, preferir `session.lastAuthNameUsed`
         let clienteUsuario: string | null = null;
         try {
           const clientRepo = AppDataSource.getRepository(Client);
@@ -1422,7 +1423,25 @@ export async function respond(req: any, res: any) {
           console.error('Error buscando cliente para obtener usuario Geonet:', e);
         }
 
-        const fullGeonetUser = clienteUsuario || `${session.lastAuthNameUsed || 'tecnico'}@geonet`;
+        const sessionTargetMatches = Boolean(
+          session && (
+            String(session.lastSelectedClientIdServicio) === String(targetId) ||
+            String(session.lastSelectedInstallationId) === String(targetId) ||
+            (session.pendingAuth && (session.pendingAuth.clientIdServicio == targetId || session.pendingAuth.installationId == targetId))
+          )
+        );
+
+        let fullGeonetUser = '';
+        if (session?.lastAuthNameUsed && sessionTargetMatches) {
+          fullGeonetUser = session.lastAuthNameUsed;
+        } else if (clienteUsuario) {
+          fullGeonetUser = clienteUsuario;
+        } else {
+          fullGeonetUser = `${session.lastAuthNameUsed || 'tecnico'}@geonet`;
+        }
+        if (fullGeonetUser && !String(fullGeonetUser).toLowerCase().includes('@geonet')) {
+          fullGeonetUser = `${String(fullGeonetUser).trim()}@geonet`;
+        }
 
         try {
           const subidaExitosa = await uploadDocumentoCliente(
@@ -2640,25 +2659,39 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
   let usuarioInstalacionSource = '';
   let sessionUsuarioInstalacion = data._session && data._session.lastSelectedUsuarioInstalacion;
   let sessionDump = JSON.stringify(data._session || {});
-  // Buscar usuarioInstalacion igual que para agregarArticuloACliente
+  // Buscar usuarioInstalacion: PRIORIDAD a la sesión si coincide con el target (comportamiento similar a "wisphub activate")
   try {
-    const clientRepo = AppDataSource.getRepository(Client);
-    const instRepo = AppDataSource.getRepository(Installation);
-    let entity: any = await clientRepo.findOne({ where: { id_servicio: Number(clientid) } });
-    if (entity && entity.usuario) {
-      usuarioInstalacion = entity.usuario;
-      usuarioInstalacionSource = 'Client.usuario';
+    const sess = data._session || {};
+    const sessionTargetMatches = Boolean(
+      sess && (
+        String(sess.lastSelectedClientIdServicio) === String(clientid) ||
+        String(sess.lastSelectedInstallationId) === String(clientid) ||
+        (sess.pendingAuth && (sess.pendingAuth.clientIdServicio == clientid || sess.pendingAuth.installationId == clientid))
+      )
+    );
+
+    if (sess.lastAuthNameUsed && sessionTargetMatches) {
+      usuarioInstalacion = sess.lastAuthNameUsed;
+      usuarioInstalacionSource = 'session.lastAuthNameUsed (priority)';
     } else {
-      entity = await instRepo.findOne({ where: [{ id: Number(clientid) }, { id_servicio: Number(clientid) }] });
+      const clientRepo = AppDataSource.getRepository(Client);
+      const instRepo = AppDataSource.getRepository(Installation);
+      let entity: any = await clientRepo.findOne({ where: { id_servicio: Number(clientid) } });
       if (entity && entity.usuario) {
         usuarioInstalacion = entity.usuario;
-        usuarioInstalacionSource = 'Installation.usuario';
+        usuarioInstalacionSource = 'Client.usuario';
       } else {
-        usuarioInstalacion = data.usuario || sessionUsuarioInstalacion || (data._session && data._session.lastAuthNameUsed) || `${clientid}@geonet`;
-        if (data.usuario) usuarioInstalacionSource = 'data.usuario';
-        else if (sessionUsuarioInstalacion) usuarioInstalacionSource = 'session.lastSelectedUsuarioInstalacion';
-        else if (data._session && data._session.lastAuthNameUsed) usuarioInstalacionSource = 'session.lastAuthNameUsed';
-        else usuarioInstalacionSource = 'default';
+        entity = await instRepo.findOne({ where: [{ id: Number(clientid) }, { id_servicio: Number(clientid) }] });
+        if (entity && entity.usuario) {
+          usuarioInstalacion = entity.usuario;
+          usuarioInstalacionSource = 'Installation.usuario';
+        } else {
+          usuarioInstalacion = data.usuario || sessionUsuarioInstalacion || (data._session && data._session.lastAuthNameUsed) || `${clientid}@geonet`;
+          if (data.usuario) usuarioInstalacionSource = 'data.usuario';
+          else if (sessionUsuarioInstalacion) usuarioInstalacionSource = 'session.lastSelectedUsuarioInstalacion';
+          else if (data._session && data._session.lastAuthNameUsed) usuarioInstalacionSource = 'session.lastAuthNameUsed';
+          else usuarioInstalacionSource = 'default';
+        }
       }
     }
   } catch (e) {
@@ -2670,6 +2703,10 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
     else usuarioInstalacionSource = 'default';
   }
   console.log(`[processPostAuthActions] activarInstalacionGeonet: clientid=${clientid}, usuarioInstalacion='${usuarioInstalacion}' (source: ${usuarioInstalacionSource}), onuId=${onuId}`);
+  // Asegurar formato del usuario para Geonet (incluir @geonet si hace falta)
+  if (usuarioInstalacion && !String(usuarioInstalacion).toLowerCase().includes('@geonet')) {
+    usuarioInstalacion = `${String(usuarioInstalacion).trim()}@geonet`;
+  }
   if (!onuId) return { message: '⚠️ ONU autorizada, falta SN.', actions: [] };
 
   // 1. CHANGE LOCATION
@@ -2732,23 +2769,37 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
       let sessionUsuario = data._session && data._session.lastAuthNameUsed;
       let sessionDump = JSON.stringify(data._session || {});
       try {
-        const clientRepo = AppDataSource.getRepository(Client);
-        const instRepo = AppDataSource.getRepository(Installation);
-        let entity: any = await clientRepo.findOne({ where: { id_servicio: Number(clientid) } });
-        if (entity && entity.usuario) {
-          clienteUsuario = entity.usuario;
-          clienteUsuarioSource = 'Client.usuario';
+        const sess = data._session || {};
+        const sessionTargetMatches = Boolean(
+          sess && (
+            String(sess.lastSelectedClientIdServicio) === String(clientid) ||
+            String(sess.lastSelectedInstallationId) === String(clientid) ||
+            (sess.pendingAuth && (sess.pendingAuth.clientIdServicio == clientid || sess.pendingAuth.installationId == clientid))
+          )
+        );
+
+        if (sess.lastAuthNameUsed && sessionTargetMatches) {
+          clienteUsuario = sess.lastAuthNameUsed;
+          clienteUsuarioSource = 'session.lastAuthNameUsed (priority)';
         } else {
-          entity = await instRepo.findOne({ where: [{ id: Number(clientid) }, { id_servicio: Number(clientid) }] });
+          const clientRepo = AppDataSource.getRepository(Client);
+          const instRepo = AppDataSource.getRepository(Installation);
+          let entity: any = await clientRepo.findOne({ where: { id_servicio: Number(clientid) } });
           if (entity && entity.usuario) {
             clienteUsuario = entity.usuario;
-            clienteUsuarioSource = 'Installation.usuario';
+            clienteUsuarioSource = 'Client.usuario';
           } else {
-            clienteUsuario = data.usuario || sessionUsuarioInstalacion || (data._session && data._session.lastAuthNameUsed) || `${clientid}@geonet`;
-            if (data.usuario) clienteUsuarioSource = 'data.usuario';
-            else if (sessionUsuarioInstalacion) clienteUsuarioSource = 'session.lastSelectedUsuarioInstalacion';
-            else if (data._session && data._session.lastAuthNameUsed) clienteUsuarioSource = 'session.lastAuthNameUsed';
-            else clienteUsuarioSource = 'default';
+            entity = await instRepo.findOne({ where: [{ id: Number(clientid) }, { id_servicio: Number(clientid) }] });
+            if (entity && entity.usuario) {
+              clienteUsuario = entity.usuario;
+              clienteUsuarioSource = 'Installation.usuario';
+            } else {
+              clienteUsuario = data.usuario || sessionUsuarioInstalacion || (data._session && data._session.lastAuthNameUsed) || `${clientid}@geonet`;
+              if (data.usuario) clienteUsuarioSource = 'data.usuario';
+              else if (sessionUsuarioInstalacion) clienteUsuarioSource = 'session.lastSelectedUsuarioInstalacion';
+              else if (data._session && data._session.lastAuthNameUsed) clienteUsuarioSource = 'session.lastAuthNameUsed';
+              else clienteUsuarioSource = 'default';
+            }
           }
         }
       } catch (e) {
@@ -2757,6 +2808,10 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
         if (data.usuario) clienteUsuarioSource = 'data.usuario';
         else if (sessionUsuarioInstalacion) clienteUsuarioSource = 'session.lastSelectedUsuarioInstalacion';
         else clienteUsuarioSource = 'default';
+      }
+      // Asegurar que el usuario tenga el sufijo @geonet
+      if (clienteUsuario && !String(clienteUsuario).toLowerCase().includes('@geonet')) {
+        clienteUsuario = `${String(clienteUsuario).trim()}@geonet`;
       }
       console.log(`[processPostAuthActions] agregarArticuloACliente: clientid=${clientid}, usuario='${clienteUsuario}' (source: ${clienteUsuarioSource}), onuId=${onuId}`);
       await agregarArticuloACliente(clientid, clienteUsuario, onuId);
