@@ -86,7 +86,8 @@ export async function captureSmartoltOnuSnapshot() {
   }
 
   // Upsert behavior: update latest snapshot if it's recent (within 24h), otherwise create new
-  const latest = await repo.findOne({ order: { capturedAt: 'DESC' } });
+  const latestArr = await repo.find({ order: { capturedAt: 'DESC' }, take: 1 });
+  const latest = latestArr && latestArr.length ? latestArr[0] : null;
   const maxSize = 200000; // bytes threshold to avoid huge DB fields
   const payloadToStore = payloadStr && payloadStr.length <= maxSize ? payloadStr : null;
   if (payloadStr && !payloadToStore) {
@@ -116,8 +117,8 @@ export async function captureSmartoltOnuSnapshot() {
 
 export async function getLatestSmartoltOnuSnapshot() {
   const repo = AppDataSource.getRepository(SmartoltOnuSnapshot);
-  const latest = await repo.findOne({ order: { capturedAt: 'DESC' } });
-  return latest;
+  const arr = await repo.find({ order: { capturedAt: 'DESC' }, take: 1 });
+  return arr && arr.length ? arr[0] : null;
 }
 
 function scheduleDailyRun(runAtHour = 3, runAtMinute = 15, job: () => Promise<void>) {

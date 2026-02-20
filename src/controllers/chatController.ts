@@ -22,7 +22,7 @@ import {
   _placeholder
 } from '../services/wisphubClient';
 import { replaceOnuForClient } from '../services/wisphubClient';
-import { getLatestSmartoltOnuSnapshot } from '../services/smartoltOnuSnapshot';
+import { getLatestSmartoltOnuSnapshot, scheduleSmartoltOnuSnapshots } from '../services/smartoltOnuSnapshot';
 import { searchLocalInstallations, refreshInstallationsByTerm, listPendingLocalInstallations, listAllLocalInstallations, fullSyncInstallations } from '../services/wisphubInstallations';
 import {
   authorizeOnu, listOlts, type OltInfo, getZones, getOltVlans,
@@ -1491,6 +1491,11 @@ export async function respond(req: any, res: any) {
       if (/(cambiar\s+onu|cambio\s+onu|cambio\s+de\s+onu)/i.test(lower) && !/(buscar|submit)/i.test(lower)) {
         session.changeOnuFlowMode = true;
         session.pendingChangeOnuClientSearch = true;
+        try {
+          scheduleSmartoltOnuSnapshots();
+        } catch (e) {
+          console.warn('SmartOLT ONU snapshot scheduler failed', e);
+        }
         session.pendingChangeOnu = { stage: 'search' };
         finalContent = 'Perfecto. Ingresa el nombre completo y/o el RUT para buscar al cliente y cambiar la ONU.';
         actionsOut = [
@@ -2761,7 +2766,10 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
   }
 
   if (!skipGeonetRegistration) {
-    await registrarOnuGeonet(data.onu_type, onuId);
+    const registered = await registrarOnuGeonet(data.onu_type, onuId);
+    if (registered) messages.push(`✅ Registro ONU en Geonet (${onuId}) exitoso.`);
+    else messages.push(`❌ Registro ONU en Geonet (${onuId}) falló.`);
+
     if (clientid !== undefined) {
       // Buscar el usuario correcto desde la entidad Client o Installation
       let clienteUsuario = '';
@@ -2814,10 +2822,66 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
         clienteUsuario = `${String(clienteUsuario).trim()}@geonet`;
       }
       console.log(`[processPostAuthActions] agregarArticuloACliente: clientid=${clientid}, usuario='${clienteUsuario}' (source: ${clienteUsuarioSource}), onuId=${onuId}`);
-      await agregarArticuloACliente(clientid, clienteUsuario, onuId);
+      messages.push(`🔄 Asignando ONU ${onuId} al usuario ${clienteUsuario}...`);
+      const assigned = await agregarArticuloACliente(clientid, clienteUsuario, onuId);
+      if (assigned) messages.push(`✅ ONU asignada a ${clienteUsuario}.`);
+      else messages.push(`❌ Falló asignación a ${clienteUsuario}.`);
     }
   } else {
     messages.push('ℹ️ ONU ya registrada en BD (SN coincidente).');
+    // Intentar asignar si no se hizo aún
+    if (clientid !== undefined) {
+      let clienteUsuario = '';
+      let clienteUsuarioSource = '';
+      try {
+        const sess = data._session || {};
+        const sessionTargetMatches = Boolean(
+          sess && (
+            String(sess.lastSelectedClientIdServicio) === String(clientid) ||
+            String(sess.lastSelectedInstallationId) === String(clientid) ||
+            (sess.pendingAuth && (sess.pendingAuth.clientIdServicio == clientid || sess.pendingAuth.installationId == clientid))
+          )
+        );
+        if (sess.lastAuthNameUsed && sessionTargetMatches) {
+          clienteUsuario = sess.lastAuthNameUsed;
+          clienteUsuarioSource = 'session.lastAuthNameUsed (priority)';
+        } else {
+          const clientRepo = AppDataSource.getRepository(Client);
+          const instRepo = AppDataSource.getRepository(Installation);
+          let entity: any = await clientRepo.findOne({ where: { id_servicio: Number(clientid) } });
+          if (entity && entity.usuario) {
+            clienteUsuario = entity.usuario;
+            clienteUsuarioSource = 'Client.usuario';
+          } else {
+            entity = await instRepo.findOne({ where: [{ id: Number(clientid) }, { id_servicio: Number(clientid) }] });
+            if (entity && entity.usuario) {
+              clienteUsuario = entity.usuario;
+              clienteUsuarioSource = 'Installation.usuario';
+            } else {
+              clienteUsuario = data.usuario || sessionUsuarioInstalacion || (data._session && data._session.lastAuthNameUsed) || `${clientid}@geonet`;
+              if (data.usuario) clienteUsuarioSource = 'data.usuario';
+              else if (sessionUsuarioInstalacion) clienteUsuarioSource = 'session.lastSelectedUsuarioInstalacion';
+              else if (data._session && data._session.lastAuthNameUsed) clienteUsuarioSource = 'session.lastAuthNameUsed';
+              else clienteUsuarioSource = 'default';
+            }
+          }
+        }
+      } catch (e) {
+        clienteUsuario = data.usuario || sessionUsuarioInstalacion || (data._session && data._session.lastAuthNameUsed) || `${clientid}@geonet`;
+        clienteUsuarioSource = 'default';
+      }
+      if (clienteUsuario && !String(clienteUsuario).toLowerCase().includes('@geonet')) {
+        clienteUsuario = `${String(clienteUsuario).trim()}@geonet`;
+      }
+      messages.push(`🔄 Intentando asignar ONU ${onuId} al usuario ${clienteUsuario}...`);
+      try {
+        const assigned = await agregarArticuloACliente(clientid, clienteUsuario, onuId);
+        if (assigned) messages.push(`✅ ONU asignada a ${clienteUsuario}.`);
+        else messages.push(`❌ Falló asignación a ${clienteUsuario}.`);
+      } catch (e: any) {
+        messages.push(`❌ Error al intentar asignar ONU: ${e?.message || e}`);
+      }
+    }
   }
 
   // --- WIFI vs BOTONES DIRECTOS ---
