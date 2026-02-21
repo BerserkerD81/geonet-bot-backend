@@ -6,6 +6,7 @@ import helmet from 'helmet';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
+import rateLimit from 'express-rate-limit';
 
 // Data Source y Rutas
 import { AppDataSource } from './datasource';
@@ -28,23 +29,37 @@ dotenv.config();
 
 const app = express();
 
-// --- SEGURIDAD Y MIDDLEWARES ---
+// --- CONFIANZA EN NGINX PROXY MANAGER ---
+// Fundamental para que la cookie 'secure: true' funcione detrás del proxy HTTP interno
+app.set('trust proxy', 1);
+
+// --- SEGURIDAD Y MIDDLEWARES (HELMET) ---
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" },
   })
 );
 
+// --- RATE LIMITING (Protección contra fuerza bruta y DDoS) ---
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutos
+  max: 150, // Límite de 150 peticiones por IP cada 15 minutos
+  message: { error: 'Demasiadas peticiones desde esta IP, intenta más tarde.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use('/', globalLimiter);
+
 // --- CONFIGURACIÓN ESTRICTA DE CORS ---
 const allowedOrigins = [
   'https://jmm.geonet.cl', 
-  'http://localhost:5173', // Entorno Dev local
+  'http://localhost:5173', // Solo para entorno de desarrollo local
   'http://127.0.0.1:5173'
 ];
 
 app.use(cors({
   origin: function (origin, callback) {
-    // Permitir peticiones sin origen (como las de servidores internos o Postman)
+    // Permitir peticiones sin origen (como Postman, curl o procesos internos del servidor)
     if (!origin) return callback(null, true);
     
     // Verificar si el origen está en la lista blanca
@@ -54,20 +69,27 @@ app.use(cors({
       callback(new Error('No permitido por CORS'));
     }
   },
-  credentials: true,
+  credentials: true, // Vital para permitir el envío/recepción de cookies de sesión
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
-// --------------------------------------
 
+// --- PARSERS ---
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+// --- SESIONES BLINDADAS ---
 app.use(
   session({
     secret: process.env.SESSION_SECRET || 'secret_super_seguro',
     resave: false,
-    saveUninitialized: false
+    saveUninitialized: false,
+    cookie: {
+      secure: process.env.NODE_ENV === 'production', // true en producción (HTTPS)
+      httpOnly: true, // Inmune a lectura mediante JavaScript (XSS)
+      sameSite: 'strict', // Solo viaja si la petición ocurre dentro de tu dominio
+      maxAge: 1000 * 60 * 60 * 24 // 1 día de duración
+    }
   })
 );
 
