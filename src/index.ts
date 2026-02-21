@@ -35,7 +35,31 @@ app.use(
   })
 );
 
-app.use(cors({ origin: true, credentials: true }));
+// --- CONFIGURACIÓN ESTRICTA DE CORS ---
+const allowedOrigins = [
+  'https://jmm.geonet.cl', 
+  'http://localhost:5173', // Entorno Dev local
+  'http://127.0.0.1:5173'
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Permitir peticiones sin origen (como las de servidores internos o Postman)
+    if (!origin) return callback(null, true);
+    
+    // Verificar si el origen está en la lista blanca
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(new Error('No permitido por CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+}));
+// --------------------------------------
+
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
