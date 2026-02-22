@@ -723,126 +723,117 @@ export async function agregarArticuloACliente(
   categoria: string = 'Productos Wifi' // Este parámetro es menos relevante ahora porque la API lo decide, pero lo mantenemos por compatibilidad
 ): Promise<boolean> {
   const start = Date.now();
-  const { browser, page } = await openPage();
+  const MAX_ATTEMPTS = 3;
 
-  try {
-    if (!await ensureSession(page)) return false;
-
-    // 1. IR A LA PÁGINA
-    // Nota: El HTML sugiere que la URL tiene el formato /clientes/agregar-articulos/USUARIO/ID/
-    const url = `${GEONET_BASE_URL}/clientes/agregar-articulos/${clienteUsuario}/${clienteId}/`;
-    
-    console.log(`[Puppeteer] Navegando a asignar artículo: ${url}`);
-    await safeGoto(page, url, { waitForSelector: '.lista-productos-wifi' });
-
-    // 2. INTERACTUAR CON EL BUSCADOR (AUTOCOMPLETE)
-    console.log(`[Puppeteer] Buscando equipo por serial: ${numSerie}`);
-    
-    // Enfocar y limpiar el input por seguridad
-    await page.click('.lista-productos-wifi', { clickCount: 3 });
-    await page.keyboard.press('Backspace');
-    
-    // Escribir el serial simulando tipeo humano (delay ayuda a que jQuery UI reaccione)
-    await page.type('.lista-productos-wifi', numSerie, { delay: 100 });
-
-    // 3. ESPERAR Y SELECCIONAR DEL DROPDOWN
-    // El HTML usa jQuery UI, que genera una lista ul.ui-autocomplete
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    let browser: Browser | undefined;
+    let page: Page | undefined;
     try {
-      // Esperamos a que aparezca el item del menú que contiene el serial o texto del producto
+      const bp = await openPage();
+      browser = bp.browser;
+      page = bp.page;
+
+      if (!await ensureSession(page)) throw new Error('Auth falló');
+
+      // 1. IR A LA PÁGINA
+      const url = `${GEONET_BASE_URL}/clientes/agregar-articulos/${clienteUsuario}/${clienteId}/`;
+      console.log(`[Puppeteer] Navegando a asignar artículo: ${url}`);
+      await safeGoto(page, url, { waitForSelector: '.lista-productos-wifi' });
+
+      // 2. INTERACTUAR CON EL BUSCADOR (AUTOCOMPLETE)
+      console.log(`[Puppeteer] Buscando equipo por serial: ${numSerie}`);
+      await page.click('.lista-productos-wifi', { clickCount: 3 });
+      await page.keyboard.press('Backspace');
+      await page.type('.lista-productos-wifi', numSerie, { delay: 100 });
+
+      // 3. ESPERAR Y SELECCIONAR DEL DROPDOWN
       const selectorItemMenu = `ul.ui-autocomplete li.ui-menu-item`;
-      
       await page.waitForSelector(selectorItemMenu, { visible: true, timeout: 10000 });
 
-      // Buscamos el elemento específico que contenga el serial (para evitar seleccionar otro parecido)
       const itemEncontrado = await page.evaluateHandle((selector, serial) => {
         const items = document.querySelectorAll(selector);
         for (const item of items) {
-          // El texto suele ser "Modelo - Serial" o similar según tu script
           if (item.textContent?.toUpperCase().includes(serial.toUpperCase())) {
             return item;
           }
         }
-        return items[0]; // Fallback: devolver el primero si no hay coincidencia exacta de texto pero sí resultados
+        return items[0] || null;
       }, selectorItemMenu, numSerie);
 
-      if (!itemEncontrado) throw new Error("Elemento no encontrado en el dropdown");
+      if (!itemEncontrado) throw new Error(`No se encontró el equipo ${numSerie} en el autocompletado.`);
 
-      console.log('[Puppeteer] Elemento encontrado en inventario. Haciendo click...');
       const elementHandle = itemEncontrado.asElement() as ElementHandle<Element> | null;
-      if (elementHandle) {
-        await elementHandle.click();
-      } else {
-        throw new Error("Elemento no es un ElementHandle<Element>");
+      if (!elementHandle) throw new Error('Elemento del dropdown no es clickeable');
+      console.log('[Puppeteer] Elemento encontrado en inventario. Haciendo click...');
+      await elementHandle.click();
+
+      // 4. ESPERAR A QUE LA FILA SE AGREGUE Y RELLENE
+      const inputSerieSelector = 'input[name$="-num_serie"]';
+      await page.waitForFunction((selector, serial) => {
+        const inputs = document.querySelectorAll(selector);
+        const lastInput = inputs[inputs.length - 1] as HTMLInputElement | undefined;
+        return !!(lastInput && lastInput.value.includes(serial));
+      }, { timeout: 5000 }, inputSerieSelector, numSerie);
+
+      // 5. (OPCIONAL) MODIFICAR MAC SI SE PROVEE
+      if (mac) {
+        console.log(`[Puppeteer] Sobreescribiendo MAC con: ${mac}`);
+        await page.evaluate((macVal) => {
+          const macInputs = document.querySelectorAll('input.mac-address');
+          const lastMacInput = macInputs[macInputs.length - 1] as HTMLInputElement | undefined;
+          if (lastMacInput) {
+            lastMacInput.value = macVal;
+            lastMacInput.dispatchEvent(new Event('change', { bubbles: true }));
+            lastMacInput.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+        }, mac);
       }
 
-    } catch (e) {
-      console.error(`❌ No se encontró el equipo ${numSerie} en el autocompletado.`);
-      return false;
-    }
+      // 6. ENVIAR FORMULARIO
+      console.log('[Puppeteer] Guardando asignación...');
+      const submitBtn = await page.$('#submit-button');
+      if (!submitBtn) throw new Error('Botón guardar no encontrado');
 
-    // 4. ESPERAR A QUE LA FILA SE AGREGUE Y RELLENE
-    // El script de la página hace $(".add-row").click() y luego rellena los campos.
-    // Esperamos a que el input de serie tenga valor.
-    const inputSerieSelector = 'input[name$="-num_serie"]'; // Selector genérico para formsets (form-0-num_serie, form-1...)
-    
-    await page.waitForFunction((selector, serial) => {
-      const inputs = document.querySelectorAll(selector);
-      // Buscamos el último input agregado
-      const lastInput = inputs[inputs.length - 1] as HTMLInputElement;
-      return lastInput && lastInput.value.includes(serial);
-    }, { timeout: 5000 }, inputSerieSelector, numSerie);
-
-    // 5. (OPCIONAL) MODIFICAR MAC SI SE PROVEE
-    if (mac) {
-      console.log(`[Puppeteer] Sobreescribiendo MAC con: ${mac}`);
-      // Buscamos el último input de MAC generado
-      await page.evaluate((macVal) => {
-        const macInputs = document.querySelectorAll('input.mac-address');
-        const lastMacInput = macInputs[macInputs.length - 1] as HTMLInputElement;
-        if (lastMacInput) {
-          lastMacInput.value = macVal;
-          // Disparar eventos para que validadores de JS (si los hay) se enteren
-          lastMacInput.dispatchEvent(new Event('change', { bubbles: true }));
-          lastMacInput.dispatchEvent(new Event('input', { bubbles: true }));
-        }
-      }, mac);
-    }
-
-    // 6. ENVIAR FORMULARIO
-    console.log('[Puppeteer] Guardando asignación...');
-    
-    const submitBtn = await page.$('#submit-button');
-    if (!submitBtn) throw new Error('Botón guardar no encontrado');
-
-    await Promise.all([
+      await Promise.all([
         page.waitForNavigation({ waitUntil: 'domcontentloaded' }),
         submitBtn.click()
-    ]);
+      ]);
 
-    // 7. VALIDACIÓN FINAL DE ÉXITO
-    // Si la URL sigue siendo la de agregar-articulos, algo falló (validación de Django)
-    if (page.url().includes('agregar-articulos')) {
+      // 7. VALIDACIÓN FINAL DE ÉXITO
+      if (page.url().includes('agregar-articulos')) {
         const errorMsg = await page.evaluate(() => {
-            // Buscar alertas de error comunes en Django/Bootstrap
-            return document.querySelector('.alert-danger')?.textContent?.trim() || 
-                   document.querySelector('.errorlist')?.textContent?.trim() ||
-                   "Error de validación desconocido";
+          return document.querySelector('.alert-danger')?.textContent?.trim() ||
+                 document.querySelector('.errorlist')?.textContent?.trim() ||
+                 'Error de validación desconocido';
         });
-        console.warn(`⚠️ Geonet rechazó la asignación: ${errorMsg}`);
-        return false;
+        throw new Error(`Geonet rechazó la asignación: ${errorMsg}`);
+      }
+
+      console.log(`✅ Artículo ${numSerie} asignado correctamente.`);
+      console.log(`[Puppeteer] Tiempo total: ${Date.now() - start}ms`);
+
+      // Cerrar y devolver éxito
+      try { if (page && !page.isClosed()) await page.close(); } catch (e) {}
+      try { if (browser) await browser.disconnect(); } catch (e) {}
+      return true;
+
+    } catch (error: any) {
+      console.error(`[agregarArticuloACliente] Intento ${attempt} falló: ${error?.message || error}`);
+      if (attempt < MAX_ATTEMPTS) {
+        console.log(`[agregarArticuloACliente] Reintentando (${attempt + 1}/${MAX_ATTEMPTS})...`);
+        // pequeña espera antes de reintentar
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+      } else {
+        console.error(`[agregarArticuloACliente] Fallaron los ${MAX_ATTEMPTS} intentos.`);
+      }
+      // asegurarse de cerrar recursos antes del próximo intento o al salir
+      try { if (page && !page.isClosed()) await page.close(); } catch (e) {}
+      try { if (browser) await browser.disconnect(); } catch (e) {}
+      if (attempt === MAX_ATTEMPTS) return false;
+      // de lo contrario, continuar al siguiente intento
     }
-
-    console.log(`✅ Artículo ${numSerie} asignado correctamente.`);
-    console.log(`[Puppeteer] Tiempo total: ${Date.now() - start}ms`);
-    return true;
-
-  } catch (error: any) {
-    console.error(`❌ Error critico en agregarArticuloACliente: ${error.message}`);
-    return false;
-  } finally {
-    await page.close();
-    await browser.disconnect();
   }
+  return false;
 }
 export async function getWifiProductUuidBySerial(serial: string): Promise<string | null> {
   const start = Date.now();

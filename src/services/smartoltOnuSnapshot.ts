@@ -142,7 +142,7 @@ function scheduleDailyRun(runAtHour = 3, runAtMinute = 15, job: () => Promise<vo
   scheduleNext();
 }
 
-export function scheduleSmartoltOnuSnapshots() {
+export async function scheduleSmartoltOnuSnapshots() {
   // Run once at startup only
   captureSmartoltOnuSnapshot().catch((e) => console.error('Initial SmartOLT ONU snapshot failed:', e));
 

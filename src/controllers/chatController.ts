@@ -22,7 +22,7 @@ import {
   _placeholder
 } from '../services/wisphubClient';
 import { replaceOnuForClient } from '../services/wisphubClient';
-import { getLatestSmartoltOnuSnapshot, scheduleSmartoltOnuSnapshots } from '../services/smartoltOnuSnapshot';
+import { getLatestSmartoltOnuSnapshot, scheduleSmartoltOnuSnapshots,captureSmartoltOnuSnapshot} from '../services/smartoltOnuSnapshot';
 import { searchLocalInstallations, refreshInstallationsByTerm, listPendingLocalInstallations, listAllLocalInstallations, fullSyncInstallations } from '../services/wisphubInstallations';
 import {
   authorizeOnu, listOlts, type OltInfo, getZones, getOltVlans,
@@ -1492,9 +1492,9 @@ export async function respond(req: any, res: any) {
         session.changeOnuFlowMode = true;
         session.pendingChangeOnuClientSearch = true;
         try {
-          scheduleSmartoltOnuSnapshots();
+          await captureSmartoltOnuSnapshot();
         } catch (e) {
-          console.warn('SmartOLT ONU snapshot scheduler failed', e);
+          console.warn('SmartOLT ONU snapshot capture failed', e);
         }
         session.pendingChangeOnu = { stage: 'search' };
         finalContent = 'Perfecto. Ingresa el nombre completo y/o el RUT para buscar al cliente y cambiar la ONU.';
