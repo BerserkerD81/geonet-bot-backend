@@ -720,7 +720,7 @@ export async function agregarArticuloACliente(
   clienteUsuario: string,
   numSerie: string,
   mac: string = '',
-  categoria: string = 'Productos Wifi' // Mantenido por compatibilidad
+  categoria: string = 'Productos Wifi'
 ): Promise<boolean> {
   const start = Date.now();
   const MAX_ATTEMPTS = 3;
@@ -740,47 +740,42 @@ export async function agregarArticuloACliente(
       const url = `${GEONET_BASE_URL}/clientes/agregar-articulos/${clienteUsuario}/${clienteId}/`;
       console.log(`[Puppeteer] Navegando a asignar artículo: ${url} (Intento ${attempt})`);
       
-      // Esperamos a que el formulario base exista
-      await safeGoto(page, url, { waitForSelector: '#agregar-productos-stock', timeout: 30000 });
+      // Es crucial esperar por la clase '.add-row', eso nos confirma que el JS de Geonet ya borró la fila inicial y está listo.
+      await safeGoto(page, url, { waitForSelector: '.add-row', timeout: 30000 });
 
-      // 2. INYECTAR LÓGICA DIRECTA EN EL NAVEGADOR (Bypass Interfaz Gráfica)
-      console.log(`[Puppeteer] Buscando e inyectando equipo ${numSerie} vía DOM...`);
+      // 2. INYECTAR LÓGICA DIRECTA USANDO EL PROPIO JQUERY DE GEONET
+      console.log(`[Puppeteer] Buscando e inyectando equipo ${numSerie}...`);
 
       const result = await page.evaluate(async (args) => {
         try {
-            // A. Consultar el inventario directamente al backend de Geonet
+            // A. Consultar el inventario al backend de Geonet
             const res = await fetch('/autocomplete-almacen/?exclude_services');
             if (!res.ok) throw new Error(`HTTP Error backend: ${res.status}`);
             const inventario = await res.json();
 
-            // B. Buscar la ONU por serial en la respuesta JSON
+            // B. Buscar la ONU por serial
             const item = inventario.find((i: any) => 
                 i.num_serie && i.num_serie.toUpperCase() === args.serial.toUpperCase()
             );
 
             if (!item) {
-                return { ok: false, error: `El equipo ${args.serial} no fue encontrado en el stock disponible del almacén.` };
+                return { ok: false, error: `El equipo ${args.serial} no está en el stock del almacén.` };
             }
 
-            // C. Rellenar el formulario de Django directamente (ignorando el buscador visual)
-            const uuidInput = document.getElementById('id_form-0-uuid') as HTMLInputElement;
-            const catInput = document.getElementById('id_form-0-categoria') as HTMLInputElement;
-            const serieInput = document.getElementById('id_form-0-num_serie') as HTMLInputElement;
-            const macInput = document.getElementById('id_form-0-mac') as HTMLInputElement;
-            const cantidadInput = document.getElementById('id_form-0-cantidad') as HTMLInputElement;
+            // C. Verificar jQuery
+            const jq = (window as any).$;
+            if (!jq) throw new Error("jQuery no está cargado en la página.");
 
-            if (!uuidInput || !serieInput) throw new Error('No se encontraron los inputs ocultos del formulario.');
-
-            // Llenar los datos. El UUID viaja en el atributo 'value' del JSON de Geonet
-            uuidInput.value = item.value; 
-            catInput.value = item.categoria;
-            serieInput.value = item.num_serie;
-            macInput.value = args.mac || item.mac || '';
-            if (cantidadInput) cantidadInput.value = '1';
-
-            // Disparar evento change por si los listeners internos de Geonet lo requieren
-            serieInput.dispatchEvent(new Event('change', { bubbles: true }));
-            macInput.dispatchEvent(new Event('change', { bubbles: true }));
+            // D. Ejecutar la lógica exacta que usa Geonet al seleccionar un item
+            jq(".add-row").click(); // Genera la nueva fila de inputs
+            
+            // Rellenar siempre los últimos elementos generados (como hace su frontend)
+            jq(".label-item").last().html(item.nombre);
+            jq(".num-serie").last().val(item.num_serie);
+            jq(".mac-address").last().val(args.mac || item.mac || '');
+            jq(".cantidad").last().val(1);
+            jq(".uuid-item").last().val(item.value);
+            jq(".categoria").last().val(item.categoria);
 
             return { ok: true, error: null };
         } catch (e: any) {
@@ -788,13 +783,12 @@ export async function agregarArticuloACliente(
         }
       }, { serial: numSerie, mac: mac });
 
-      // Si la inyección falló (ej. no hay stock), lanzamos error para abortar
       if (!result.ok) {
-          throw new Error(`Error lógico: ${result.error}`);
+          throw new Error(`Inyección fallida: ${result.error}`);
       }
 
       // 3. ENVIAR FORMULARIO
-      console.log('[Puppeteer] Datos inyectados. Guardando asignación...');
+      console.log('[Puppeteer] Datos rellenados con éxito. Guardando asignación...');
       const submitBtn = await page.$('#submit-button');
       if (!submitBtn) throw new Error('Botón guardar no encontrado');
 
@@ -816,14 +810,12 @@ export async function agregarArticuloACliente(
       console.log(`✅ Artículo ${numSerie} asignado correctamente a ${clienteUsuario}.`);
       console.log(`[Puppeteer] Tiempo total agregarArticuloACliente: ${Date.now() - start}ms`);
 
-      // Limpieza exitosa
       try { if (page && !page.isClosed()) await page.close(); } catch (e) {}
       return true;
 
     } catch (error: any) {
       console.error(`❌ [agregarArticuloACliente] Intento ${attempt} falló: ${error?.message || error}`);
       
-      // Limpiar página en caso de error, PERO NO DESCONECTAR EL BROWSER COMPARTIDO
       try { if (page && !page.isClosed()) await page.close(); } catch (e) {}
 
       if (attempt < MAX_ATTEMPTS) {
