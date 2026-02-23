@@ -42,7 +42,7 @@ app.use(
 
 // --- RATE LIMITING (Protección contra fuerza bruta y DDoS) ---
 const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutos
+  windowMs: 1 * 60 * 1000, // 1 minutos
   max: 150, // Límite de 150 peticiones por IP cada 15 minutos
   message: { error: 'Demasiadas peticiones desde esta IP, intenta más tarde.' },
   standardHeaders: true,
