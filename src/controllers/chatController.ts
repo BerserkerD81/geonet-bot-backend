@@ -1491,11 +1491,6 @@ export async function respond(req: any, res: any) {
       if (/(cambiar\s+onu|cambio\s+onu|cambio\s+de\s+onu)/i.test(lower) && !/(buscar|submit)/i.test(lower)) {
         session.changeOnuFlowMode = true;
         session.pendingChangeOnuClientSearch = true;
-        try {
-          await captureSmartoltOnuSnapshot();
-        } catch (e) {
-          console.warn('SmartOLT ONU snapshot capture failed', e);
-        }
         session.pendingChangeOnu = { stage: 'search' };
         finalContent = 'Perfecto. Ingresa el nombre completo y/o el RUT para buscar al cliente y cambiar la ONU.';
         actionsOut = [
