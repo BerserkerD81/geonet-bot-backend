@@ -1071,13 +1071,17 @@ export async function buildAuthActions(state: any, req?: any) {
   // Priorizar los campos relacionados al plan (`plan_internet`, `plan`) para
   // la extracción de la velocidad; `defaults.name` puede contener el servicio
   // (ej. '1256_jorge') y NO debe usarse para parsear la velocidad.
-  const planNameSource = req?.session?.lastSelectedPlan
+  let planNameSource = req?.session?.lastSelectedPlan
     || state.defaults?.plan_internet
     || state.defaults?.plan
     || collected?.plan
     || collected?.plan_internet
     || state.defaults?.name
     || collected?.name;
+  // Replace spaces with '-' in planNameSource
+  if (typeof planNameSource === 'string') {
+    planNameSource = planNameSource.replace(/\s+/g, '-');
+  }
 
   // 2. Extraemos SOLO el número de velocidad (ej: '600' desde '600 Mbps')
   const extractedNumber = extractSpeedNumber(planNameSource);
