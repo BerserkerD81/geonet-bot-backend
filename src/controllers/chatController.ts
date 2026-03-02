@@ -8,6 +8,7 @@ import { Installation } from '../models/Installation';
 import { Client } from '../models/Client';
 import fs from 'fs';
 import path from 'path';
+import { sendContractLinkEmail } from '../services/emailService';
 import { buildStructuredResponse } from '../services/simpleBot';
 import {
   searchLocal,
@@ -45,6 +46,8 @@ const CHAT_CONTEXT_KEYS = [
   'lastSelectedInstallationId',
   'lastSelectedIsPyme',
   'lastSelectedPlan',
+  'lastSelectedEmail',
+  'lastSelectedEmailCc',
   'pendingAuth',
   // IPs
   'ipv4',
@@ -662,6 +665,10 @@ function buildClientDetails(entity: any, type: 'client' | 'installation'): strin
   const address = entity.direccion || 'Sin dirección';
   const plan = entity.plan_internet || entity.servicio || 'Plan desconocido';
   const phone = entity.telefono || entity.celular || entity.movil || 'N/A';
+  const emailData = extractEmails(entity);
+  const emailLabel = emailData.primary && emailData.cc && emailData.cc !== emailData.primary
+    ? `${emailData.primary} (cc: ${emailData.cc})`
+    : (emailData.primary || emailData.cc || 'N/A');
   const coords = (entity.latitud && entity.longitud) ? `${entity.latitud}, ${entity.longitud}` : null;
   const mapLink = coords ? `https://www.google.com/maps/search/?api=1&query=${entity.latitud},${entity.longitud}` : null;
   const ip = entity.ip || entity.ipv4_address || entity.ip_cliente || 'N/A';
@@ -671,6 +678,7 @@ function buildClientDetails(entity: any, type: 'client' | 'installation'): strin
   👤 **Cliente:** ${name} [ID: ${id}]
   📍 **Dirección:** ${address}
   📞 **Tel:** ${phone}
+  📧 **Correo:** ${emailLabel}
   🌍 **IP Asignada:** ${ip}
   🚀 **Plan:** ${plan}
   ${coords ? `🗺️ **Ubicación:** [Ver en Maps](${mapLink})` : '🗺️ **Ubicación:** No registrada'}
@@ -718,6 +726,35 @@ function pickActionValue(actions: any[] | undefined, ids: string[]): string | un
     }
   }
   return undefined;
+}
+
+function extractEmails(entity: any): { primary?: string; cc?: string } {
+  const primary = pickFirstString([entity?.email, entity?.correo, entity?.mail, entity?.email_cc]);
+  const cc = pickFirstString([entity?.email_cc]);
+  const trimmedPrimary = typeof primary === 'string' ? primary.trim() : undefined;
+  const trimmedCc = typeof cc === 'string' ? cc.trim() : undefined;
+  return { primary: trimmedPrimary || undefined, cc: trimmedCc || undefined };
+}
+
+async function resolveContactEmail(targetId: number | string): Promise<{ primary?: string; cc?: string; name?: string }> {
+  const instRepo = AppDataSource.getRepository(Installation);
+  const clientRepo = AppDataSource.getRepository(Client);
+
+  const inst = await instRepo.findOne({ where: [{ id: Number(targetId) }, { id_servicio: Number(targetId) }] });
+  if (inst) {
+    const emails = extractEmails(inst);
+    const name = `${inst.nombre || ''} ${inst.apellidos || ''}`.trim() || inst.usuario || undefined;
+    return { ...emails, name };
+  }
+
+  const client = await clientRepo.findOne({ where: { id_servicio: Number(targetId) } });
+  if (client) {
+    const emails = extractEmails(client);
+    const name = `${client.nombre || ''} ${client.apellidos || ''}`.trim() || client.usuario || undefined;
+    return { ...emails, name };
+  }
+
+  return {};
 }
 
 async function findOnuDetailByServiceName(serviceName: string, ip?: string) {
@@ -1265,6 +1302,8 @@ export async function addMessage(req: any, res: any) {
     req.session.lastSelectedClientIdServicio = undefined;
     req.session.lastSelectedInstallationId = undefined;
     req.session.lastSelectedIsPyme = undefined;
+    req.session.lastSelectedEmail = undefined;
+    req.session.lastSelectedEmailCc = undefined;
     req.session.pendingAuth = undefined;
     req.session.pendingPhotos = undefined;
     req.session.lastAuthNameUsed = undefined;
@@ -1333,6 +1372,8 @@ export async function respond(req: any, res: any) {
     session.lastSelectedClientIdServicio = undefined;
     session.lastSelectedInstallationId = undefined;
     session.lastSelectedIsPyme = undefined;
+    session.lastSelectedEmail = undefined;
+    session.lastSelectedEmailCc = undefined;
     session.pendingAuth = undefined;
     session.pendingPhotos = undefined;
     session.lastAuthNameUsed = undefined;
@@ -1856,6 +1897,10 @@ export async function respond(req: any, res: any) {
             await processContractUpdate(targetId).catch(err => console.error('Error generating contract:', err));
             const baseName = session.lastAuthNameUsed || targetId;
             let contratourl = await getAutoLoginContractLink(`${baseName}@geonet`, targetId);
+            const contact = await resolveContactEmail(targetId);
+            const recipientList = [contact.primary, contact.cc].filter(Boolean) as string[];
+            const primaryRecipient = recipientList[0];
+            let emailNote = '';
 
             // Si el botón solicitó activación, ejecutar activación ahora y anexar resultado
             if (wantsActivate) {
@@ -1907,10 +1952,33 @@ export async function respond(req: any, res: any) {
               finalContent = `✅ Contrato generado:`;
             }
 
+            // Intentar enviar el contrato al correo del cliente
+            if (!contratourl) {
+              emailNote = '\n⚠️ No se generó el link de contrato para enviarlo por correo.';
+            } else if (primaryRecipient) {
+              try {
+                await sendContractLinkEmail({
+                  to: primaryRecipient,
+                  cc: contact.cc && contact.cc !== primaryRecipient ? contact.cc : undefined,
+                  contractUrl: contratourl,
+                  clientName: contact.name || String(baseName),
+                  installationId: targetId,
+                  planName: session.lastSelectedPlan
+                });
+                emailNote = `\n📧 Contrato enviado a: ${recipientList.join(', ')}`;
+              } catch (err: any) {
+                console.error('Error enviando contrato por correo:', err);
+                emailNote = `\n⚠️ No pude enviar el contrato por correo: ${err?.message || err}`;
+              }
+            } else {
+              emailNote = '\n⚠️ No encontré correo del cliente para enviar el contrato.';
+            }
+
             // Mostrar solamente el link para copiar contrato (no mostrar botón separado de activar)
             actionsOut = [
               { id: 'btn-contrato', type: 'link', label: '📄 Copiar Contrato', url: `${contratourl}` }
             ];
+            finalContent += emailNote;
           }
         } else {
           finalContent = '⚠️ Error: No se detectó ID para generar contrato.';
@@ -2302,6 +2370,9 @@ export async function respond(req: any, res: any) {
           if (!isClient) session.lastSelectedInstallationId = entity.id;
           // ACTUALIZAR USUARIO INSTALACION SIEMPRE
           session.lastSelectedUsuarioInstalacion = entity.usuario || undefined;
+          const emails = extractEmails(entity);
+          session.lastSelectedEmail = emails.primary;
+          session.lastSelectedEmailCc = emails.cc;
 
           const planName = entity.plan_internet || entity.servicio || pickPlanFromRaw(entity.raw);
           if (planName) {

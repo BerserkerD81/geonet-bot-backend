@@ -126,6 +126,54 @@ export async function sendSuccessfulLoginNotice(to: string, name?: string, meta?
   await sendMail(to, title, html);
 }
 
+function normalizeRecipients(input: string | string[] | undefined): string[] {
+  if (!input) return [];
+  const raw = Array.isArray(input) ? input : String(input).split(/[,;]/);
+  return raw.map(r => String(r || '').trim()).filter(Boolean);
+}
+
+export async function sendContractLinkEmail(params: { to: string | string[]; cc?: string | string[]; contractUrl: string; clientName?: string; installationId?: number | string; planName?: string | null }) {
+  const t = getTransporter();
+  if (!t) {
+    // eslint-disable-next-line no-console
+    console.warn('[email] SMTP not configured, skipping contract email to', params.to);
+    return;
+  }
+
+  const toList = normalizeRecipients(params.to);
+  const ccList = normalizeRecipients(params.cc);
+  if (!toList.length) {
+    // eslint-disable-next-line no-console
+    console.warn('[email] No recipients provided for contract email');
+    return;
+  }
+
+  const title = `${SMTP.appName} • Contrato de servicio`;
+  const preheader = 'Tu contrato está listo para revisar y firmar.';
+  const friendlyName = params.clientName || 'Cliente';
+  const installationLabel = params.installationId ? `ID servicio/instalación: ${params.installationId}` : '';
+  const planLabel = params.planName ? `Plan: ${params.planName}` : '';
+  const metaLines = [installationLabel, planLabel].filter(Boolean).map(text => `<p style="margin:0 0 8px;color:${BRAND.textSecondary}">${text}</p>`).join('');
+
+  const body = `
+    <p style="margin:0 0 16px;color:${BRAND.textSecondary}">Hola ${friendlyName ? `<strong>${friendlyName}</strong>` : ''},</p>
+    <p style="margin:0 0 16px;color:${BRAND.textSecondary}">Tu contrato está listo. Puedes revisarlo, firmarlo o descargarlo desde el siguiente enlace seguro:</p>
+    <p style="margin:0 0 18px;color:${BRAND.textPrimary}"><a href="${params.contractUrl}" style="color:${BRAND.primary};font-weight:600;word-break:break-all">${params.contractUrl}</a></p>
+    ${metaLines || ''}
+    <p style="margin:12px 0 0;color:${BRAND.textSecondary}">Si el botón no funciona, copia y pega el enlace en tu navegador.</p>
+  `;
+
+  const html = renderBaseTemplate({ title, preheader, bodyHtml: body, cta: { label: 'Abrir contrato', url: params.contractUrl } });
+
+  await t.sendMail({
+    from: SMTP.from,
+    to: toList.join(', '),
+    cc: ccList.length ? ccList.join(', ') : undefined,
+    subject: title,
+    html
+  });
+}
+
 export async function verifyTransport(): Promise<{ ok: true } | { ok: false; error: string } | { ok: false; reason: 'not_configured' }> {
   const t = getTransporter();
   if (!t) return { ok: false, reason: 'not_configured' };
