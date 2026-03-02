@@ -40,6 +40,47 @@ import {
 // --- HELPERS: Caching & Utils ---
 
 const _simpleCache = new Map<string, { ts: number; val: any }>();
+const _searchCache = new Map<string, { ts: number; results: any }>();
+
+// Detecta si un mensaje es principalmente una tabla/listado (evita resultados irrelevantes)
+function isTableOrListMessage(content: string): boolean {
+  if (!content) return false;
+  const lines = content.split('\n');
+  
+  // Contar líneas que son tablas Markdown o solo headers/separadores
+  const tableLikeLines = lines.filter(l => /^\|.*\|$/.test(l.trim())).length;
+  const totalLines = lines.filter(l => l.trim()).length;
+  
+  // Si más del 70% son líneas de tabla, es una tabla
+  if (totalLines > 2 && tableLikeLines / totalLines > 0.7) return true;
+  
+  // Detectar si es solo bullets/numbered list
+  const listLines = lines.filter(l => /^[\d\-\*\+]\s+/.test(l.trim())).length;
+  if (totalLines > 5 && listLines / totalLines > 0.8) return true;
+  
+  return false;
+}
+
+// Calcula relevancia del resultado (favorece búsquedas en contexto, no en tablas)
+function calculateRelevance(content: string, query: string): number {
+  let score = 0;
+  const queryLower = query.toLowerCase();
+  
+  // Penaliza si es tabla
+  if (isTableOrListMessage(content)) score -= 50;
+  
+  // Bonifica por palabra completa exacta
+  if (new RegExp(`\\b${queryLower}\\b`, 'i').test(content)) score += 30;
+  
+  // Bonifica si aparece al inicio del mensaje
+  if (content.toLowerCase().startsWith(queryLower)) score += 20;
+  
+  // Bonifica por múltiples ocurrencias
+  const matches = content.match(new RegExp(queryLower, 'gi')) || [];
+  score += Math.min(matches.length * 5, 25);
+  
+  return score;
+}
 
 const CHAT_CONTEXT_KEYS = [
   'lastSelectedClientIdServicio',
@@ -180,6 +221,15 @@ async function cacheGet<T>(key: string, ttlSeconds: number, fetcher: () => Promi
 function cacheDelete(keyPrefix: string) {
   for (const k of _simpleCache.keys()) {
     if (k.startsWith(keyPrefix)) _simpleCache.delete(k);
+  }
+}
+
+// Limpia el cache de búsqueda para un usuario (cuando se agregan mensajes nuevos)
+function invalidateSearchCache(userId: number) {
+  for (const k of _searchCache.keys()) {
+    if (k.startsWith(`search:${userId}:`)) {
+      _searchCache.delete(k);
+    }
   }
 }
 
@@ -1332,6 +1382,9 @@ export async function addMessage(req: any, res: any) {
   });
 
   await msgRepo.save(msg);
+  
+  // Invalidar cache de búsqueda del usuario para que obtenga resultados actualizados
+  invalidateSearchCache(Number(userId));
 
   // Devolvemos el ID de sesión para que el frontend lo actualice
   return res.json({ ok: true, id: msg.id, sessionId: activeSessionId });
@@ -3200,53 +3253,84 @@ export async function listUserMessages(req: any, res: any) {
 import { Brackets } from 'typeorm'; // Asegúrate de importar esto de typeorm
 
 // -------------------------------------------------------------------------
-// BÚSQUEDA GLOBAL (Endpoint Nuevo)
+// BÚSQUEDA GLOBAL (Endpoint Nuevo) - MEJORADO CON RELEVANCIA Y PAGINACIÓN
 // -------------------------------------------------------------------------
 export async function searchUserMessages(req: any, res: any) {
   const userId = req.session?.userId;
-  const { query } = req.query;
+  const { query, offset = 0, limit = 12 } = req.query;
 
   if (!userId) return res.status(401).json({ error: 'unauthenticated' });
-  if (!query || String(query).trim().length < 2) return res.json({ results: [] });
+  if (!query || String(query).trim().length < 2) return res.json({ results: [], total: 0, hasMore: false });
 
   try {
+    // Verificar cache primero
+    const cacheKey = `search:${userId}:${query}:${offset}:${limit}`;
+    const cached = _searchCache.get(cacheKey);
+    const now = Date.now();
+    
+    if (cached && now - cached.ts < 60000) { // Cache de 1 minuto
+      return res.json({ ...cached.results, cached: true });
+    }
+
     const msgRepo = AppDataSource.getRepository(ChatMessage);
+    const pageOffset = Math.max(0, Number(offset) || 0);
+    const pageLimit = Math.min(Number(limit) || 12, 50); // Máx 50 por página
 
-    // Debug: Ver con qué ID estamos buscando
-    // console.log(`Buscando "${query}" para usuario ID: ${userId}`);
-
+    // Primero obtenemos más registros para filtrarlos después
     const messages = await msgRepo.createQueryBuilder('msg')
-      // Usamos LEFT JOIN para traer el mensaje aunque la sesión se haya borrado
       .leftJoinAndSelect('msg.session', 'session')
       .where('msg.userId = :userId', { userId })
-      // COMPATIBILIDAD: Usamos LOWER(col) LIKE LOWER(val) para soportar MySQL y Postgres
       .andWhere('LOWER(msg.content) LIKE LOWER(:query)', { query: `%${query}%` })
+      .select(['msg.id', 'msg.content', 'msg.role', 'msg.createdAt', 'msg.sessionId', 'session.title'])
       .orderBy('msg.createdAt', 'DESC')
-      .take(20)
+      .take(pageLimit * 2) // Traemos el doble para filtrar tablas/listados
       .getMany();
 
-    const results = messages.map(m => ({
-      chatId: String(m.sessionId),
-      // Si no hay sesión (orphan), mostramos un fallback
-      chatTitle: (m as any).session?.title || 'Chat sin título',
-      chatTimestamp: new Date(m.createdAt).toLocaleDateString(),
-      messageId: m.id, // TypeORM suele devolver number o string según config
-      messageRole: m.role,
-      messageContent: m.content,
-      matchType: 'message'
-    }));
+    // Filtrar mensajes que son principalmente tablas y calcular relevancia
+    const filtered = messages
+      .filter(m => !isTableOrListMessage(m.content))
+      .map(m => ({
+        msg: m,
+        relevance: calculateRelevance(m.content, String(query))
+      }))
+      .sort((a, b) => b.relevance - a.relevance) // Ordenar por relevancia
+      .slice(0, pageLimit)
+      .map(({ msg }) => ({
+        chatId: String(msg.sessionId),
+        chatTitle: (msg as any).session?.title || 'Chat sin título',
+        chatTimestamp: new Date(msg.createdAt).toLocaleDateString(),
+        messageId: msg.id,
+        messageRole: msg.role,
+        messageContent: msg.content,
+        matchType: 'message'
+      }));
 
-    return res.json({ results });
+    // Obtener total para saber si hay más resultados
+    const total = await msgRepo.createQueryBuilder('msg')
+      .where('msg.userId = :userId', { userId })
+      .andWhere('LOWER(msg.content) LIKE LOWER(:query)', { query: `%${query}%` })
+      .getCount();
+
+    const response = {
+      results: filtered,
+      total,
+      offset: pageOffset,
+      limit: pageLimit,
+      hasMore: pageOffset + filtered.length < total
+    };
+
+    // Guardar en cache
+    _searchCache.set(cacheKey, { ts: now, results: response });
+
+    return res.json(response);
   } catch (error) {
     console.error('Search error:', error);
     return res.status(500).json({ error: 'Error en búsqueda' });
   }
 }
 // -------------------------------------------------------------------------
-// OBTENER MENSAJES (Modificado para Contexto y Paginación)
+// OBTENER MENSAJES (Modificado para Contexto y Paginación Optimizada)
 // -------------------------------------------------------------------------
-// En controllers/chatController.ts
-
 export async function getSessionMessages(req: any, res: any) {
   const userId = req.session?.userId;
   const { sessionId } = req.params;
@@ -3257,63 +3341,46 @@ export async function getSessionMessages(req: any, res: any) {
   try {
     const msgRepo = AppDataSource.getRepository(ChatMessage);
 
-    // 1. Validar que la sesión exista y pertenezca al usuario
-    // Si la búsqueda arrojó un mensaje huérfano (sin sesión), esto daría 404.
-    // Usamos createQueryBuilder para ser más flexibles o un findOne básico.
+    // Validar que la sesión exista y pertenezca al usuario
     const sessionRepo = AppDataSource.getRepository(ChatSession);
     const session = await sessionRepo.findOne({
       where: { id: Number(sessionId), userId: Number(userId) }
     });
 
-    // Si no existe la sesión pero intentamos cargar mensajes, devolvemos array vacío
-    // en lugar de error 404 para que el frontend no rompa.
     if (!session) {
-      return res.json({ messages: [] });
+      return res.json({ messages: [], sessionExists: false });
     }
 
     let messages: any[] = [];
-    const take = Math.min(Number(limit), 50);
+    const take = Math.min(Number(limit), 100); // Máx 100 por solicitud
 
-    // 2. Lógica de Contexto (Saltar al mensaje)
+    // 2. Lógica de Contexto (Saltar al mensaje) - OPTIMIZADA
     if (aroundId) {
       const targetId = Number(aroundId);
 
-      // Mensajes anteriores + el actual
-      const prevMsgs = await msgRepo.createQueryBuilder('msg')
+      // Usar una sola query con ranges en lugar de dos queries
+      const results = await msgRepo.createQueryBuilder('msg')
         .where('msg.sessionId = :sid', { sid: sessionId })
-        .andWhere('msg.id <= :mid', { mid: targetId })
-        .orderBy('msg.createdAt', 'DESC') // Hacia atrás
-        .take(Math.ceil(take / 2) + 1)
+        .andWhere('msg.id >= :minId', { minId: targetId - Math.ceil(take / 2) })
+        .andWhere('msg.id <= :maxId', { maxId: targetId + Math.ceil(take / 2) })
+        .orderBy('msg.createdAt', 'ASC')
+        .take(take)
         .getMany();
 
-      // Mensajes posteriores
-      const nextMsgs = await msgRepo.createQueryBuilder('msg')
-        .where('msg.sessionId = :sid', { sid: sessionId })
-        .andWhere('msg.id > :mid', { mid: targetId })
-        .orderBy('msg.createdAt', 'ASC') // Hacia adelante
-        .take(Math.ceil(take / 2))
-        .getMany();
-
-      // Unir y ordenar por fecha ascendente para el chat
-      messages = [...prevMsgs, ...nextMsgs].sort((a, b) =>
-        new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
-      );
-
+      messages = results;
     }
-    // 3. Lógica de Paginación (Scroll hacia arriba)
+    // 3. Lógica de Paginación (Scroll hacia arriba) - OPTIMIZADA
     else if (beforeId) {
       const targetId = Number(beforeId);
 
       messages = await msgRepo.createQueryBuilder('msg')
         .where('msg.sessionId = :sid', { sid: sessionId })
         .andWhere('msg.id < :bid', { bid: targetId })
-        .orderBy('msg.createdAt', 'DESC') // Los más recientes anteriores a ese ID
+        .orderBy('msg.createdAt', 'DESC')
         .take(take)
         .getMany();
 
-      // Invertimos para que queden cronológicos (Viejo -> Nuevo)
       messages.reverse();
-
     }
     // 4. Lógica Inicial (Últimos mensajes)
     else {
@@ -3325,10 +3392,13 @@ export async function getSessionMessages(req: any, res: any) {
       messages.reverse();
     }
 
-    return res.json({ messages });
+    return res.json({ 
+      messages,
+      sessionExists: true,
+      messageCount: messages.length
+    });
   } catch (error: any) {
     console.error("Error en getSessionMessages:", error);
-    // Devolvemos 500 con el mensaje para que puedas verlo en la consola del navegador
     return res.status(500).json({ error: error.message });
   }
 }
