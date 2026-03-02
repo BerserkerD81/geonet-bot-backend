@@ -807,6 +807,51 @@ async function resolveContactEmail(targetId: number | string): Promise<{ primary
   return {};
 }
 
+async function resolveGeonetInstallationUser(targetId: number | string, session?: any): Promise<{ fullUser: string; source: string }> {
+  let resolvedUser: string | null = null;
+  let source = 'id_fallback';
+
+  const sessionTargetMatches =
+    String(session?.lastSelectedClientIdServicio) === String(targetId) ||
+    String(session?.lastSelectedInstallationId) === String(targetId) ||
+    (session?.pendingAuth && (session.pendingAuth.clientIdServicio == targetId || session.pendingAuth.installationId == targetId));
+
+  if (session?.lastAuthNameUsed && sessionTargetMatches) {
+    resolvedUser = String(session.lastAuthNameUsed).trim();
+    source = 'session.lastAuthNameUsed';
+  }
+
+  if (!resolvedUser) {
+    try {
+      const instRepo = AppDataSource.getRepository(Installation);
+      const inst = await instRepo.findOne({ where: [{ id: Number(targetId) }, { id_servicio: Number(targetId) }] });
+      if (inst?.usuario) {
+        resolvedUser = String(inst.usuario).trim();
+        source = 'installation.usuario';
+      }
+    } catch (e) {
+      console.error('[resolveGeonetInstallationUser] Error Installation DB:', e);
+    }
+  }
+
+  if (!resolvedUser) {
+    try {
+      const clientRepo = AppDataSource.getRepository(Client);
+      const client = await clientRepo.findOne({ where: { id_servicio: Number(targetId) } });
+      if (client?.usuario) {
+        resolvedUser = String(client.usuario).trim();
+        source = 'client.usuario';
+      }
+    } catch (e) {
+      console.error('[resolveGeonetInstallationUser] Error Client DB:', e);
+    }
+  }
+
+  const rawUser = resolvedUser || String(targetId).trim();
+  const fullUser = rawUser.toLowerCase().includes('@geonet') ? rawUser : `${rawUser}@geonet`;
+  return { fullUser, source };
+}
+
 async function findOnuDetailByServiceName(serviceName: string, ip?: string) {
   const repo = AppDataSource.getRepository(SmartoltOnuDetail);
 
@@ -1753,51 +1798,7 @@ export async function respond(req: any, res: any) {
         if (!targetId) {
           finalContent = "⚠️ Error: No se detectó ID para activar.";
         } else {
-          let resolvedUser: string | null = null;
-          let source = 'none';
-
-          // 1. ESTRATEGIA CORREGIDA: PRIORIDAD A LA SESIÓN (INFORMACIÓN RECIENTE)
-          const sessionTargetMatches =
-            String(session.lastSelectedClientIdServicio) === String(targetId) ||
-            String(session.lastSelectedInstallationId) === String(targetId) ||
-            (session.pendingAuth && (session.pendingAuth.clientIdServicio == targetId || session.pendingAuth.installationId == targetId));
-
-          if (session.lastAuthNameUsed && sessionTargetMatches) {
-            resolvedUser = session.lastAuthNameUsed;
-            source = 'Session (Priority)';
-          }
-
-          // 2. Si no hay datos en sesión, buscamos en Base de Datos (Fallback)
-          if (!resolvedUser) {
-            try {
-              const instRepo = AppDataSource.getRepository(Installation);
-              const inst = await instRepo.findOne({
-                where: [{ id: Number(targetId) }, { id_servicio: Number(targetId) }]
-              });
-              if (inst && inst.usuario) {
-                resolvedUser = inst.usuario;
-                source = 'Installation Table';
-              }
-            } catch (e) { console.error('Error Installation DB:', e); }
-          }
-
-          // 3. Fallback final: Cliente o generar ID genérico
-          if (!resolvedUser) {
-            try {
-              const clientRepo = AppDataSource.getRepository(Client);
-              const client = await clientRepo.findOne({ where: { id_servicio: Number(targetId) } });
-              if (client && client.usuario) {
-                resolvedUser = client.usuario;
-                source = 'Client Table';
-              }
-            } catch (e) { console.error('Error Client DB:', e); }
-          }
-
-          // Limpieza final del usuario
-          const rawUser = resolvedUser || targetId;
-          const fullGeonetUser = String(rawUser).trim().toLowerCase().includes('@geonet')
-            ? String(rawUser).trim()
-            : `${String(rawUser).trim()}@geonet`;
+          const { fullUser: fullGeonetUser, source } = await resolveGeonetInstallationUser(targetId, session);
 
           console.log(`[wisphub activate] Activating User: ${fullGeonetUser} (Source: ${source}, ID: ${targetId})`);
 
@@ -1948,8 +1949,9 @@ export async function respond(req: any, res: any) {
           } else {
             finalContent = `📄 Generando contrato para ID **${targetId}**...`;
             await processContractUpdate(targetId).catch(err => console.error('Error generating contract:', err));
-            const baseName = session.lastAuthNameUsed || targetId;
-            let contratourl = await getAutoLoginContractLink(`${baseName}@geonet`, targetId);
+            const userResolution = await resolveGeonetInstallationUser(targetId, session);
+            const fullUser = userResolution.fullUser;
+            let contratourl = await getAutoLoginContractLink(fullUser, targetId);
             const contact = await resolveContactEmail(targetId);
             const recipientList = [contact.primary, contact.cc].filter(Boolean) as string[];
             const primaryRecipient = recipientList[0];
@@ -1959,9 +1961,6 @@ export async function respond(req: any, res: any) {
             if (wantsActivate) {
               finalContent = `✅ Contrato generado e intentando activación en WispHub...`;
               try {
-                const clienteUsuario = String(session.lastAuthNameUsed || `${baseName}@geonet`).trim();
-                const fullUser = clienteUsuario.toLowerCase().includes('@geonet') ? clienteUsuario : `${clienteUsuario}@geonet`;
-
                 const sleep = (ms: number) => new Promise<void>(res => setTimeout(res, ms));
                 const maxAttempts = 4;
                 let attempt = 0;
@@ -2014,7 +2013,7 @@ export async function respond(req: any, res: any) {
                   to: primaryRecipient,
                   cc: contact.cc && contact.cc !== primaryRecipient ? contact.cc : undefined,
                   contractUrl: contratourl,
-                  clientName: contact.name || String(baseName),
+                  clientName: contact.name || String(fullUser),
                   installationId: targetId,
                   planName: session.lastSelectedPlan
                 });
