@@ -19,6 +19,9 @@ export class ChatSession {
   @CreateDateColumn()
   createdAt!: Date;
 
+  @Column('datetime', { nullable: true })
+  deletedByUserAt?: Date | null;
+
   // Relación inversa: Una sesión tiene muchos mensajes
   @OneToMany(() => ChatMessage, (message) => message.session)
   messages!: ChatMessage[];

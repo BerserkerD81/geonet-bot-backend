@@ -44,4 +44,7 @@ export class ChatMessage {
 
   @CreateDateColumn()
   createdAt!: Date;
+
+  @Column('datetime', { nullable: true })
+  deletedByUserAt?: Date | null;
 }

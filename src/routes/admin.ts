@@ -1,7 +1,7 @@
 import express from 'express';
 import { requireAdmin } from '../middlewares/auth';
 import * as adminUsers from '../controllers/adminUserController';
-import { listUserMessages } from '../controllers/chatController';
+import { listUserMessages, listAdminUserSessions, getAdminUserSessionMessages } from '../controllers/chatController';
 
 const router = express.Router();
 
@@ -14,5 +14,7 @@ router.delete('/users/:id', adminUsers.deleteUser);
 
 // Chat history per user (admin only)
 router.get('/users/:userId/messages', listUserMessages);
+router.get('/users/:userId/sessions', listAdminUserSessions);
+router.get('/users/:userId/sessions/:sessionId/messages', getAdminUserSessionMessages);
 
 export default router;

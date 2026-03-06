@@ -20,6 +20,7 @@ import {
   registrarOnuGeonet,
   agregarArticuloACliente,
   uploadDocumentoCliente,
+  getClientByServiceId,
   _placeholder
 } from '../services/wisphubClient';
 import { replaceOnuForClient } from '../services/wisphubClient';
@@ -32,10 +33,20 @@ import {
   getAllZones, getVlansByOltId, listGlobalUnconfiguredOnus,
   updateOnuWifi,
   getInternalOnuIdBySn,
+  getOnuBySerial,
   updateOnuSn,
   changeOnuType,
-  getAllOnusDetails
+  getAllOnusDetails,
+  getOnuFullStatusInfoByExternalId,
+  getOnuDetailsByExternalId,
+  getOnuSignalByExternalId,
+  getOnuRunningConfigByExternalId,
+  getOnuSignalGraphByExternalId,
+  getOnuTrafficGraphByExternalId,
+  type SmartoltGraphType,
+  resyncOnuConfigByExternalId
 } from '../services/smartoltClient';
+import { IsNull } from 'typeorm';
 
 // --- HELPERS: Caching & Utils ---
 
@@ -119,6 +130,10 @@ const CHAT_CONTEXT_KEYS = [
   'pendingChangeOnuClientSearch',
   'pendingWifiClientSearch',
   'pendingWifiChange',
+  'monitorClientFlowMode',
+  'pendingMonitorClientSearch',
+  'pendingMonitorClient',
+  'monitorGraphType',
   // Assistant metadata and housekeeping
   'assistantMetadata',
   'sessionExpiresAt',
@@ -138,7 +153,9 @@ async function loadChatContext(session: any, sessionId: number) {
   if (!stored) {
     try {
       const sessionRepo = AppDataSource.getRepository(ChatSession);
-      const chatSession = await sessionRepo.findOne({ where: { id: Number(sessionId) } });
+      const where: any = { id: Number(sessionId) };
+      if (session?.userId) where.userId = Number(session.userId);
+      const chatSession = await sessionRepo.findOne({ where });
       if (chatSession && chatSession.context) {
         stored = chatSession.context as any;
         session.chatContexts[String(sessionId)] = stored;
@@ -169,7 +186,9 @@ async function saveChatContext(session: any, sessionId: number) {
   try {
     const sessionRepo = AppDataSource.getRepository(ChatSession);
     const sanitized = sanitizeContextForDb(snapshot);
-    await sessionRepo.update({ id: Number(sessionId) }, { context: sanitized });
+    const where: any = { id: Number(sessionId) };
+    if (session?.userId) where.userId = Number(session.userId);
+    await sessionRepo.update(where, { context: sanitized });
   } catch (e) {
     console.error('Error guardando contexto en DB:', e);
   }
@@ -1340,6 +1359,493 @@ function buildWifiChangeActions(sn: string) {
   ];
 }
 
+function buildMonitorClientSearchActions() {
+  return [
+    { id: 'monitor_search_fullname', type: 'input', label: 'Nombre Completo', placeholder: 'Ej: Juan Pérez', payload: 'monitoreo buscar nombre {monitor_search_fullname} rut {monitor_search_rut}' },
+    { id: 'monitor_search_rut', type: 'input', label: 'RUT', placeholder: 'Ej: 12.345.678-9', payload: 'monitoreo buscar nombre {monitor_search_fullname} rut {monitor_search_rut}' },
+    { id: 'monitor_search_submit', type: 'button', label: 'Buscar Cliente', payload: 'monitoreo buscar nombre {monitor_search_fullname} rut {monitor_search_rut}' }
+  ];
+}
+
+function buildMonitorPanelActions(onuExternalId?: string) {
+  const actions: any[] = [];
+  if (onuExternalId) {
+    actions.push({ id: 'monitor_graph_hourly', type: 'button', label: '🕐 Hora', payload: `monitoreo grafico hourly ${onuExternalId}` });
+    actions.push({ id: 'monitor_graph_daily', type: 'button', label: '📅 Día', payload: `monitoreo grafico daily ${onuExternalId}` });
+    actions.push({ id: 'monitor_graph_weekly', type: 'button', label: '🗓️ Semana', payload: `monitoreo grafico weekly ${onuExternalId}` });
+    actions.push({ id: 'monitor_graph_monthly', type: 'button', label: '📆 Mes', payload: `monitoreo grafico monthly ${onuExternalId}` });
+    actions.push({ id: 'monitor_graph_yearly', type: 'button', label: '🗃️ Año', payload: `monitoreo grafico yearly ${onuExternalId}` });
+    actions.push({ id: 'monitor_refresh', type: 'button', label: '🔄 Actualizar panel', payload: `monitoreo refresh ${onuExternalId}` });
+    actions.push({ id: 'monitor_resync', type: 'button', label: '🛠️ Resync ONU', payload: `monitoreo resync ${onuExternalId}` });
+  }
+  actions.push({ id: 'monitor_new_search', type: 'button', label: 'Buscar otro cliente', payload: 'monitoreo cliente' });
+  return actions;
+}
+
+function normalizeMonitorGraphType(value?: string): SmartoltGraphType {
+  const v = String(value || '').toLowerCase().trim();
+  if (v === 'hourly') return 'hourly';
+  if (v === 'weekly') return 'weekly';
+  if (v === 'monthly') return 'monthly';
+  if (v === 'yearly') return 'yearly';
+  return 'daily';
+}
+
+function monitorGraphTypeLabel(value?: string): string {
+  const t = normalizeMonitorGraphType(value);
+  if (t === 'hourly') return 'Hora';
+  if (t === 'weekly') return 'Semana';
+  if (t === 'monthly') return 'Mes';
+  if (t === 'yearly') return 'Año';
+  return 'Día';
+}
+
+function resolveOnuExternalIdFromDetail(detail: any): string | undefined {
+  const payload = detail?.payload || {};
+  return pickFirstString([
+    detail?.uniqueExternalId,
+    payload?.unique_external_id,
+    payload?.uniqueExternalId,
+    payload?.onu_external_id,
+    payload?.onuExternalId,
+    payload?.external_id,
+    payload?.onu_id,
+    payload?.id
+  ]);
+}
+
+function findValueByKeyRegex(source: any, regex: RegExp, depth = 0): any {
+  if (source === null || source === undefined || depth > 6) return undefined;
+  if (typeof source !== 'object') return undefined;
+
+  if (Array.isArray(source)) {
+    for (const item of source) {
+      const found = findValueByKeyRegex(item, regex, depth + 1);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+
+  for (const [key, value] of Object.entries(source)) {
+    if (regex.test(String(key)) && value !== undefined && value !== null && typeof value !== 'object') {
+      return value;
+    }
+  }
+
+  for (const value of Object.values(source)) {
+    const found = findValueByKeyRegex(value, regex, depth + 1);
+    if (found !== undefined) return found;
+  }
+
+  return undefined;
+}
+
+function toCompactString(value: any): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'string') {
+    const t = value.trim();
+    return t || undefined;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  try {
+    const txt = JSON.stringify(value);
+    return txt && txt.length > 180 ? `${txt.slice(0, 180)}...` : txt;
+  } catch {
+    return String(value);
+  }
+}
+
+function toDbmString(value: any): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const raw = String(value).trim();
+  if (!raw) return undefined;
+  if (/dbm/i.test(raw)) return raw.replace(/\s+/g, ' ').trim();
+  const num = Number(raw.replace(',', '.'));
+  if (!Number.isNaN(num)) {
+    const text = Number.isInteger(num) ? String(num) : num.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+    return `${text} dBm`;
+  }
+  return raw;
+}
+
+function parseDbmNumber(value: any): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  const raw = String(value).replace(',', '.').trim();
+  if (!raw) return undefined;
+  const match = raw.match(/-?\d+(?:\.\d+)?/);
+  if (!match) return undefined;
+  const parsed = Number(match[0]);
+  return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+function classifyOnuSignalQuality(input: { signal1490?: string; signalValue?: string; rx?: string; statusSummary?: string }): { label: string; tone: string; detail?: string } {
+  const dbm = parseDbmNumber(input.signal1490) ?? parseDbmNumber(input.signalValue) ?? parseDbmNumber(input.rx);
+
+  if (dbm !== undefined) {
+    const dbmText = Number.isInteger(dbm) ? `${dbm}` : dbm.toFixed(2).replace(/0+$/, '').replace(/\.$/, '');
+    if (dbm > -8) return { label: 'Mala', tone: '🔴', detail: `RX ONU ${dbmText} dBm (potencia muy alta)` };
+    if (dbm >= -18) return { label: 'Excelente', tone: '🟢', detail: `RX ONU ${dbmText} dBm` };
+    if (dbm >= -23) return { label: 'Buena', tone: '🟢', detail: `RX ONU ${dbmText} dBm` };
+    if (dbm >= -27) return { label: 'Regular', tone: '🟡', detail: `RX ONU ${dbmText} dBm` };
+    return { label: 'Mala', tone: '🔴', detail: `RX ONU ${dbmText} dBm` };
+  }
+
+  const status = normalizeComparableText(String(input.statusSummary || ''));
+  if (/critical|critico|critica|offline|caido|falla|error|down/.test(status)) return { label: 'Mala', tone: '🔴' };
+  if (/regular|warning|alerta|inestable|degradado|degraded/.test(status)) return { label: 'Regular', tone: '🟡' };
+  if (/very good|muy bueno|good|ok|online|up|estable|normal/.test(status)) return { label: 'Buena', tone: '🟢' };
+
+  return { label: 'N/D', tone: '⚪' };
+}
+
+function buildWifiSignalRefreshActions(sn?: string): any[] {
+  const cleanSn = String(sn || '').trim().toUpperCase();
+  if (!cleanSn) return [];
+  return [{ id: 'wifi_signal_refresh', type: 'button', label: '🔄 Refrescar señal ONU', payload: `wifi signal refresh sn ${cleanSn}` }];
+}
+
+function formatMonitorDate(value: any): string | undefined {
+  const raw = toCompactString(value);
+  if (!raw) return undefined;
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toLocaleDateString('es-CL');
+  }
+  return raw;
+}
+
+function extractDistanceFromText(value: any): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const raw = String(value);
+
+  const parenMeters = raw.match(/\((\d{2,7}(?:[\.,]\d+)?)\s*m\)/i);
+  if (parenMeters?.[1]) {
+    const n = Number(parenMeters[1].replace(',', '.'));
+    if (!Number.isNaN(n)) return `${Math.round(n)}m`;
+  }
+
+  const directMeters = raw.match(/(?:distance|distancia|ranging|range)?[^\d-]{0,12}(\d{2,7}(?:[\.,]\d+)?)\s*(?:m|mts|metros?)\b/i);
+  if (directMeters?.[1]) {
+    const n = Number(directMeters[1].replace(',', '.'));
+    if (!Number.isNaN(n)) return `${Math.round(n)}m`;
+  }
+
+  const inKm = raw.match(/(\d+(?:[\.,]\d+)?)\s*km\b/i);
+  if (inKm?.[1]) {
+    const n = Number(inKm[1].replace(',', '.'));
+    if (!Number.isNaN(n)) return `${Math.round(n * 1000)}m`;
+  }
+
+  return undefined;
+}
+
+function toMetersString(value: any): string | undefined {
+  const extracted = extractDistanceFromText(value);
+  if (extracted) return extracted;
+  if (value === undefined || value === null) return undefined;
+  const raw = String(value).trim();
+  if (!raw) return undefined;
+  const num = Number(raw.replace(',', '.'));
+  if (!Number.isNaN(num) && num > 0 && num < 100000) {
+    return `${Math.round(num)}m`;
+  }
+  return undefined;
+}
+
+function extractOnlineUptimeFromText(value: any): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const raw = String(value);
+
+  const onlineWithAgo = raw.match(/online\s*\(([^)]+)\)/i);
+  if (onlineWithAgo?.[1]) return onlineWithAgo[1].trim();
+
+  const uptime = raw.match(/(?:uptime|up\s*time|tiempo\s+en\s+l[ií]nea|online\s*time)\s*[:\-]?\s*([^\n,;]+)/i);
+  if (uptime?.[1]) return uptime[1].trim();
+
+  const onlineSince = raw.match(/online\s+since\s+([^\n,;]+)/i);
+  if (onlineSince?.[1]) return `Desde ${onlineSince[1].trim()}`;
+
+  return undefined;
+}
+
+function normalizeWisphubServiceStatus(value: any, entity?: any): string | undefined {
+  if (entity?.fecha_cancelacion) return 'Cancelado';
+  const raw = toCompactString(value);
+  if (!raw) return undefined;
+
+  const normalized = raw
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  if (/^\d+$/.test(normalized)) {
+    if (normalized === '1') return 'Activo';
+    if (normalized === '2') return 'Suspendido';
+    if (normalized === '3') return 'Cancelado';
+  }
+
+  if (normalized.includes('cancel') || normalized.includes('baja') || normalized.includes('retir') || normalized.includes('inactiv')) return 'Cancelado';
+  if (normalized.includes('suspend') || normalized.includes('cort') || normalized.includes('bloq') || normalized.includes('moros')) return 'Suspendido';
+  if (normalized.includes('activ') || normalized.includes('habil') || normalized.includes('online') || normalized.includes('al dia') || normalized.includes('aldia')) return 'Activo';
+
+  return raw;
+}
+
+function normalizeInvoicePaidStatus(value: any): string | undefined {
+  const raw = toCompactString(value);
+  if (!raw) return undefined;
+
+  const normalized = raw
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  if (normalized.includes('pagad') || normalized.includes('paid') || normalized.includes('al dia') || normalized.includes('aldia')) return 'Pagada';
+  if (normalized.includes('pend') || normalized.includes('venc') || normalized.includes('deud') || normalized.includes('moros') || normalized.includes('impag') || normalized.includes('unpaid') || normalized.includes('no pag')) return 'No pagada';
+
+  return raw;
+}
+
+function extractMonitorWisphubSummary(entity: any, clientApiPayload?: any): { wisphubServiceStatus?: string; lastInvoiceDate?: string; lastInvoicePaid?: string } {
+  const raw = entity?.raw || {};
+  const remote = clientApiPayload || {};
+
+  const wisphubServiceStatus = normalizeWisphubServiceStatus(
+    pickFirstString([
+      remote?.estado,
+      entity?.estado,
+      findValueByKeyRegex(remote, /(^estado$|estado_?servicio|service_?status|status_?service)/i),
+      findValueByKeyRegex(raw, /(^estado$|estado_?servicio|service_?status|status_?service)/i)
+    ]),
+    { ...(entity || {}), fecha_cancelacion: remote?.fecha_cancelacion || entity?.fecha_cancelacion }
+  );
+
+  const paidFlag = remote?.facturas_pagadas;
+  const paidFromFlag = typeof paidFlag === 'boolean' ? (paidFlag ? 'Pagada' : 'No pagada') : undefined;
+
+  const lastInvoiceDate = formatMonitorDate(
+    pickFirstString([
+      remote?.fecha_ultima_factura,
+      remote?.fecha_factura,
+      remote?.fecha_corte,
+      remote?.fecha_registro,
+      findValueByKeyRegex(remote, /(fecha.*(ultima|última).*factura|ultima.*factura.*fecha|last.*invoice.*date|invoice.*date|fecha_?factura|fecha.*ultimo.*pago|last.*payment.*date)/i),
+      findValueByKeyRegex(raw, /(fecha.*(ultima|última).*factura|ultima.*factura.*fecha|last.*invoice.*date|invoice.*date|fecha_?factura|fecha.*ultimo.*pago|last.*payment.*date)/i)
+    ])
+  );
+
+  const lastInvoicePaid = paidFromFlag || normalizeInvoicePaidStatus(
+    pickFirstString([
+      remote?.estado_facturas,
+      entity?.estado_facturas,
+      findValueByKeyRegex(remote, /(facturas?_?pagadas|estado.*factura|factura.*estado|invoice.*status|payment.*status|pagad|paid|pend|venc|deud|moros|impag|unpaid)/i),
+      findValueByKeyRegex(raw, /(estado.*factura|factura.*estado|invoice.*status|payment.*status|pagad|paid|pend|venc|deud|moros|impag|unpaid)/i)
+    ])
+  );
+
+  return { wisphubServiceStatus, lastInvoiceDate, lastInvoicePaid };
+}
+
+function extractTxFromFullStatus(fullStatusInfo: string | undefined, wavelength: '1310' | '1490'): string | undefined {
+  if (!fullStatusInfo) return undefined;
+  const lineRegex = new RegExp(`${wavelength}nm[^\\r\\n]*Tx\\s*:?\\s*(-?\\d+(?:\\.\\d+)?)`, 'i');
+  const m = fullStatusInfo.match(lineRegex);
+  return toDbmString(m?.[1]);
+}
+
+function persistGraphImage(buffer?: Buffer | null): string | undefined {
+  if (!buffer || !Buffer.isBuffer(buffer) || buffer.length === 0) return undefined;
+  const dataUrl = `data:image/png;base64,${buffer.toString('base64')}`;
+  const saved = saveImageDataUrl(dataUrl);
+  return saved?.webPath;
+}
+
+function buildMonitorGraphsSection(monitor: { signalGraphUrl?: string; trafficGraphUrl?: string }): string {
+  const lines: string[] = [];
+  const periodLabel = monitorGraphTypeLabel((monitor as any).graphType);
+  if (monitor.signalGraphUrl) lines.push(`📈 **Gráfico señal (${periodLabel}):** [Ver](${monitor.signalGraphUrl})`);
+  if (monitor.trafficGraphUrl) lines.push(`📊 **Gráfico tráfico (${periodLabel}):** [Ver](${monitor.trafficGraphUrl})`);
+  return lines.length ? `\n${lines.join('\n')}` : '';
+}
+
+async function loadMonitorSmartoltData(onuExternalId: string, graphType: SmartoltGraphType = 'daily') {
+  const normalizedGraphType = normalizeMonitorGraphType(graphType);
+  const calls = await Promise.allSettled([
+    getOnuFullStatusInfoByExternalId(onuExternalId),
+    getOnuDetailsByExternalId(onuExternalId),
+    getOnuSignalByExternalId(onuExternalId),
+    getOnuRunningConfigByExternalId(onuExternalId),
+    getOnuSignalGraphByExternalId(onuExternalId, normalizedGraphType),
+    getOnuTrafficGraphByExternalId(onuExternalId, normalizedGraphType)
+  ]);
+
+  const [fullStatusRes, detailsRes, signalRes, runningRes, signalGraphRes, trafficGraphRes] = calls;
+
+  const fullStatus = fullStatusRes.status === 'fulfilled' ? fullStatusRes.value : null;
+  const details = detailsRes.status === 'fulfilled' ? detailsRes.value : null;
+  const signal = signalRes.status === 'fulfilled' ? signalRes.value : null;
+  const runningConfig = runningRes.status === 'fulfilled' ? runningRes.value : null;
+  const signalGraphUrl = signalGraphRes.status === 'fulfilled' ? persistGraphImage(signalGraphRes.value as Buffer) : undefined;
+  const trafficGraphUrl = trafficGraphRes.status === 'fulfilled' ? persistGraphImage(trafficGraphRes.value as Buffer) : undefined;
+  const fullStatusInfo = pickFirstString([fullStatus?.full_status_info, fullStatus?.fullStatusInfo]);
+  const runningConfigText = pickFirstString([
+    runningConfig?.running_config,
+    runningConfig?.runningConfig,
+    runningConfig?.config,
+    runningConfig?.result
+  ]);
+
+  const signal1310 = toDbmString(pickFirstString([
+    signal?.onu_signal_1310,
+    signal?.signal_1310,
+    details?.onu_details?.signal_1310,
+    details?.signal_1310,
+    findValueByKeyRegex(signal, /signal_?1310|1310.*rx|olt.*rx/i),
+    findValueByKeyRegex(details, /signal_?1310|1310.*rx|olt.*rx/i)
+  ]));
+
+  const signal1490 = toDbmString(pickFirstString([
+    signal?.onu_signal_1490,
+    signal?.signal_1490,
+    details?.onu_details?.signal_1490,
+    details?.signal_1490,
+    findValueByKeyRegex(signal, /signal_?1490|1490.*rx|onu.*rx/i),
+    findValueByKeyRegex(details, /signal_?1490|1490.*rx|onu.*rx/i)
+  ]));
+
+  const signalValue = toCompactString(pickFirstString([
+    signal?.onu_signal_value,
+    details?.onu_details?.onu_signal_value,
+    details?.onu_signal_value,
+    signal1490 && signal1310 ? `ONU ${signal1490} / OLT ${signal1310}` : undefined
+  ]));
+
+  const statusSummary = toCompactString(
+    pickFirstString([
+      signal?.onu_signal,
+      details?.onu_details?.signal,
+      details?.status,
+      details?.onu_status,
+      fullStatus?.status,
+      fullStatus?.onu_status,
+      fullStatusInfo,
+      details?.status,
+      details?.onu_status,
+      findValueByKeyRegex(fullStatus, /status|state/i),
+      findValueByKeyRegex(details, /status|state/i)
+    ])
+  ) || 'N/D';
+
+  const rx = toCompactString(pickFirstString([
+    signalValue,
+    signal1490 && signal1310 ? `ONU ${signal1490} / OLT ${signal1310}` : undefined,
+    findValueByKeyRegex(signal, /(^rx$|optical.*rx|rx.*power|signal.*rx|rssi)/i),
+    findValueByKeyRegex(details, /(^rx$|optical.*rx|rx.*power|signal.*rx|rssi)/i)
+  ])) || 'N/D';
+
+  const txOnu = toDbmString(pickFirstString([
+    extractTxFromFullStatus(fullStatusInfo, '1310'),
+    findValueByKeyRegex(signal, /(onu.*tx|tx.*onu|1310.*tx|^tx$)/i),
+    findValueByKeyRegex(details, /(onu.*tx|tx.*onu|1310.*tx|^tx$)/i)
+  ]));
+
+  const txOlt = toDbmString(pickFirstString([
+    extractTxFromFullStatus(fullStatusInfo, '1490'),
+    findValueByKeyRegex(signal, /(olt.*tx|tx.*olt|1490.*tx)/i),
+    findValueByKeyRegex(details, /(olt.*tx|tx.*olt|1490.*tx)/i)
+  ]));
+
+  const tx = toCompactString(pickFirstString([
+    txOnu && txOlt ? `ONU ${txOnu} / OLT ${txOlt}` : undefined,
+    txOnu,
+    findValueByKeyRegex(signal, /(^tx$|optical.*tx|tx.*power|signal.*tx)/i)
+  ])) || 'N/D';
+
+  const distanceOltOnu = toMetersString(pickFirstString([
+    findValueByKeyRegex(signal, /(distance|distancia|ranging|range|fiber.*length|line.*length)/i),
+    findValueByKeyRegex(details, /(distance|distancia|ranging|range|fiber.*length|line.*length)/i),
+    extractDistanceFromText(signalValue),
+    extractDistanceFromText(fullStatusInfo),
+    extractDistanceFromText(statusSummary)
+  ]));
+
+  const onlineUptime = toCompactString(pickFirstString([
+    findValueByKeyRegex(fullStatus, /(uptime|online.*time|online_since|connected_since|time_online|duration)/i),
+    findValueByKeyRegex(details, /(uptime|online.*time|online_since|connected_since|time_online|duration)/i),
+    extractOnlineUptimeFromText(statusSummary),
+    extractOnlineUptimeFromText(fullStatusInfo)
+  ]));
+
+  const failedApis = calls
+    .map((c, idx) => ({ c, name: ['full_status', 'details', 'signal', 'running_config', `signal_graph_${normalizedGraphType}`, `traffic_graph_${normalizedGraphType}`][idx] }))
+    .filter((x) => x.c.status === 'rejected')
+    .map((x) => `${x.name}: ${((x.c as PromiseRejectedResult).reason as any)?.message || 'error'}`);
+
+  return {
+    statusSummary,
+    rx,
+    tx,
+    distanceOltOnu,
+    onlineUptime,
+    signalValue,
+    signal1310,
+    signal1490,
+    runningConfig: runningConfigText,
+    fullStatusInfo,
+    graphType: normalizedGraphType,
+    signalGraphUrl,
+    trafficGraphUrl,
+    failedApis,
+    raw: {
+      fullStatus,
+      details,
+      signal,
+      runningConfig,
+      graphType: normalizedGraphType,
+      signalGraphUrl,
+      trafficGraphUrl
+    }
+  };
+}
+
+async function loadWifiSignalCheckBySn(snInput: string) {
+  const sn = String(snInput || '').trim().toUpperCase();
+  if (!sn) throw new Error('SN requerido');
+
+  let onuExternalId = sn;
+  try {
+    const bySerial = await getOnuBySerial(sn);
+    const resolvedExternalId = pickFirstString([
+      bySerial?.onu_external_id,
+      bySerial?.onuExternalId,
+      bySerial?.unique_external_id,
+      bySerial?.uniqueExternalId,
+      bySerial?.external_id,
+      bySerial?.externalId,
+      findValueByKeyRegex(bySerial, /(onu_?external_?id|unique_?external_?id|external_?id)/i)
+    ]);
+    if (resolvedExternalId) onuExternalId = resolvedExternalId;
+  } catch {
+  }
+
+  const monitor = await loadMonitorSmartoltData(onuExternalId, 'daily');
+  const signalLine = monitor.signalValue || monitor.rx || 'N/D';
+  const quality = classifyOnuSignalQuality({
+    signal1490: monitor.signal1490,
+    signalValue: monitor.signalValue,
+    rx: monitor.rx,
+    statusSummary: monitor.statusSummary
+  });
+
+  return {
+    sn,
+    onuExternalId,
+    monitor,
+    signalLine,
+    quality
+  };
+}
+
 // =========================================================================
 // --- CONTROLLER FUNCTIONS ---
 // =========================================================================
@@ -1352,7 +1858,7 @@ export async function getUserSessions(req: any, res: any) {
   try {
     const sessionRepo = AppDataSource.getRepository(ChatSession);
     const sessions = await sessionRepo.find({
-      where: { userId: Number(userId) },
+      where: { userId: Number(userId), deletedByUserAt: IsNull() },
       order: { createdAt: 'DESC' },
       take: 50 // Límite razonable
     });
@@ -1360,6 +1866,70 @@ export async function getUserSessions(req: any, res: any) {
   } catch (error) {
     console.error('Error fetching sessions:', error);
     return res.status(500).json({ error: 'Error interno al cargar sesiones' });
+  }
+}
+
+export async function deleteUserSession(req: any, res: any) {
+  const userId = req.session?.userId;
+  if (!userId) return res.status(401).json({ error: 'unauthenticated' });
+
+  const sessionId = Number(req.params.sessionId);
+  if (!Number.isFinite(sessionId) || sessionId <= 0) {
+    return res.status(400).json({ error: 'invalid_session_id' });
+  }
+
+  try {
+    const sessionRepo = AppDataSource.getRepository(ChatSession);
+    const chatSession = await sessionRepo.findOne({
+      where: { id: sessionId, userId: Number(userId), deletedByUserAt: IsNull() }
+    });
+
+    if (!chatSession) return res.status(404).json({ error: 'session_not_found' });
+
+    chatSession.deletedByUserAt = new Date();
+    await sessionRepo.save(chatSession);
+
+    if (req.session?.chatContexts) delete req.session.chatContexts[String(sessionId)];
+    if (Number(req.session?.activeChatContextId) === sessionId) {
+      CHAT_CONTEXT_KEYS.forEach((k) => {
+        req.session[k] = undefined;
+      });
+      req.session.activeChatContextId = undefined;
+    }
+
+    invalidateSearchCache(Number(userId));
+    return res.json({ ok: true, sessionId });
+  } catch (error) {
+    console.error('Error soft-deleting session:', error);
+    return res.status(500).json({ error: 'Error interno al borrar sesión' });
+  }
+}
+
+export async function deleteUserMessage(req: any, res: any) {
+  const userId = req.session?.userId;
+  if (!userId) return res.status(401).json({ error: 'unauthenticated' });
+
+  const messageId = Number(req.params.messageId);
+  if (!Number.isFinite(messageId) || messageId <= 0) {
+    return res.status(400).json({ error: 'invalid_message_id' });
+  }
+
+  try {
+    const msgRepo = AppDataSource.getRepository(ChatMessage);
+    const msg = await msgRepo.findOne({
+      where: { id: messageId, userId: Number(userId), deletedByUserAt: IsNull() }
+    });
+
+    if (!msg) return res.status(404).json({ error: 'message_not_found' });
+
+    msg.deletedByUserAt = new Date();
+    await msgRepo.save(msg);
+
+    invalidateSearchCache(Number(userId));
+    return res.json({ ok: true, messageId, sessionId: msg.sessionId });
+  } catch (error) {
+    console.error('Error soft-deleting message:', error);
+    return res.status(500).json({ error: 'Error interno al borrar mensaje' });
   }
 }
 
@@ -1381,7 +1951,10 @@ export async function addMessage(req: any, res: any) {
   const sessionRepo = AppDataSource.getRepository(ChatSession);
   const msgRepo = AppDataSource.getRepository(ChatMessage);
 
-  let activeSessionId = sessionId;
+  let activeSessionId = sessionId ? Number(sessionId) : null;
+  if (sessionId && (!Number.isFinite(activeSessionId) || Number(activeSessionId) <= 0)) {
+    return res.status(400).json({ error: 'invalid_session_id' });
+  }
 
   // 1. Si no hay sessionId, creamos una NUEVA sesión
   if (!activeSessionId) {
@@ -1411,10 +1984,21 @@ export async function addMessage(req: any, res: any) {
     req.session.wifiFlowMode = undefined;
     req.session.pendingWifiClientSearch = undefined;
     req.session.pendingWifiChange = undefined;
+    req.session.monitorClientFlowMode = undefined;
+    req.session.pendingMonitorClientSearch = undefined;
+    req.session.pendingMonitorClient = undefined;
+    req.session.monitorGraphType = undefined;
 
     await saveChatContext(req.session, activeSessionId);
-  } else if (req.session?.activeChatContextId !== activeSessionId) {
-    await loadChatContext(req.session, activeSessionId);
+  } else {
+    const existingSession = await sessionRepo.findOne({
+      where: { id: Number(activeSessionId), userId: Number(userId), deletedByUserAt: IsNull() }
+    });
+    if (!existingSession) return res.status(404).json({ error: 'session_not_found' });
+
+    if (Number(req.session?.activeChatContextId) !== Number(activeSessionId)) {
+      await loadChatContext(req.session, Number(activeSessionId));
+    }
   }
 
   // 2. Guardamos el mensaje vinculado a la sesión
@@ -1460,7 +2044,10 @@ export async function respond(req: any, res: any) {
   const sessionRepo = AppDataSource.getRepository(ChatSession);
 
   // 1. Garantizar Sesión (por si se llama directo a respond sin addMessage)
-  let activeSessionId = sessionId;
+  let activeSessionId = sessionId ? Number(sessionId) : null;
+  if (sessionId && (!Number.isFinite(activeSessionId) || Number(activeSessionId) <= 0)) {
+    return res.status(400).json({ error: 'invalid_session_id' });
+  }
   if (!activeSessionId) {
     const title = content ? content.substring(0, 40) : 'Conversación sin título';
     const newS = await sessionRepo.save(sessionRepo.create({ userId: Number(userId), title }));
@@ -1484,10 +2071,21 @@ export async function respond(req: any, res: any) {
     session.wifiFlowMode = undefined;
     session.pendingWifiClientSearch = undefined;
     session.pendingWifiChange = undefined;
+    session.monitorClientFlowMode = undefined;
+    session.pendingMonitorClientSearch = undefined;
+    session.pendingMonitorClient = undefined;
+    session.monitorGraphType = undefined;
 
     await saveChatContext(session, activeSessionId);
-  } else if (session?.activeChatContextId !== activeSessionId) {
-    await loadChatContext(session, activeSessionId);
+  } else {
+    const existingSession = await sessionRepo.findOne({
+      where: { id: Number(activeSessionId), userId: Number(userId), deletedByUserAt: IsNull() }
+    });
+    if (!existingSession) return res.status(404).json({ error: 'session_not_found' });
+
+    if (Number(session?.activeChatContextId) !== Number(activeSessionId)) {
+      await loadChatContext(session, Number(activeSessionId));
+    }
   }
 
   // 2. Manejo de Imagen: Guardar físicamente
@@ -1497,11 +2095,31 @@ export async function respond(req: any, res: any) {
   // --- DETECCIÓN DE ACCIÓN DE REFRESCO (CAMBIO NUEVO) ---
   const lower = (content || '').toLowerCase().trim();
 
+  const monitorRefreshByText = /^monitoreo\s+(refresh|resync|grafico|gr[aá]fico|periodo|per[ií]odo)\b/i.test(lower);
+  const wifiSignalRefreshByText = /^wifi\s+signal\s+refresh\b/i.test(lower);
+  const monitorRefreshByActions = Array.isArray(req.body.actions) && req.body.actions.some((a: any) => {
+    const id = String(a?.id || '').toLowerCase();
+    const value = String(a?.value || a?.payload || '').toLowerCase();
+    if (id.startsWith('monitor_graph')) return true;
+    if (['monitor_refresh', 'monitor-refresh', 'monitor_resync', 'monitor-resync'].includes(id)) return true;
+    return /^monitoreo\s+(refresh|resync|grafico|gr[aá]fico|periodo|per[ií]odo)\b/i.test(value);
+  });
+  const wifiSignalRefreshByActions = Array.isArray(req.body.actions) && req.body.actions.some((a: any) => {
+    const id = String(a?.id || '').toLowerCase();
+    const value = String(a?.value || a?.payload || '').toLowerCase();
+    if (['wifi_signal_refresh', 'wifi-signal-refresh'].includes(id)) return true;
+    return /^wifi\s+signal\s+refresh\b/i.test(value);
+  });
+
   // Detectamos si el payload o el contenido indican una acción de actualizar tabla
   const isRefreshAction =
     ['auth refresh onu-list', 'change refresh onu-list', 'instalaciones sync', 'sync instalaciones', 'refresh'].includes(lower) ||
+    monitorRefreshByText ||
+    wifiSignalRefreshByText ||
+    monitorRefreshByActions ||
+    wifiSignalRefreshByActions ||
     (Array.isArray(req.body.actions) && req.body.actions.some((a: any) =>
-      ['refresh', 'instalaciones sync', 'auth refresh onu-list', 'change refresh onu-list'].includes(a.value || a.payload)
+      ['refresh', 'instalaciones sync', 'auth refresh onu-list', 'change refresh onu-list', 'wifi signal refresh'].includes(a.value || a.payload)
     ));
 
   // --- DETECTAR Y GUARDAR FORMULARIOS ---
@@ -1630,8 +2248,230 @@ export async function respond(req: any, res: any) {
         assistantMetadata = null;
       }
 
+      // --- CLIENT MONITOR FLOW: START ---
+      if (/(monitoreo\s+cliente|monitor(?:eo)?\s+cliente)/i.test(lower) && !/(buscar|select|seleccionar)/i.test(lower)) {
+        session.monitorClientFlowMode = true;
+        session.pendingMonitorClientSearch = true;
+        session.pendingMonitorClient = undefined;
+        session.monitorGraphType = 'daily';
+        session.changeOnuFlowMode = false;
+        session.pendingChangeOnuClientSearch = false;
+        session.pendingChangeOnu = undefined;
+        session.wifiFlowMode = false;
+        session.pendingWifiClientSearch = false;
+        session.pendingWifiChange = undefined;
+        session.lastContextType = 'monitor-client-search';
+        finalContent = 'Perfecto. Ingresa el nombre completo y/o el RUT para buscar al cliente en monitoreo.';
+        actionsOut = buildMonitorClientSearchActions();
+      }
+      // --- CLIENT MONITOR FLOW: SEARCH ---
+      else if (lower.startsWith('monitoreo buscar') || (session.pendingMonitorClientSearch && (collected?.monitor_search_fullname || collected?.monitor_search_rut))) {
+        const nameMatch = prompt.match(/nombre\s+(.+?)(?=\s+rut|$)/i);
+        const rutMatch = prompt.match(/rut\s+([^\s]+)/i);
+
+        let fullName = (collected?.monitor_search_fullname || nameMatch?.[1] || '').trim();
+        let rut = (collected?.monitor_search_rut || rutMatch?.[1] || '').trim();
+
+        if (fullName.includes('{monitor_search_fullname}')) fullName = '';
+        if (rut.includes('{monitor_search_rut}')) rut = '';
+
+        if (!fullName && !rut) {
+          finalContent = 'Ingresa nombre completo y/o RUT para buscar al cliente.';
+          actionsOut = buildMonitorClientSearchActions();
+          session.pendingMonitorClientSearch = true;
+          session.monitorClientFlowMode = true;
+        } else {
+          const clients = await findClientsByNameRutWithSync(fullName, rut);
+          session.pendingMonitorClientSearch = false;
+          session.monitorClientFlowMode = true;
+          if (!session.monitorGraphType) session.monitorGraphType = 'daily';
+          session.lastContextType = 'monitor-client-search';
+
+          if (clients.length) {
+            const fmt = formatEntityList(clients, 'client');
+            const table = buildClientsTable(clients);
+            finalContent = `📡 **Monitoreo Cliente**\n\nResultados para "${[fullName, rut].filter(Boolean).join(' / ') || 'búsqueda'}":\n\n${table}`;
+            actionsOut = fmt.actions.map(a => ({
+              ...a,
+              payload: String(a.payload || '').trim() + ' monitor'
+            }));
+          } else {
+            finalContent = 'No encontré clientes con esos datos. Intenta nuevamente.';
+            actionsOut = buildMonitorClientSearchActions();
+            session.pendingMonitorClientSearch = true;
+          }
+        }
+      }
+      // --- CLIENT MONITOR FLOW: CHANGE GRAPH PERIOD ---
+      else if (lower.startsWith('monitoreo grafico') || lower.startsWith('monitoreo gráfico') || lower.startsWith('monitoreo periodo') || lower.startsWith('monitoreo período') || pickActionValue(req.body?.actions, ['monitor_graph_hourly', 'monitor_graph_daily', 'monitor_graph_weekly', 'monitor_graph_monthly', 'monitor_graph_yearly'])) {
+        const actionGraph = pickActionValue(req.body?.actions, ['monitor_graph_hourly', 'monitor_graph_daily', 'monitor_graph_weekly', 'monitor_graph_monthly', 'monitor_graph_yearly']);
+        const source = String(actionGraph || prompt || '');
+        const graphMatch = source.match(/(?:grafico|gr[aá]fico|periodo|per[ií]odo)\s+(hourly|daily|weekly|monthly|yearly)/i);
+        const graphType = normalizeMonitorGraphType(graphMatch?.[1] || session?.monitorGraphType || 'daily');
+        const onuExternalId = (source.match(/(?:hourly|daily|weekly|monthly|yearly)\s+([^\s]+)/i)?.[1] || session?.pendingMonitorClient?.onuExternalId || '').trim();
+
+        if (!onuExternalId) {
+          finalContent = '⚠️ No tengo el ID de ONU para cambiar el período del gráfico. Vuelve a seleccionar el cliente en monitoreo.';
+          actionsOut = buildMonitorPanelActions();
+        } else {
+          session.monitorGraphType = graphType;
+          const monitor = await loadMonitorSmartoltData(onuExternalId, graphType);
+          let selected = session?.pendingMonitorClient || {};
+          if (selected?.clientIdServicio) {
+            const clientApiPayload = await getClientByServiceId(selected.clientIdServicio).catch(() => null);
+            const wisphubSummary = extractMonitorWisphubSummary(selected, clientApiPayload || undefined);
+            selected = { ...selected, ...wisphubSummary };
+            session.pendingMonitorClient = { ...(session.pendingMonitorClient || {}), ...wisphubSummary };
+          }
+          const graphSection = buildMonitorGraphsSection(monitor);
+          const apiWarnings = monitor.failedApis.length ? `\n\n⚠️ APIs con error: ${monitor.failedApis.join(' | ')}` : '';
+          const lastInvoiceLabel = selected.lastInvoiceDate
+            ? `${selected.lastInvoiceDate}${selected.lastInvoicePaid ? ` (${selected.lastInvoicePaid})` : ''}`
+            : (selected.lastInvoicePaid || 'N/D');
+
+          finalContent = `📡 **Panel Monitoreo SmartOLT**\n\n👤 **Cliente:** ${selected.clientName || 'N/D'}\n🆔 **Servicio:** ${selected.clientIdServicio || 'N/D'}\n🌍 **IP:** ${selected.ip || 'N/D'}\n🛰️ **Estado WispHub:** ${selected.wisphubServiceStatus || 'N/D'}\n💳 **Última factura:** ${lastInvoiceLabel}\n🔢 **ONU External ID:** ${onuExternalId}\n🗂️ **Período gráficos:** ${monitorGraphTypeLabel(graphType)}\n📶 **Estado ONU:** ${monitor.statusSummary}\n⏱️ **Tiempo en línea:** ${monitor.onlineUptime || 'N/D'}\n📏 **Distancia ONU-OLT:** ${monitor.distanceOltOnu || 'N/D'}\n📥 **RX:** ${monitor.rx}\n📤 **TX:** ${monitor.tx}${graphSection}${apiWarnings}`;
+          actionsOut = buildMonitorPanelActions(onuExternalId);
+          assistantMetadata = {
+            flow: 'monitor-client',
+            monitor: {
+              ...selected,
+              onuExternalId,
+              graphType,
+              refreshedAt: new Date().toISOString(),
+              statusSummary: monitor.statusSummary,
+              rx: monitor.rx,
+              tx: monitor.tx,
+              distanceOltOnu: monitor.distanceOltOnu,
+              onlineUptime: monitor.onlineUptime,
+              signalValue: monitor.signalValue,
+              signal1310: monitor.signal1310,
+              signal1490: monitor.signal1490,
+              runningConfig: monitor.runningConfig,
+              fullStatusInfo: monitor.fullStatusInfo,
+              signalGraphUrl: monitor.signalGraphUrl,
+              trafficGraphUrl: monitor.trafficGraphUrl,
+              smartolt: monitor.raw,
+              failedApis: monitor.failedApis
+            }
+          };
+        }
+      }
+      // --- CLIENT MONITOR FLOW: REFRESH PANEL ---
+      else if (lower.startsWith('monitoreo refresh') || pickActionValue(req.body?.actions, ['monitor_refresh', 'monitor-refresh'])) {
+        const actionRefresh = pickActionValue(req.body?.actions, ['monitor_refresh', 'monitor-refresh']);
+        const source = String(actionRefresh || prompt || '');
+        const onuExternalId = (source.match(/refresh\s+([^\s]+)/i)?.[1] || session?.pendingMonitorClient?.onuExternalId || '').trim();
+
+        if (!onuExternalId) {
+          finalContent = '⚠️ No tengo el ID de ONU para refrescar monitoreo. Vuelve a seleccionar el cliente en el flujo de monitoreo.';
+          actionsOut = buildMonitorPanelActions();
+        } else {
+          const graphType = normalizeMonitorGraphType(session?.monitorGraphType || 'daily');
+          const monitor = await loadMonitorSmartoltData(onuExternalId, graphType);
+          let selected = session?.pendingMonitorClient || {};
+          if (selected?.clientIdServicio) {
+            const clientApiPayload = await getClientByServiceId(selected.clientIdServicio).catch(() => null);
+            const wisphubSummary = extractMonitorWisphubSummary(selected, clientApiPayload || undefined);
+            selected = { ...selected, ...wisphubSummary };
+            session.pendingMonitorClient = { ...(session.pendingMonitorClient || {}), ...wisphubSummary };
+          }
+          const graphSection = buildMonitorGraphsSection(monitor);
+          const apiWarnings = monitor.failedApis.length ? `\n\n⚠️ APIs con error: ${monitor.failedApis.join(' | ')}` : '';
+          const lastInvoiceLabel = selected.lastInvoiceDate
+            ? `${selected.lastInvoiceDate}${selected.lastInvoicePaid ? ` (${selected.lastInvoicePaid})` : ''}`
+            : (selected.lastInvoicePaid || 'N/D');
+
+          finalContent = `📡 **Panel Monitoreo SmartOLT**\n\n👤 **Cliente:** ${selected.clientName || 'N/D'}\n🆔 **Servicio:** ${selected.clientIdServicio || 'N/D'}\n🌍 **IP:** ${selected.ip || 'N/D'}\n🛰️ **Estado WispHub:** ${selected.wisphubServiceStatus || 'N/D'}\n💳 **Última factura:** ${lastInvoiceLabel}\n🔢 **ONU External ID:** ${onuExternalId}\n🗂️ **Período gráficos:** ${monitorGraphTypeLabel(graphType)}\n📶 **Estado ONU:** ${monitor.statusSummary}\n⏱️ **Tiempo en línea:** ${monitor.onlineUptime || 'N/D'}\n📏 **Distancia ONU-OLT:** ${monitor.distanceOltOnu || 'N/D'}\n📥 **RX:** ${monitor.rx}\n📤 **TX:** ${monitor.tx}${graphSection}${apiWarnings}`;
+          actionsOut = buildMonitorPanelActions(onuExternalId);
+          assistantMetadata = {
+            flow: 'monitor-client',
+            monitor: {
+              ...selected,
+              onuExternalId,
+              graphType,
+              refreshedAt: new Date().toISOString(),
+              statusSummary: monitor.statusSummary,
+              rx: monitor.rx,
+              tx: monitor.tx,
+              distanceOltOnu: monitor.distanceOltOnu,
+              onlineUptime: monitor.onlineUptime,
+              signalValue: monitor.signalValue,
+              signal1310: monitor.signal1310,
+              signal1490: monitor.signal1490,
+              runningConfig: monitor.runningConfig,
+              fullStatusInfo: monitor.fullStatusInfo,
+              signalGraphUrl: monitor.signalGraphUrl,
+              trafficGraphUrl: monitor.trafficGraphUrl,
+              smartolt: monitor.raw,
+              failedApis: monitor.failedApis
+            }
+          };
+        }
+      }
+      // --- CLIENT MONITOR FLOW: RESYNC ONU ---
+      else if (lower.startsWith('monitoreo resync') || pickActionValue(req.body?.actions, ['monitor_resync', 'monitor-resync'])) {
+        const actionResync = pickActionValue(req.body?.actions, ['monitor_resync', 'monitor-resync']);
+        const source = String(actionResync || prompt || '');
+        const onuExternalId = (source.match(/resync\s+([^\s]+)/i)?.[1] || session?.pendingMonitorClient?.onuExternalId || '').trim();
+
+        if (!onuExternalId) {
+          finalContent = '⚠️ No tengo el ID de ONU para ejecutar resync. Vuelve a seleccionar el cliente en monitoreo.';
+          actionsOut = buildMonitorPanelActions();
+        } else {
+          const resyncResult = await resyncOnuConfigByExternalId(onuExternalId).catch((e: any) => ({ error: e?.message || 'error' }));
+          const graphType = normalizeMonitorGraphType(session?.monitorGraphType || 'daily');
+          const monitor = await loadMonitorSmartoltData(onuExternalId, graphType);
+          let selected = session?.pendingMonitorClient || {};
+          if (selected?.clientIdServicio) {
+            const clientApiPayload = await getClientByServiceId(selected.clientIdServicio).catch(() => null);
+            const wisphubSummary = extractMonitorWisphubSummary(selected, clientApiPayload || undefined);
+            selected = { ...selected, ...wisphubSummary };
+            session.pendingMonitorClient = { ...(session.pendingMonitorClient || {}), ...wisphubSummary };
+          }
+          const failedResync = !!(resyncResult && (resyncResult as any).error);
+          const resyncLine = failedResync
+            ? `❌ **Resync:** ${(resyncResult as any).error}`
+            : `✅ **Resync ejecutado** para ONU ${onuExternalId}`;
+          const graphSection = buildMonitorGraphsSection(monitor);
+          const apiWarnings = monitor.failedApis.length ? `\n\n⚠️ APIs con error: ${monitor.failedApis.join(' | ')}` : '';
+          const lastInvoiceLabel = selected.lastInvoiceDate
+            ? `${selected.lastInvoiceDate}${selected.lastInvoicePaid ? ` (${selected.lastInvoicePaid})` : ''}`
+            : (selected.lastInvoicePaid || 'N/D');
+
+          finalContent = `📡 **Panel Monitoreo SmartOLT**\n\n${resyncLine}\n\n👤 **Cliente:** ${selected.clientName || 'N/D'}\n🆔 **Servicio:** ${selected.clientIdServicio || 'N/D'}\n🌍 **IP:** ${selected.ip || 'N/D'}\n🛰️ **Estado WispHub:** ${selected.wisphubServiceStatus || 'N/D'}\n💳 **Última factura:** ${lastInvoiceLabel}\n🔢 **ONU External ID:** ${onuExternalId}\n🗂️ **Período gráficos:** ${monitorGraphTypeLabel(graphType)}\n📶 **Estado ONU:** ${monitor.statusSummary}\n⏱️ **Tiempo en línea:** ${monitor.onlineUptime || 'N/D'}\n📏 **Distancia ONU-OLT:** ${monitor.distanceOltOnu || 'N/D'}\n📥 **RX:** ${monitor.rx}\n📤 **TX:** ${monitor.tx}${graphSection}${apiWarnings}`;
+          actionsOut = buildMonitorPanelActions(onuExternalId);
+          assistantMetadata = {
+            flow: 'monitor-client',
+            monitor: {
+              ...selected,
+              onuExternalId,
+              graphType,
+              refreshedAt: new Date().toISOString(),
+              resyncResult,
+              statusSummary: monitor.statusSummary,
+              rx: monitor.rx,
+              tx: monitor.tx,
+              distanceOltOnu: monitor.distanceOltOnu,
+              onlineUptime: monitor.onlineUptime,
+              signalValue: monitor.signalValue,
+              signal1310: monitor.signal1310,
+              signal1490: monitor.signal1490,
+              runningConfig: monitor.runningConfig,
+              fullStatusInfo: monitor.fullStatusInfo,
+              signalGraphUrl: monitor.signalGraphUrl,
+              trafficGraphUrl: monitor.trafficGraphUrl,
+              smartolt: monitor.raw,
+              failedApis: monitor.failedApis
+            }
+          };
+        }
+      }
       // --- CHANGE ONU FLOW: START ---
-      if (/(cambiar\s+onu|cambio\s+onu|cambio\s+de\s+onu)/i.test(lower) && !/(buscar|submit)/i.test(lower)) {
+      else if (/(cambiar\s+onu|cambio\s+onu|cambio\s+de\s+onu)/i.test(lower) && !/(buscar|submit)/i.test(lower)) {
+        session.monitorClientFlowMode = false;
+        session.pendingMonitorClientSearch = false;
+        session.pendingMonitorClient = undefined;
+        session.monitorGraphType = undefined;
         session.changeOnuFlowMode = true;
         session.pendingChangeOnuClientSearch = true;
         session.pendingChangeOnu = { stage: 'search' };
@@ -1644,6 +2484,10 @@ export async function respond(req: any, res: any) {
       }
       // --- CHANGE WIFI FLOW: START ---
       else if (/(cambiar\s+wifi|cambio\s+wifi|cambiar\s+clave\s+wifi|cambiar\s+contrase(n|ñ)a\s+wifi|cambiar\s+password\s+wifi)/i.test(lower) && !/(buscar|submit|apply)/i.test(lower)) {
+        session.monitorClientFlowMode = false;
+        session.pendingMonitorClientSearch = false;
+        session.pendingMonitorClient = undefined;
+        session.monitorGraphType = undefined;
         session.wifiFlowMode = true;
         session.pendingWifiClientSearch = true;
         session.pendingWifiChange = { stage: 'search' };
@@ -1842,6 +2686,74 @@ export async function respond(req: any, res: any) {
           }
         }
       }
+      else if (lower.startsWith('wifi signal refresh') || pickActionValue(req.body?.actions, ['wifi_signal_refresh', 'wifi-signal-refresh'])) {
+        const actionWifiSignalRefresh = pickActionValue(req.body?.actions, ['wifi_signal_refresh', 'wifi-signal-refresh']);
+        const source = String(actionWifiSignalRefresh || prompt || '');
+        const snMatch = source.match(/sn\s+([a-zA-Z0-9]+)/i);
+        const sn = ((snMatch ? snMatch[1] : null) || session.lastSelectedOnuSn || '').toString().trim().toUpperCase();
+
+        if (!sn) {
+          finalContent = '⚠️ No tengo el SN de la ONU para refrescar la señal. Vuelve a aplicar WiFi o indica el SN.';
+          actionsOut = [];
+        } else {
+          try {
+            const signalCheck = await loadWifiSignalCheckBySn(sn);
+            const qualitySuffix = signalCheck.quality.detail ? ` (${signalCheck.quality.detail})` : '';
+            finalContent = `📶 **Verificación señal post-WiFi**\n\n🧾 **SN:** ${signalCheck.sn}\n🔢 **ONU External ID:** ${signalCheck.onuExternalId}\n📡 **Señal ONU/OLT Rx:** ${signalCheck.signalLine}\n🏷️ **Calidad señal:** ${signalCheck.quality.tone} ${signalCheck.quality.label}${qualitySuffix}\n📶 **Estado ONU:** ${signalCheck.monitor.statusSummary}\n⏱️ **Tiempo en línea:** ${signalCheck.monitor.onlineUptime || 'N/D'}\n📏 **Distancia ONU-OLT:** ${signalCheck.monitor.distanceOltOnu || 'N/D'}\n📤 **TX:** ${signalCheck.monitor.tx}`;
+            actionsOut = buildWifiSignalRefreshActions(signalCheck.sn);
+            session.lastSelectedOnuSn = signalCheck.sn;
+          } catch (err: any) {
+            finalContent = `⚠️ No se pudo refrescar la señal de la ONU ${sn}: ${err?.message || 'error desconocido'}`;
+            actionsOut = buildWifiSignalRefreshActions(sn);
+            session.lastSelectedOnuSn = sn;
+          }
+
+          const targetId = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
+          const isPyme = await resolveIsPyme(session, targetId);
+          let planText = session.lastSelectedPlan || session.pendingAuth?.defaults?.name;
+          let planIsPyme = isPyme || (planText ? isPymeText(planText) : false);
+
+          if (!planIsPyme && targetId) {
+            try {
+              const instRepo = AppDataSource.getRepository(Installation);
+              const inst = await instRepo.findOne({ where: [{ id: Number(targetId) }, { id_servicio: Number(targetId) }] });
+              const instPlan = inst?.plan_internet || inst?.servicio || pickPlanFromRaw(inst?.raw);
+              if (instPlan) {
+                planText = instPlan;
+                session.lastSelectedPlan = instPlan;
+                planIsPyme = isPymeText(instPlan);
+              }
+            } catch (err) {
+              console.error('Error obteniendo plan (Installation) para PYME:', err);
+            }
+
+            if (!planIsPyme) {
+              try {
+                const clientRepo = AppDataSource.getRepository(Client);
+                const client = await clientRepo.findOne({ where: { id_servicio: Number(targetId) } });
+                const clientPlan = client?.plan_internet || client?.servicio || pickPlanFromRaw(client?.raw);
+                if (clientPlan) {
+                  planText = clientPlan;
+                  session.lastSelectedPlan = clientPlan;
+                  planIsPyme = isPymeText(clientPlan);
+                }
+              } catch (err) {
+                console.error('Error obteniendo plan (Client) para PYME:', err);
+              }
+            }
+          }
+
+          if (targetId) {
+            if (planIsPyme) {
+              actionsOut.push({ id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` });
+              finalContent += `\n\n👇 Acciones post-instalación (PYME) para ID ${targetId}:`;
+            } else {
+              actionsOut.push({ id: 'btn-contrato', type: 'button', label: '📄 Generar Contrato y Activar en WispHub', payload: `generar contrato activar ${targetId}` });
+              finalContent += `\n\n👇 Acciones post-instalación para ID ${targetId}:`;
+            }
+          }
+        }
+      }
       // --- WIFI APPLY ---
       else if (lower.startsWith('wifi apply') || pickActionValue(req.body?.actions, ['wifi-apply', 'wifi_apply', 'wifi apply', 'wifi_apply_action'])) {
         const actionWifi = pickActionValue(req.body?.actions, ['wifi-apply', 'wifi_apply', 'wifi apply', 'wifi_apply_action']);
@@ -1871,6 +2783,19 @@ export async function respond(req: any, res: any) {
 
               finalContent = `📡 Resultado WiFi (SN: ${sn}):\nSSID: ${ssid}\nClave: ${pass}\n\n${results.join('\n')}`;
               actionsOut = [];
+              session.lastSelectedOnuSn = String(sn).trim().toUpperCase();
+
+              try {
+                const signalCheck = await loadWifiSignalCheckBySn(String(sn));
+                const qualitySuffix = signalCheck.quality.detail ? ` (${signalCheck.quality.detail})` : '';
+                finalContent += `\n\n📶 **Señal ONU autorizada:** ${signalCheck.signalLine}\n🏷️ **Calidad señal:** ${signalCheck.quality.tone} ${signalCheck.quality.label}${qualitySuffix}\n🔢 **ONU External ID:** ${signalCheck.onuExternalId}`;
+                actionsOut.push(...buildWifiSignalRefreshActions(signalCheck.sn));
+                session.lastSelectedOnuSn = signalCheck.sn;
+              } catch (signalErr: any) {
+                finalContent += `\n\n⚠️ No se pudo obtener señal de la ONU ahora mismo: ${signalErr?.message || 'error desconocido'}`;
+                actionsOut.push(...buildWifiSignalRefreshActions(String(sn)));
+              }
+
               const targetId = session.lastSelectedClientIdServicio || session.lastSelectedInstallationId;
               const isPyme = await resolveIsPyme(session, targetId);
               let planText = session.lastSelectedPlan || session.pendingAuth?.defaults?.name;
@@ -1909,7 +2834,17 @@ export async function respond(req: any, res: any) {
               if (targetId) {
                 // Evitar mostrar acciones post-instalación si estamos en flujo explícito
                 // de cambio WiFi o cambio de ONU (evita confusión y colisiones de flujo).
-                const skipPostActions = !!(session?.wifiFlowMode || session?.changeOnuFlowMode || session?.pendingWifiChange || session?.pendingChangeOnu || String(session?.lastContextType || '').toLowerCase().includes('wifi') || String(session?.lastContextType || '').toLowerCase().includes('onu'));
+                const skipPostActions = !!(
+                  session?.wifiFlowMode ||
+                  session?.changeOnuFlowMode ||
+                  session?.monitorClientFlowMode ||
+                  session?.pendingWifiChange ||
+                  session?.pendingChangeOnu ||
+                  session?.pendingMonitorClient ||
+                  String(session?.lastContextType || '').toLowerCase().includes('wifi') ||
+                  String(session?.lastContextType || '').toLowerCase().includes('onu') ||
+                  String(session?.lastContextType || '').toLowerCase().includes('monitor')
+                );
                 if (!skipPostActions) {
                   if (planIsPyme) {
                     actionsOut.push({ id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` });
@@ -2369,10 +3304,13 @@ export async function respond(req: any, res: any) {
           if (hit) {
             // derive a string similar to previous payloads: prefer explicit value/payload, otherwise use id
             rawActionSelect = String(hit.value || hit.payload || hit.id || '').trim();
-            // if payload contains wifi marker, ensure context reflects wifi-client-search
+            // if payload contains flow marker, ensure context reflects source flow
             try {
-              if (String(hit.value || hit.payload || '').toLowerCase().includes('wifi')) {
+              const rawPayload = String(hit.value || hit.payload || '').toLowerCase();
+              if (rawPayload.includes('wifi')) {
                 (req.session ||= {}).lastContextType = 'wifi-client-search';
+              } else if (rawPayload.includes('monitor')) {
+                (req.session ||= {}).lastContextType = 'monitor-client-search';
               }
             } catch (e) { /* ignore */ }
           }
@@ -2409,6 +3347,7 @@ export async function respond(req: any, res: any) {
           try {
             console.log('[select-client] entity id:', entity?.id_servicio || entity?.id || 'N/A');
             console.log('[select-client] session flags:', {
+              monitorClientFlowMode: !!session.monitorClientFlowMode,
               changeOnuFlowMode: !!session.changeOnuFlowMode,
               wifiFlowMode: !!session.wifiFlowMode,
               pendingChangeOnu: !!session.pendingChangeOnu,
@@ -2437,7 +3376,103 @@ export async function respond(req: any, res: any) {
           const sessionTitle = `${displayName || 'Cliente'} - ${dateLabel}`;
           await sessionRepo.update({ id: Number(activeSessionId), userId: Number(userId) }, { title: sessionTitle });
 
-          if (isClient && (session.changeOnuFlowMode || session.lastContextType === 'change-onu-client-search' || session.pendingChangeOnu || session.pendingChangeOnuClientSearch)) {
+          if (isClient && (session.monitorClientFlowMode || session.lastContextType === 'monitor-client-search' || session.pendingMonitorClientSearch)) {
+            session.pendingMonitorClientSearch = false;
+            session.monitorClientFlowMode = false;
+            session.lastContextType = 'monitor-client-selected';
+
+            const rut = entity.cedula || entity.rut || 'N/A';
+            const plan = entity.plan_internet || entity.servicio || 'Plan desconocido';
+            const ip = entity.ipv4_address || entity.ip || entity.ip_cliente || entity.ip_publica || undefined;
+            const smartoltName = entity.servicio || displayName || `Cliente ${serviceId}`;
+            const clientApiPayload = await getClientByServiceId(serviceId).catch(() => null);
+            const wisphubSummary = extractMonitorWisphubSummary(entity, clientApiPayload || undefined);
+            const lastInvoiceLabel = wisphubSummary.lastInvoiceDate
+              ? `${wisphubSummary.lastInvoiceDate}${wisphubSummary.lastInvoicePaid ? ` (${wisphubSummary.lastInvoicePaid})` : ''}`
+              : (wisphubSummary.lastInvoicePaid || 'N/D');
+
+            let detail: any = null;
+            try {
+              detail = await findOnuDetailByServiceName(smartoltName, ip);
+            } catch (err) {
+              console.error('Error resolviendo smartolt_onu_detail para monitoreo:', err);
+            }
+
+            const onuExternalId = resolveOnuExternalIdFromDetail(detail);
+            const snapshotSn = pickFirstString([detail?.sn, detail?.payload?.sn, detail?.payload?.serial, detail?.payload?.onu_sn]);
+            const snapshotAt = detail?.capturedAt ? new Date(detail.capturedAt).toLocaleString('es-CL') : 'N/D';
+
+            session.pendingMonitorClient = {
+              clientIdServicio: serviceId,
+              clientName: displayName || `Cliente ${serviceId}`,
+              ip: ip || 'N/D',
+              smartoltName,
+              onuExternalId: onuExternalId || undefined,
+              wisphubServiceStatus: wisphubSummary.wisphubServiceStatus,
+              lastInvoiceDate: wisphubSummary.lastInvoiceDate,
+              lastInvoicePaid: wisphubSummary.lastInvoicePaid
+            };
+
+            if (!onuExternalId) {
+              finalContent = `📡 **Monitoreo Cliente**\n\n✅ Cliente seleccionado: **${displayName || 'Cliente'}** [ID: ${serviceId}]\n🪪 **RUT:** ${rut}\n🚀 **Plan:** ${plan}\n🌍 **IP:** ${ip || 'N/D'}\n🛰️ **Estado WispHub:** ${wisphubSummary.wisphubServiceStatus || 'N/D'}\n💳 **Última factura:** ${lastInvoiceLabel}\n\n⚠️ No encontré **ONU External ID** en \`smartolt_onu_detail\` para esa IP.\n💾 Último snapshot: SN ${snapshotSn || 'N/D'} | Capturado: ${snapshotAt}`;
+              actionsOut = buildMonitorPanelActions();
+              assistantMetadata = {
+                flow: 'monitor-client',
+                monitor: {
+                  clientIdServicio: serviceId,
+                  clientName: displayName || `Cliente ${serviceId}`,
+                  rut,
+                  plan,
+                  ip: ip || 'N/D',
+                  wisphubServiceStatus: wisphubSummary.wisphubServiceStatus,
+                  lastInvoiceDate: wisphubSummary.lastInvoiceDate,
+                  lastInvoicePaid: wisphubSummary.lastInvoicePaid,
+                  snapshot: detail || null,
+                  onuExternalId: null
+                }
+              };
+            } else {
+              const graphType = normalizeMonitorGraphType(session?.monitorGraphType || 'daily');
+              session.monitorGraphType = graphType;
+              const monitor = await loadMonitorSmartoltData(onuExternalId, graphType);
+              const graphSection = buildMonitorGraphsSection(monitor);
+              const apiWarnings = monitor.failedApis.length ? `\n\n⚠️ APIs con error: ${monitor.failedApis.join(' | ')}` : '';
+
+              finalContent = `📡 **Panel Monitoreo SmartOLT**\n\n✅ Cliente seleccionado: **${displayName || 'Cliente'}** [ID: ${serviceId}]\n🪪 **RUT:** ${rut}\n🚀 **Plan:** ${plan}\n🌍 **IP:** ${ip || 'N/D'}\n🛰️ **Estado WispHub:** ${wisphubSummary.wisphubServiceStatus || 'N/D'}\n💳 **Última factura:** ${lastInvoiceLabel}\n🔢 **ONU External ID:** ${onuExternalId}\n🧾 **SN:** ${snapshotSn || 'N/D'}\n🗂️ **Período gráficos:** ${monitorGraphTypeLabel(graphType)}\n📶 **Estado ONU:** ${monitor.statusSummary}\n⏱️ **Tiempo en línea:** ${monitor.onlineUptime || 'N/D'}\n📏 **Distancia ONU-OLT:** ${monitor.distanceOltOnu || 'N/D'}\n📥 **RX:** ${monitor.rx}\n📤 **TX:** ${monitor.tx}${graphSection}${apiWarnings}`;
+              actionsOut = buildMonitorPanelActions(onuExternalId);
+              assistantMetadata = {
+                flow: 'monitor-client',
+                monitor: {
+                  clientIdServicio: serviceId,
+                  clientName: displayName || `Cliente ${serviceId}`,
+                  rut,
+                  plan,
+                  ip: ip || 'N/D',
+                  wisphubServiceStatus: wisphubSummary.wisphubServiceStatus,
+                  lastInvoiceDate: wisphubSummary.lastInvoiceDate,
+                  lastInvoicePaid: wisphubSummary.lastInvoicePaid,
+                  smartoltName,
+                  onuExternalId,
+                  graphType,
+                  statusSummary: monitor.statusSummary,
+                  rx: monitor.rx,
+                  tx: monitor.tx,
+                  distanceOltOnu: monitor.distanceOltOnu,
+                  onlineUptime: monitor.onlineUptime,
+                  signalValue: monitor.signalValue,
+                  signal1310: monitor.signal1310,
+                  signal1490: monitor.signal1490,
+                  runningConfig: monitor.runningConfig,
+                  fullStatusInfo: monitor.fullStatusInfo,
+                  snapshot: detail || null,
+                  signalGraphUrl: monitor.signalGraphUrl,
+                  trafficGraphUrl: monitor.trafficGraphUrl,
+                  smartolt: monitor.raw,
+                  failedApis: monitor.failedApis
+                }
+              };
+            }
+          } else if (isClient && (session.changeOnuFlowMode || session.lastContextType === 'change-onu-client-search' || session.pendingChangeOnu || session.pendingChangeOnuClientSearch)) {
             // CHANGE-ONU flow: prepare pendingChangeOnu and show unconfigured ONUs table
             session.pendingChangeOnuClientSearch = false;
             console.log('[select-client] chosen-flow: change-onu');
@@ -3072,7 +4107,19 @@ export async function submitAuth(req: any, res: any) {
   if (!userId) return res.status(401).json({ error: 'unauthenticated' });
 
   // Extraemos sessionId del request body
-  const sessionId = req.body.sessionId;
+  const sessionId = req.body.sessionId ? Number(req.body.sessionId) : undefined;
+
+  if (req.body.sessionId && (!Number.isFinite(sessionId) || Number(sessionId) <= 0)) {
+    return res.status(400).json({ error: 'invalid_session_id' });
+  }
+
+  if (sessionId) {
+    const sessionRepo = AppDataSource.getRepository(ChatSession);
+    const ownedSession = await sessionRepo.findOne({
+      where: { id: Number(sessionId), userId: Number(userId), deletedByUserAt: IsNull() }
+    });
+    if (!ownedSession) return res.status(404).json({ error: 'session_not_found' });
+  }
 
   if (sessionId && session?.activeChatContextId !== Number(sessionId)) {
     await loadChatContext(session, Number(sessionId));
@@ -3236,21 +4283,148 @@ export async function listUserMessages(req: any, res: any) {
     const userId = Number(req.params.userId);
     if (!userId) return res.status(400).json({ error: 'User ID required' });
 
-    const repo = AppDataSource.getRepository(ChatMessage);
-    const messages = await repo.find({
+    const msgRepo = AppDataSource.getRepository(ChatMessage);
+    const sessionRepo = AppDataSource.getRepository(ChatSession);
+
+    const messages = await msgRepo.find({
       where: { userId: userId },
       order: { createdAt: 'ASC' }
     });
 
-    return res.json({ messages });
+    const sessions = await sessionRepo.find({
+      where: { userId: userId },
+      order: { createdAt: 'DESC' }
+    });
+
+    const bySession = new Map<number | null, any[]>();
+    for (const m of messages) {
+      const key = m.sessionId === null || m.sessionId === undefined ? null : Number(m.sessionId);
+      if (!bySession.has(key)) bySession.set(key, []);
+      bySession.get(key)!.push(m);
+    }
+
+    const sessionItems: any[] = sessions.map((s) => {
+      const sessionMessages = bySession.get(Number(s.id)) || [];
+      const lastMessageAt = sessionMessages.length
+        ? sessionMessages[sessionMessages.length - 1].createdAt
+        : s.createdAt;
+
+      return {
+        sessionId: s.id,
+        title: s.title || `Sesión ${s.id}`,
+        createdAt: s.createdAt,
+        deletedByUserAt: s.deletedByUserAt || null,
+        messageCount: sessionMessages.length,
+        lastMessageAt,
+        messages: sessionMessages
+      };
+    });
+
+    const orphanMessages = bySession.get(null) || [];
+    if (orphanMessages.length) {
+      sessionItems.push({
+        sessionId: null,
+        title: 'Sesión legacy (sin sessionId)',
+        createdAt: orphanMessages[0]?.createdAt,
+        deletedByUserAt: null,
+        messageCount: orphanMessages.length,
+        lastMessageAt: orphanMessages[orphanMessages.length - 1]?.createdAt,
+        messages: orphanMessages
+      });
+    }
+
+    sessionItems.sort((a, b) => new Date(b.lastMessageAt || 0).getTime() - new Date(a.lastMessageAt || 0).getTime());
+
+    return res.json({
+      sessions: sessionItems,
+      totalSessions: sessionItems.length,
+      totalMessages: messages.length,
+      messages
+    });
   } catch (error) {
     console.error('Error fetching user messages (admin)', error);
     return res.status(500).json({ error: 'Error fetching user history' });
   }
 }
-// ... importaciones existentes ...
-import { Brackets } from 'typeorm'; // Asegúrate de importar esto de typeorm
 
+export async function listAdminUserSessions(req: any, res: any) {
+  try {
+    const userId = Number(req.params.userId);
+    if (!userId) return res.status(400).json({ error: 'User ID required' });
+
+    const sessionRepo = AppDataSource.getRepository(ChatSession);
+    const msgRepo = AppDataSource.getRepository(ChatMessage);
+
+    const sessions = await sessionRepo.find({
+      where: { userId },
+      order: { createdAt: 'DESC' },
+      take: 200
+    });
+
+    const sessionIds = sessions.map((s) => Number(s.id)).filter((id) => Number.isFinite(id));
+    let messageCountBySession = new Map<number, number>();
+
+    if (sessionIds.length) {
+      const rows = await msgRepo
+        .createQueryBuilder('msg')
+        .select('msg.sessionId', 'sessionId')
+        .addSelect('COUNT(msg.id)', 'total')
+        .where('msg.userId = :userId', { userId })
+        .andWhere('msg.sessionId IN (:...sessionIds)', { sessionIds })
+        .groupBy('msg.sessionId')
+        .getRawMany();
+
+      messageCountBySession = new Map(rows.map((r: any) => [Number(r.sessionId), Number(r.total) || 0]));
+    }
+
+    const mapped = sessions.map((s) => ({
+      id: s.id,
+      userId: s.userId,
+      title: s.title,
+      createdAt: s.createdAt,
+      deletedByUserAt: s.deletedByUserAt || null,
+      messageCount: messageCountBySession.get(Number(s.id)) || 0
+    }));
+
+    return res.json({ sessions: mapped, total: mapped.length });
+  } catch (error) {
+    console.error('Error fetching admin user sessions', error);
+    return res.status(500).json({ error: 'Error fetching user sessions' });
+  }
+}
+
+export async function getAdminUserSessionMessages(req: any, res: any) {
+  try {
+    const userId = Number(req.params.userId);
+    const sessionId = Number(req.params.sessionId);
+    if (!userId || !sessionId) return res.status(400).json({ error: 'User ID and session ID are required' });
+
+    const sessionRepo = AppDataSource.getRepository(ChatSession);
+    const msgRepo = AppDataSource.getRepository(ChatMessage);
+
+    const session = await sessionRepo.findOne({ where: { id: sessionId, userId } });
+    if (!session) return res.status(404).json({ error: 'Session not found' });
+
+    const messages = await msgRepo.find({
+      where: { userId, sessionId },
+      order: { createdAt: 'ASC' }
+    });
+
+    return res.json({
+      session: {
+        id: session.id,
+        title: session.title,
+        createdAt: session.createdAt,
+        deletedByUserAt: session.deletedByUserAt || null
+      },
+      messages,
+      messageCount: messages.length
+    });
+  } catch (error) {
+    console.error('Error fetching admin session messages', error);
+    return res.status(500).json({ error: 'Error fetching session messages' });
+  }
+}
 // -------------------------------------------------------------------------
 // BÚSQUEDA GLOBAL (Endpoint Nuevo) - MEJORADO CON RELEVANCIA Y PAGINACIÓN
 // -------------------------------------------------------------------------
@@ -3279,6 +4453,8 @@ export async function searchUserMessages(req: any, res: any) {
     const messages = await msgRepo.createQueryBuilder('msg')
       .leftJoinAndSelect('msg.session', 'session')
       .where('msg.userId = :userId', { userId })
+      .andWhere('msg.deletedByUserAt IS NULL')
+      .andWhere('(msg.sessionId IS NULL OR session.deletedByUserAt IS NULL)')
       .andWhere('LOWER(msg.content) LIKE LOWER(:query)', { query: `%${query}%` })
       .select(['msg.id', 'msg.content', 'msg.role', 'msg.createdAt', 'msg.sessionId', 'session.title'])
       .orderBy('msg.createdAt', 'DESC')
@@ -3306,7 +4482,10 @@ export async function searchUserMessages(req: any, res: any) {
 
     // Obtener total para saber si hay más resultados
     const total = await msgRepo.createQueryBuilder('msg')
+      .leftJoin('msg.session', 'session')
       .where('msg.userId = :userId', { userId })
+      .andWhere('msg.deletedByUserAt IS NULL')
+      .andWhere('(msg.sessionId IS NULL OR session.deletedByUserAt IS NULL)')
       .andWhere('LOWER(msg.content) LIKE LOWER(:query)', { query: `%${query}%` })
       .getCount();
 
@@ -3343,7 +4522,7 @@ export async function getSessionMessages(req: any, res: any) {
     // Validar que la sesión exista y pertenezca al usuario
     const sessionRepo = AppDataSource.getRepository(ChatSession);
     const session = await sessionRepo.findOne({
-      where: { id: Number(sessionId), userId: Number(userId) }
+      where: { id: Number(sessionId), userId: Number(userId), deletedByUserAt: IsNull() }
     });
 
     if (!session) {
@@ -3360,6 +4539,8 @@ export async function getSessionMessages(req: any, res: any) {
       // Usar una sola query con ranges en lugar de dos queries
       const results = await msgRepo.createQueryBuilder('msg')
         .where('msg.sessionId = :sid', { sid: sessionId })
+        .andWhere('msg.userId = :userId', { userId: Number(userId) })
+        .andWhere('msg.deletedByUserAt IS NULL')
         .andWhere('msg.id >= :minId', { minId: targetId - Math.ceil(take / 2) })
         .andWhere('msg.id <= :maxId', { maxId: targetId + Math.ceil(take / 2) })
         .orderBy('msg.createdAt', 'ASC')
@@ -3374,6 +4555,8 @@ export async function getSessionMessages(req: any, res: any) {
 
       messages = await msgRepo.createQueryBuilder('msg')
         .where('msg.sessionId = :sid', { sid: sessionId })
+        .andWhere('msg.userId = :userId', { userId: Number(userId) })
+        .andWhere('msg.deletedByUserAt IS NULL')
         .andWhere('msg.id < :bid', { bid: targetId })
         .orderBy('msg.createdAt', 'DESC')
         .take(take)
@@ -3384,7 +4567,7 @@ export async function getSessionMessages(req: any, res: any) {
     // 4. Lógica Inicial (Últimos mensajes)
     else {
       messages = await msgRepo.find({
-        where: { sessionId: Number(sessionId) },
+        where: { sessionId: Number(sessionId), userId: Number(userId), deletedByUserAt: IsNull() },
         order: { createdAt: 'DESC' },
         take: take
       });

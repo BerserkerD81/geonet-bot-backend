@@ -7,7 +7,9 @@ import {
     applyPendingWan, 
     getUserSessions, 
     getSessionMessages,
-    searchUserMessages // <--- 1. IMPORTAR ESTO
+  searchUserMessages,
+  deleteUserSession,
+  deleteUserMessage
 } from '../controllers/chatController';
 import { authenticateGeonet, downloadContratoGeonet } from '../services/wisphubClient';
 
@@ -17,6 +19,8 @@ const router = express.Router();
 router.get('/search', requireAuth, searchUserMessages); // <--- 2. AGREGAR ESTA RUTA
 router.get('/sessions', requireAuth, getUserSessions); 
 router.get('/sessions/:sessionId/messages', requireAuth, getSessionMessages);
+router.delete('/sessions/:sessionId', requireAuth, deleteUserSession);
+router.delete('/messages/:messageId', requireAuth, deleteUserMessage);
 
 // --- Rutas de Interacción ---
 router.post('/messages', requireAuth, addMessage);

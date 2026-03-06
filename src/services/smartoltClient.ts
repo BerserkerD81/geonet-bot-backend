@@ -1008,6 +1008,85 @@ export async function getInternalOnuIdBySn(sn: string): Promise<number | string 
   }
 }
 
+function unwrapSmartoltResponse(data: any): any {
+  if (data && typeof data === 'object' && 'response' in data) {
+    return (data as any).response;
+  }
+  return data;
+}
+
+async function getOnuApiByExternalId(path: string, onuExternalId: string | number): Promise<any> {
+  if (!onuExternalId) throw new Error('onuExternalId required');
+  const fullPath = `${path}/${encodeURIComponent(String(onuExternalId))}`;
+  const data = await getWithPostFallback<any>(fullPath);
+  return unwrapSmartoltResponse(data);
+}
+
+export type SmartoltGraphType = 'hourly' | 'daily' | 'weekly' | 'monthly' | 'yearly';
+
+async function getOnuGraphByExternalId(path: string, onuExternalId: string | number, graphType: SmartoltGraphType = 'daily'): Promise<Buffer> {
+  if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
+  if (!SMARTOLT.apiKey) throw new Error('SMARTOLT_API_KEY not configured');
+  if (!onuExternalId) throw new Error('onuExternalId required');
+
+  const url = `${baseUrl}${path}/${encodeURIComponent(String(onuExternalId))}/${encodeURIComponent(String(graphType))}`;
+  const res = await axios.get<ArrayBuffer>(url, {
+    headers: getHeaders(),
+    timeout: 20000,
+    responseType: 'arraybuffer'
+  });
+
+  const data = Buffer.from(res.data as any);
+  const contentType = String(res.headers?.['content-type'] || '').toLowerCase();
+  if (contentType.includes('application/json') || contentType.includes('text/json')) {
+    try {
+      const parsed = JSON.parse(data.toString('utf8'));
+      throw new Error(parsed?.error || parsed?.response || 'SmartOLT graph error');
+    } catch (e: any) {
+      throw new Error(e?.message || 'SmartOLT graph response is not an image');
+    }
+  }
+
+  return data;
+}
+
+export async function getOnuFullStatusInfoByExternalId(onuExternalId: string | number): Promise<any> {
+  return getOnuApiByExternalId('/api/onu/get_onu_full_status_info', onuExternalId);
+}
+
+export async function getOnuDetailsByExternalId(onuExternalId: string | number): Promise<any> {
+  return getOnuApiByExternalId('/api/onu/get_onu_details', onuExternalId);
+}
+
+export async function getOnuSignalByExternalId(onuExternalId: string | number): Promise<any> {
+  return getOnuApiByExternalId('/api/onu/get_onu_signal', onuExternalId);
+}
+
+export async function getOnuRunningConfigByExternalId(onuExternalId: string | number): Promise<any> {
+  return getOnuApiByExternalId('/api/onu/get_running_config', onuExternalId);
+}
+
+export async function getOnuSignalGraphByExternalId(onuExternalId: string | number, graphType: SmartoltGraphType = 'daily'): Promise<Buffer> {
+  return getOnuGraphByExternalId('/api/onu/get_onu_signal_graph', onuExternalId, graphType);
+}
+
+export async function getOnuTrafficGraphByExternalId(onuExternalId: string | number, graphType: SmartoltGraphType = 'daily'): Promise<Buffer> {
+  return getOnuGraphByExternalId('/api/onu/get_onu_traffic_graph', onuExternalId, graphType);
+}
+
+export async function resyncOnuConfigByExternalId(onuExternalId: string | number): Promise<any> {
+  if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
+  if (!SMARTOLT.apiKey) throw new Error('SMARTOLT_API_KEY not configured');
+  if (!onuExternalId) throw new Error('onuExternalId required');
+
+  const url = `${baseUrl}/api/onu/resync_config/${encodeURIComponent(String(onuExternalId))}`;
+  const res = await axios.post(url, undefined, {
+    headers: getHeaders(),
+    timeout: 20000
+  });
+  return unwrapSmartoltResponse(res.data);
+}
+
 export default {
   authorizeOnu,
   getOnuBySerial,
@@ -1031,5 +1110,12 @@ export default {
   getAvailablePortsForOdb,
   listAllUnconfiguredOnus,
   updateOnuWifi,
-  getInternalOnuIdBySn
+  getInternalOnuIdBySn,
+  getOnuFullStatusInfoByExternalId,
+  getOnuDetailsByExternalId,
+  getOnuSignalByExternalId,
+  getOnuRunningConfigByExternalId,
+  getOnuSignalGraphByExternalId,
+  getOnuTrafficGraphByExternalId,
+  resyncOnuConfigByExternalId
 };
