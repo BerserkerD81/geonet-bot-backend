@@ -1,7 +1,7 @@
 import axios from 'axios';
 import FormData from 'form-data';
 import { SMARTOLT } from '../config';
-import { ensureRequestDelay } from '../utils/apiThrottle';
+import { ensureRequestDelay, enqueueRequest } from '../utils/apiThrottle';
 
 // ── Instancia dedicada con logging para TODAS las peticiones a SmartOLT ──
 const smartoltAxios = axios.create();
@@ -197,11 +197,11 @@ async function getSmartoltSessionCookie(force?: boolean): Promise<string | null>
   form.append('identity', identity);
   form.append('password', password);
 
-  const res = await smartoltAxios.post(`${baseUrl}/auth/login`, form, {
+  const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(`${baseUrl}/auth/login`, form, {
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     maxRedirects: 5,
     validateStatus: (s) => s >= 200 && s < 400
-  });
+  }));
 
   const setCookie = res.headers['set-cookie'];
   if (!setCookie || !Array.isArray(setCookie) || !setCookie.length) return null;
@@ -215,17 +215,19 @@ async function getSmartoltSessionCookie(force?: boolean): Promise<string | null>
 
 async function get<T = any>(path: string) {
   if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
-  const res = await smartoltAxios.get<T>(`${baseUrl}${path}`, {
-    headers: getHeaders(),
-    timeout: 15000
+  return enqueueRequest(smartoltAxios, async () => {
+    const res = await smartoltAxios.get<T>(`${baseUrl}${path}`, {
+      headers: getHeaders(),
+      timeout: 15000
+    });
+    return res.data;
   });
-  return res.data;
 }
 export async function getAllOnuTypes(): Promise<string[]> {
   const url = `${baseUrl}/api/system/get_onu_types`;
-  const { data } = await smartoltAxios.get(url, {
+  const { data } = await enqueueRequest(smartoltAxios, () => smartoltAxios.get(url, {
     headers: { 'X-Token': SMARTOLT.apiKey || '' },
-  });
+  }));
   if (data && Array.isArray(data.response)) {
     return data.response.map((t: any) => t.name || t.type || t).filter(Boolean);
   }
@@ -233,9 +235,9 @@ export async function getAllOnuTypes(): Promise<string[]> {
 }
 export async function getAllZones(): Promise<string[]> {
   const url = `${baseUrl}/api/system/get_zones`;
-  const { data } = await smartoltAxios.get(url, {
+  const { data } = await enqueueRequest(smartoltAxios, () => smartoltAxios.get(url, {
     headers: { 'X-Token': SMARTOLT.apiKey || '' },
-  });
+  }));
   if (data && Array.isArray(data.response)) {
     return data.response.map((z: any) => z.name || z.id || z).filter(Boolean);
   }
@@ -252,9 +254,9 @@ export async function getVlansByOltId(
 ): Promise<OltVlan[]> {
   const url = `${baseUrl}/api/olt/get_vlans/${oltId}`;
 
-  const { data } = await smartoltAxios.get(url, {
+  const { data } = await enqueueRequest(smartoltAxios, () => smartoltAxios.get(url, {
     headers: { 'X-Token': SMARTOLT.apiKey || '' },
-  });
+  }));
 
   if (data && Array.isArray(data.response)) {
     return data.response.map((v: any) => ({
@@ -279,11 +281,13 @@ async function getWithPostFallback<T = any>(path: string) {
     const methodRejected = status === 405 || (typeof msg === 'string' && /method/i.test(msg));
     if (!methodRejected) throw err;
 
-    const res = await smartoltAxios.post<T>(`${baseUrl}${path}`, undefined, {
-      headers: getHeaders(),
-      timeout: 15000
+    return enqueueRequest(smartoltAxios, async () => {
+      const res = await smartoltAxios.post<T>(`${baseUrl}${path}`, undefined, {
+        headers: getHeaders(),
+        timeout: 15000
+      });
+      return res.data;
     });
-    return res.data;
   }
 }
 
@@ -309,13 +313,13 @@ async function fetchZones(): Promise<SmartOltZone[]> {
   const url = `${baseUrl}/api/system/get_zones`;
 
   try {
-    const { data } = await smartoltAxios.get(url, {
+    const { data } = await enqueueRequest(smartoltAxios, () => smartoltAxios.get(url, {
       headers: {
         'X-Token': SMARTOLT.apiKey,
         'Accept': 'application/json'
       },
       timeout: 15000
-    });
+    }));
 
     // SmartOLT suele devolver: { response: [ ...zonas... ] }
     if (data && Array.isArray(data.response)) {
@@ -349,13 +353,13 @@ export async function authorizeOnu(params: AuthorizeOnuParams) {
     for (const [key, value] of Object.entries(params)) {
       if (value !== undefined && value !== null) form.append(key, String(value));
     }
-    const res = await smartoltAxios.post(url, form, {
+    const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(url, form, {
       headers: {
         ...getHeaders(),
         'Content-Type': 'application/x-www-form-urlencoded'
       },
       timeout: 15000
-    });
+    }));
     return res.data;
   } catch (err) {
     // Some deployments require multipart/form-data; fall back to that.
@@ -364,13 +368,13 @@ export async function authorizeOnu(params: AuthorizeOnuParams) {
       for (const [key, value] of Object.entries(params)) {
         if (value !== undefined && value !== null) formData.append(key, String(value));
       }
-      const res = await smartoltAxios.post(url, formData, {
+      const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(url, formData, {
         headers: {
           ...getHeaders(),
           ...(formData as any).getHeaders?.()
         },
         timeout: 15000
-      });
+      }));
       return res.data;
     } catch (err2) {
       // Prefer original error information when available
@@ -381,7 +385,8 @@ export async function authorizeOnu(params: AuthorizeOnuParams) {
 
 export async function getOnuBySerial(serial: string) {
   // Returns SN/OLT/slot/port/status
-  return get(`/api/onus/${encodeURIComponent(serial)}`);
+  // Endpoint correcto: /api/onu/get_onu_details/{sn} (no /api/onus/ que da 404)
+  return get(`/api/onu/get_onu_details/${encodeURIComponent(serial)}`);
 }
 
 async function fetchVlans(oltId: string | number): Promise<Array<{ vlan_id: string; name?: string }>> {
@@ -394,7 +399,7 @@ async function fetchVlans(oltId: string | number): Promise<Array<{ vlan_id: stri
     try {
       const form = new URLSearchParams();
       form.append('olt_id', String(oltId));
-      const res = await smartoltAxios.post(`${baseUrl}${path}`, form, { headers: getHeaders(), timeout: 15000 });
+      const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(`${baseUrl}${path}`, form, { headers: getHeaders(), timeout: 15000 }));
       data = res.data;
     } catch (err2) {
       console.warn(`fetchVlans: initial request failed for OLT ${oltId}`, (err2 as any)?.message || err2);
@@ -576,13 +581,13 @@ async function fetchOdbs(): Promise<Array<{ id?: string; name?: string; zone_id?
   const url = `${baseUrl}/api/system/get_odbs`;
 
   try {
-    const { data } = await smartoltAxios.get(url, {
+    const { data } = await enqueueRequest(smartoltAxios, () => smartoltAxios.get(url, {
       headers: {
         'X-Token': SMARTOLT.apiKey,
         'Accept': 'application/json'
       },
       timeout: 30000 // Timeout alto por si la lista es grande
-    });
+    }));
 
     // La respuesta típica es { status: true, response: [...] }
     if (data && Array.isArray(data.response)) {
@@ -682,7 +687,7 @@ export async function updateOnuLocation(onuExternalId: string, params: Record<st
   }
 
   const headers = { ...getHeaders(), ...fd.getHeaders() } as Record<string, string>;
-  const res = await smartoltAxios.post(url, fd as any, { headers, timeout: 20000, maxBodyLength: Infinity, maxContentLength: Infinity });
+  const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(url, fd as any, { headers, timeout: 20000, maxBodyLength: Infinity, maxContentLength: Infinity }));
   return res.data;
 }
 
@@ -696,7 +701,7 @@ export async function updateOnuSn(onuExternalId: string | number, newSn: string)
   const fd = new FormData();
   fd.append('new_sn', String(newSn));
   const headers = { ...getHeaders(), ...fd.getHeaders() } as Record<string, string>;
-  const res = await smartoltAxios.post(url, fd as any, { headers, timeout: 20000, maxBodyLength: Infinity, maxContentLength: Infinity });
+  const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(url, fd as any, { headers, timeout: 20000, maxBodyLength: Infinity, maxContentLength: Infinity }));
   return res.data;
 }
 
@@ -710,7 +715,7 @@ export async function changeOnuType(onuExternalId: string | number, onuType: str
   const fd = new FormData();
   fd.append('onu_type', String(onuType));
   const headers = { ...getHeaders(), ...fd.getHeaders() } as Record<string, string>;
-  const res = await smartoltAxios.post(url, fd as any, { headers, timeout: 20000, maxBodyLength: Infinity, maxContentLength: Infinity });
+  const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(url, fd as any, { headers, timeout: 20000, maxBodyLength: Infinity, maxContentLength: Infinity }));
   return res.data;
 }
 
@@ -735,7 +740,7 @@ export async function setOnuWanModeStaticIp(onuExternalId: string, ipv4Address: 
   }
 
   const headers = { ...getHeaders(), ...fd.getHeaders() } as Record<string, string>;
-  const res = await smartoltAxios.post(url, fd as any, { headers, timeout: 20000, maxBodyLength: Infinity, maxContentLength: Infinity });
+  const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(url, fd as any, { headers, timeout: 20000, maxBodyLength: Infinity, maxContentLength: Infinity }));
   return res.data;
 }
 
@@ -761,7 +766,7 @@ export async function getAvailablePortsForOdb(externalId: string | number): Prom
   const tryWithCookie = async (force?: boolean) => {
     const cookie = await getSmartoltSessionCookie(force);
     if (!cookie) return null;
-    const res = await smartoltAxios.get(`${baseUrl}${path}`, {
+    const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.get(`${baseUrl}${path}`, {
       headers: {
         Cookie: cookie,
         Accept: 'application/json',
@@ -769,7 +774,7 @@ export async function getAvailablePortsForOdb(externalId: string | number): Prom
         'X-Token': SMARTOLT.apiKey
       },
       timeout: 15000
-    });
+    }));
     return unwrap(res.data);
   };
 
@@ -817,14 +822,14 @@ async function fetchWifiPortsFromPage(onuId: string | number): Promise<Array<{ i
 
     let res;
     try {
-      res = await smartoltAxios.get(endpoint, {
+      res = await enqueueRequest(smartoltAxios, () => smartoltAxios.get(endpoint, {
         headers: {
           'Cookie': cookie,
           'X-Requested-With': 'XMLHttpRequest',
           'X-Token': SMARTOLT.apiKey || ''
         },
         transformResponse: [(data) => data] // Evitar parseo JSON, queremos texto crudo
-      });
+      }));
     } catch (err: any) {
       throw err;
     }
@@ -947,7 +952,7 @@ export async function updateOnuWifi(
     const cookie = await getSmartoltSessionCookie(forceCookie);
     if (!cookie) throw new Error('No se pudo obtener la cookie de sesión de SmartOLT');
 
-    return smartoltAxios.post(endpoint, form, {
+    return enqueueRequest(smartoltAxios, () => smartoltAxios.post(endpoint, form, {
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Cookie': cookie,
@@ -955,7 +960,7 @@ export async function updateOnuWifi(
         'X-Token': SMARTOLT.apiKey || '' 
       },
       timeout: 20000
-    });
+    }));
   };
 
   try {
@@ -975,9 +980,9 @@ export async function updateOnuWifi(
 export async function listAllUnconfiguredOnus(): Promise<any[]> {
   const subdomain = process.env.SMARTOLT_BASE_URL;
   const url = `${subdomain}api/onu/unconfigured_onus`;
-  const resp = await smartoltAxios.get(url, {
+  const resp = await enqueueRequest(smartoltAxios, () => smartoltAxios.get(url, {
     headers: { 'X-Token': process.env.SMARTOLT_API_KEY }
-  });
+  }));
   // La respuesta suele estar en resp.data.data o resp.data
   return resp.data?.data || resp.data || [];
 }
@@ -997,7 +1002,7 @@ export async function getInternalOnuIdBySn(sn: string): Promise<number | string 
     const cookie = await getSmartoltSessionCookie(forceCookie);
     if (!cookie) throw new Error('No se pudo obtener la cookie de sesión de SmartOLT');
 
-    return smartoltAxios.get(endpoint, {
+    return enqueueRequest(smartoltAxios, () => smartoltAxios.get(endpoint, {
       params: {
         free_text: sn // Parámetro de búsqueda
       },
@@ -1010,7 +1015,7 @@ export async function getInternalOnuIdBySn(sn: string): Promise<number | string 
       timeout: 15000,
       // Importante: No forzar JSON parse si la respuesta es HTML mezclado
       transformResponse: [(data) => data] 
-    });
+    }));
   };
 
   // Lógica de extracción (El equivalente a tu grep -oP "status_onu_\K\d+")
@@ -1064,11 +1069,17 @@ function unwrapSmartoltResponse(data: any): any {
   return data;
 }
 
+// Cache corto (30s) para datos por-ONU – evita ráfagas repetidas sobre la misma ONU
+const ONU_API_CACHE_TTL = 30_000;
+
 async function getOnuApiByExternalId(path: string, onuExternalId: string | number): Promise<any> {
   if (!onuExternalId) throw new Error('onuExternalId required');
-  const fullPath = `${path}/${encodeURIComponent(String(onuExternalId))}`;
-  const data = await getWithPostFallback<any>(fullPath);
-  return unwrapSmartoltResponse(data);
+  const cacheKey = `onuApi:${path}:${onuExternalId}`;
+  return fromCache(cacheKey, ONU_API_CACHE_TTL, async () => {
+    const fullPath = `${path}/${encodeURIComponent(String(onuExternalId))}`;
+    const data = await getWithPostFallback<any>(fullPath);
+    return unwrapSmartoltResponse(data);
+  });
 }
 
 export type SmartoltGraphType = 'hourly' | 'daily' | 'weekly' | 'monthly' | 'yearly';
@@ -1079,24 +1090,26 @@ async function getOnuGraphByExternalId(path: string, onuExternalId: string | num
   if (!onuExternalId) throw new Error('onuExternalId required');
 
   const url = `${baseUrl}${path}/${encodeURIComponent(String(onuExternalId))}/${encodeURIComponent(String(graphType))}`;
-  const res = await smartoltAxios.get<ArrayBuffer>(url, {
-    headers: getHeaders(),
-    timeout: 20000,
-    responseType: 'arraybuffer'
-  });
+  return enqueueRequest(smartoltAxios, async () => {
+    const res = await smartoltAxios.get<ArrayBuffer>(url, {
+      headers: getHeaders(),
+      timeout: 20000,
+      responseType: 'arraybuffer'
+    });
 
-  const data = Buffer.from(res.data as any);
-  const contentType = String(res.headers?.['content-type'] || '').toLowerCase();
-  if (contentType.includes('application/json') || contentType.includes('text/json')) {
-    try {
-      const parsed = JSON.parse(data.toString('utf8'));
-      throw new Error(parsed?.error || parsed?.response || 'SmartOLT graph error');
-    } catch (e: any) {
-      throw new Error(e?.message || 'SmartOLT graph response is not an image');
+    const data = Buffer.from(res.data as any);
+    const contentType = String(res.headers?.['content-type'] || '').toLowerCase();
+    if (contentType.includes('application/json') || contentType.includes('text/json')) {
+      try {
+        const parsed = JSON.parse(data.toString('utf8'));
+        throw new Error(parsed?.error || parsed?.response || 'SmartOLT graph error');
+      } catch (e: any) {
+        throw new Error(e?.message || 'SmartOLT graph response is not an image');
+      }
     }
-  }
 
-  return data;
+    return data;
+  });
 }
 
 export async function getOnuFullStatusInfoByExternalId(onuExternalId: string | number): Promise<any> {
@@ -1129,10 +1142,10 @@ export async function resyncOnuConfigByExternalId(onuExternalId: string | number
   if (!onuExternalId) throw new Error('onuExternalId required');
 
   const url = `${baseUrl}/api/onu/resync_config/${encodeURIComponent(String(onuExternalId))}`;
-  const res = await smartoltAxios.post(url, undefined, {
+  const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(url, undefined, {
     headers: getHeaders(),
     timeout: 20000
-  });
+  }));
   return unwrapSmartoltResponse(res.data);
 }
 
@@ -1142,10 +1155,10 @@ export async function rebootOnuByExternalId(onuExternalId: string | number): Pro
   if (!onuExternalId) throw new Error('onuExternalId required');
 
   const url = `${baseUrl}/api/onu/reboot/${encodeURIComponent(String(onuExternalId))}`;
-  const res = await smartoltAxios.post(url, undefined, {
+  const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(url, undefined, {
     headers: getHeaders(),
     timeout: 20000
-  });
+  }));
   return unwrapSmartoltResponse(res.data);
 }
 

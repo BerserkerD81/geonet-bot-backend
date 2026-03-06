@@ -1672,16 +1672,20 @@ function buildMonitorGraphsSection(monitor: { signalGraphUrl?: string; trafficGr
 
 async function loadMonitorSmartoltData(onuExternalId: string, graphType: SmartoltGraphType = 'daily') {
   const normalizedGraphType = normalizeMonitorGraphType(graphType);
-  const calls = await Promise.allSettled([
-    getOnuFullStatusInfoByExternalId(onuExternalId),
-    getOnuDetailsByExternalId(onuExternalId),
-    getOnuSignalByExternalId(onuExternalId),
-    getOnuRunningConfigByExternalId(onuExternalId),
-    getOnuSignalGraphByExternalId(onuExternalId, normalizedGraphType),
-    getOnuTrafficGraphByExternalId(onuExternalId, normalizedGraphType)
-  ]);
 
-  const [fullStatusRes, detailsRes, signalRes, runningRes, signalGraphRes, trafficGraphRes] = calls;
+  // Ejecutamos secuencialmente para no disparar 6 requests simultáneos
+  // que causan rate-limit / bloqueo de IP en SmartOLT.
+  const safe = async <T>(fn: () => Promise<T>): Promise<{ status: 'fulfilled'; value: T } | { status: 'rejected'; reason: any }> => {
+    try { return { status: 'fulfilled', value: await fn() }; }
+    catch (reason) { return { status: 'rejected', reason }; }
+  };
+
+  const fullStatusRes  = await safe(() => getOnuFullStatusInfoByExternalId(onuExternalId));
+  const detailsRes     = await safe(() => getOnuDetailsByExternalId(onuExternalId));
+  const signalRes      = await safe(() => getOnuSignalByExternalId(onuExternalId));
+  const runningRes     = await safe(() => getOnuRunningConfigByExternalId(onuExternalId));
+  const signalGraphRes = await safe(() => getOnuSignalGraphByExternalId(onuExternalId, normalizedGraphType));
+  const trafficGraphRes = await safe(() => getOnuTrafficGraphByExternalId(onuExternalId, normalizedGraphType));
 
   const fullStatus = fullStatusRes.status === 'fulfilled' ? fullStatusRes.value : null;
   const details = detailsRes.status === 'fulfilled' ? detailsRes.value : null;
@@ -1778,10 +1782,20 @@ async function loadMonitorSmartoltData(onuExternalId: string, graphType: Smartol
     extractOnlineUptimeFromText(fullStatusInfo)
   ]));
 
-  const failedApis = calls
-    .map((c, idx) => ({ c, name: ['full_status', 'details', 'signal', 'running_config', `signal_graph_${normalizedGraphType}`, `traffic_graph_${normalizedGraphType}`][idx] }))
-    .filter((x) => x.c.status === 'rejected')
-    .map((x) => `${x.name}: ${((x.c as PromiseRejectedResult).reason as any)?.message || 'error'}`);
+  const failedApis: string[] = [];
+  const resultEntries: Array<[string, { status: string; reason?: any }]> = [
+    ['full_status', fullStatusRes],
+    ['details', detailsRes],
+    ['signal', signalRes],
+    ['running_config', runningRes],
+    [`signal_graph_${normalizedGraphType}`, signalGraphRes],
+    [`traffic_graph_${normalizedGraphType}`, trafficGraphRes]
+  ];
+  for (const [name, r] of resultEntries) {
+    if (r.status === 'rejected') {
+      failedApis.push(`${name}: ${(r as any).reason?.message || 'error'}`);
+    }
+  }
 
   return {
     statusSummary,
