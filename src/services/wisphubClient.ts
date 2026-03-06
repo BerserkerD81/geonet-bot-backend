@@ -29,7 +29,8 @@ const SCRAPING_TIMEOUTS = {
   activationConfirmTries: 5,
   activationConfirmDelay: 2200,
   activationApiPollTries: 8,
-  activationApiPollDelay: 2500
+  activationApiPollDelay: 2500,
+  activationApiMaxWaitMs: Number(process.env.WISPHUB_ACTIVATION_MAX_WAIT_MS || 300000)
 } as const;
 
 // Cache de cookies en memoria. 
@@ -318,6 +319,13 @@ function isLikelyActiveStatus(value: unknown): boolean {
   const normalized = normalizeStatusText(value);
   if (!normalized) return false;
   if (/^\d+$/.test(normalized)) return normalized === '1';
+  if (
+    normalized.includes('inactiv') ||
+    normalized.includes('desactiv') ||
+    normalized.includes('suspend') ||
+    normalized.includes('cancel') ||
+    normalized.includes('baja')
+  ) return false;
   return (
     normalized.includes('activ') ||
     normalized.includes('habil') ||
@@ -568,46 +576,123 @@ async function waitForActivationUiConfirmation(page: Page, targetUrl: string): P
   return { confirmed: false, reason: uiReason };
 }
 
-async function waitForActivationApiConfirmation(instalacionId: number | string): Promise<{ confirmed: boolean; reason: string }> {
-  let lastObserved = '';
+async function waitForActivationApiConfirmation(
+  instalacionId: number | string,
+  usuarioInstalacion?: string,
+  opts?: { maxWaitMs?: number }
+): Promise<{ confirmed: boolean; reason: string }> {
+  return waitForActivationApiConfirmationByClientes(instalacionId, usuarioInstalacion, opts);
+}
 
-  for (let attempt = 1; attempt <= SCRAPING_TIMEOUTS.activationApiPollTries; attempt++) {
+function buildUsuarioCandidates(usuarioInstalacion?: string): string[] {
+  const base = String(usuarioInstalacion || '').trim();
+  if (!base) return [];
+  const left = base.includes('@') ? base.split('@')[0].trim() : base;
+  return Array.from(new Set([base, left].filter(Boolean)));
+}
+
+function pickClientEstadoForActivation(payload: Record<string, any> | null | undefined): string {
+  if (!payload || typeof payload !== 'object') return '';
+  const candidates = [
+    payload.estado,
+    payload.estado_instalacion,
+    payload.status,
+    payload?.raw?.estado,
+    payload?.raw?.estado_instalacion
+  ];
+  const observed = candidates.find((value) => {
+    const normalized = normalizeStatusText(value);
+    return !!normalized;
+  });
+  return observed === undefined || observed === null ? '' : String(observed);
+}
+
+async function findClientForActivationByClientes(
+  instalacionId: number | string,
+  usuarioInstalacion?: string
+): Promise<{ payload: Record<string, any> | null; source: string; debug: string }> {
+  const serviceId = String(instalacionId || '').trim();
+  const userCandidates = buildUsuarioCandidates(usuarioInstalacion);
+
+  const queries: Array<{ params: Record<string, any>; source: string }> = [];
+  if (serviceId) {
+    queries.push({ params: { id_servicio: serviceId, limit: 5, offset: 0 }, source: 'id_servicio' });
+  }
+
+  for (const user of userCandidates) {
+    queries.push({ params: { usuario: user, limit: 5, offset: 0 }, source: 'usuario' });
+  }
+  for (const user of userCandidates) {
+    queries.push({ params: { usuario__contains: user, limit: 5, offset: 0 }, source: 'usuario__contains' });
+  }
+
+  let lastDebug = '';
+  for (const item of queries) {
     try {
-      const payload = await getClientByServiceId(instalacionId);
-      if (payload) {
-        const candidates = [
-          payload.estado,
-          payload.estado_instalacion,
-          payload.status,
-          payload?.raw?.estado,
-          payload?.raw?.estado_instalacion
-        ];
-        const observed = candidates.find((value) => {
-          const normalized = normalizeStatusText(value);
-          return !!normalized;
-        });
-        if (observed !== undefined) {
-          lastObserved = String(observed);
+      const data = await listClientsPage(item.params);
+      const results = Array.isArray(data?.results) ? data.results : [];
+      if (results.length > 0) {
+        return {
+          payload: (results[0] || null) as Record<string, any> | null,
+          source: item.source,
+          debug: `match ${item.source} (${results.length} resultados)`
+        };
+      }
+      lastDebug = `sin resultados por ${item.source}`;
+    } catch (err: any) {
+      lastDebug = `error ${item.source}: ${err?.message || err}`;
+    }
+  }
+
+  return { payload: null, source: 'none', debug: lastDebug || 'sin resultados en /api/clientes/' };
+}
+
+async function waitForActivationApiConfirmationByClientes(
+  instalacionId: number | string,
+  usuarioInstalacion?: string,
+  opts?: { maxWaitMs?: number }
+): Promise<{ confirmed: boolean; reason: string }> {
+  let lastObserved = '';
+  const maxWaitMs = Math.max(10000, Number(opts?.maxWaitMs ?? SCRAPING_TIMEOUTS.activationApiMaxWaitMs));
+  const startedAt = Date.now();
+  let attempt = 0;
+
+  while ((Date.now() - startedAt) < maxWaitMs) {
+    attempt += 1;
+    try {
+      const found = await findClientForActivationByClientes(instalacionId, usuarioInstalacion);
+      if (found.payload) {
+        const observed = pickClientEstadoForActivation(found.payload);
+        const normalized = normalizeStatusText(observed);
+        if (normalized) {
+          lastObserved = `API clientes estado=${observed} (source=${found.source})`;
           if (isLikelyActiveStatus(observed)) {
-            return { confirmed: true, reason: `API estado activo (${lastObserved})` };
+            return { confirmed: true, reason: `API clientes activo (${observed}, source=${found.source})` };
           }
-          if (isLikelyInactiveStatus(observed)) {
-            lastObserved = `API estado no-activo (${lastObserved})`;
+          if (isLikelyInactiveStatus(observed) || !isLikelyActiveStatus(observed)) {
+            lastObserved = `API clientes no-activo (${observed}, source=${found.source})`;
           }
+        } else {
+          lastObserved = `cliente encontrado sin estado util (source=${found.source})`;
         }
+      } else {
+        lastObserved = `sin cliente en /api/clientes/ (${found.debug})`;
       }
     } catch (err: any) {
-      lastObserved = `API error: ${err?.message || err}`;
+      lastObserved = `API clientes error: ${err?.message || err}`;
     }
 
-    if (attempt < SCRAPING_TIMEOUTS.activationApiPollTries) {
-      await new Promise((resolve) => setTimeout(resolve, SCRAPING_TIMEOUTS.activationApiPollDelay));
-    }
+    const elapsed = Date.now() - startedAt;
+    const remaining = maxWaitMs - elapsed;
+    if (remaining <= 0) break;
+
+    const sleepMs = Math.min(SCRAPING_TIMEOUTS.activationApiPollDelay, remaining);
+    await new Promise((resolve) => setTimeout(resolve, sleepMs));
   }
 
   return {
     confirmed: false,
-    reason: lastObserved || 'Sin confirmación de estado activo vía API'
+    reason: `${lastObserved || 'Sin confirmación de estado activo vía /api/clientes/'} (timeout ${Math.round(maxWaitMs / 1000)}s)`
   };
 }
 
@@ -842,7 +927,7 @@ export async function activarInstalacionGeonet(
     if (!await ensureSession(page)) throw new Error('Auth falló');
 
     // Confirmación rápida por API: si ya está activa, no intentamos click.
-    const apiBefore = await waitForActivationApiConfirmation(instalacionId);
+    const apiBefore = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion);
     if (apiBefore.confirmed) {
       console.log(`✅ Instalación ${instalacionId} ya estaba activa (${apiBefore.reason}).`);
       return { ok: true, status: 200 };
@@ -861,11 +946,16 @@ export async function activarInstalacionGeonet(
         if (backdrop) backdrop.remove();
     });
 
-    // Si UI ya muestra estado activo, consideramos éxito.
+    // Si UI muestra estado activo, lo tomamos como pista, pero NO como éxito final.
     const uiBefore = await readActivationUiState(page);
     if (uiBefore.hasDeactivateButton || uiBefore.bodyLooksActive) {
-      console.log(`✅ Instalación ${instalacionId} ya se veía activa en UI.`);
-      return { ok: true, status: 200 };
+      console.log(`ℹ️ Instalación ${instalacionId} parece activa en UI; validando en /api/clientes/...`);
+      const apiUiBefore = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion);
+      if (apiUiBefore.confirmed) {
+        console.log(`✅ Instalación ${instalacionId} confirmada activa por API (${apiUiBefore.reason}).`);
+        return { ok: true, status: 200 };
+      }
+      console.warn(`⚠️ UI sugiere activa pero API no confirma aún: ${apiUiBefore.reason}`);
     }
 
     // 3. Click en activación (si existe botón)
@@ -897,7 +987,7 @@ export async function activarInstalacionGeonet(
     }
 
     if (!submitted) {
-      const apiWithoutClick = await waitForActivationApiConfirmation(instalacionId);
+      const apiWithoutClick = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion);
       if (apiWithoutClick.confirmed) {
         console.log(`✅ Instalación ${instalacionId} confirmada activa sin click (${apiWithoutClick.reason}).`);
         return { ok: true, status: 200 };
@@ -912,15 +1002,13 @@ export async function activarInstalacionGeonet(
     console.log(`[Puppeteer] Activación enviada (${submitMode}). Esperando confirmación...`);
     await navigationPromise;
 
-    // 4. Confirmar por UI (polling) y luego por API
+    // 4. UI es señal de avance, pero el éxito final depende de /api/clientes/
     const uiAfter = await waitForActivationUiConfirmation(page, targetUrl);
     if (uiAfter.confirmed) {
-      console.log(`✅ Activación confirmada por UI (${uiAfter.reason}).`);
-      console.log(`[Puppeteer] activarInstalacionGeonet tiempo total: ${Date.now() - start}ms`);
-      return { ok: true, status: 200 };
+      console.log(`ℹ️ UI reporta activación (${uiAfter.reason}); validando API de clientes...`);
     }
 
-    const apiAfter = await waitForActivationApiConfirmation(instalacionId);
+    const apiAfter = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion);
     if (apiAfter.confirmed) {
       console.log(`✅ Activación confirmada por API (${apiAfter.reason}).`);
       console.log(`[Puppeteer] activarInstalacionGeonet tiempo total: ${Date.now() - start}ms`);
