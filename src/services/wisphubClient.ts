@@ -25,7 +25,11 @@ const SCRAPING_TIMEOUTS = {
   mediumOperation: 60000,
   longOperation: 90000,
   activationWait: 15000,
-  activationNavigation: 15000
+  activationNavigation: 15000,
+  activationConfirmTries: 5,
+  activationConfirmDelay: 2200,
+  activationApiPollTries: 8,
+  activationApiPollDelay: 2500
 } as const;
 
 // Cache de cookies en memoria. 
@@ -301,6 +305,312 @@ function formatDateCL(date: Date): string {
   return `${day}/${month}/${year}`;
 }
 
+function normalizeStatusText(value: unknown): string {
+  if (value === undefined || value === null) return '';
+  return String(value)
+    .trim()
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+function isLikelyActiveStatus(value: unknown): boolean {
+  const normalized = normalizeStatusText(value);
+  if (!normalized) return false;
+  if (/^\d+$/.test(normalized)) return normalized === '1';
+  return (
+    normalized.includes('activ') ||
+    normalized.includes('habil') ||
+    normalized.includes('online') ||
+    normalized.includes('al dia') ||
+    normalized.includes('aldia')
+  );
+}
+
+function isLikelyInactiveStatus(value: unknown): boolean {
+  const normalized = normalizeStatusText(value);
+  if (!normalized) return false;
+  if (/^\d+$/.test(normalized)) return normalized === '2' || normalized === '3' || normalized === '0';
+  return (
+    normalized.includes('suspend') ||
+    normalized.includes('cort') ||
+    normalized.includes('bloq') ||
+    normalized.includes('moros') ||
+    normalized.includes('cancel') ||
+    normalized.includes('baja') ||
+    normalized.includes('inactiv')
+  );
+}
+
+type ActivationUiState = {
+  hasActivateButton: boolean;
+  hasDeactivateButton: boolean;
+  hasActivationForm: boolean;
+  hasActivationPrompt: boolean;
+  hasSuccessMessage: boolean;
+  hasErrorMessage: boolean;
+  successText: string;
+  errorText: string;
+  bodyLooksActive: boolean;
+  pageUrl: string;
+};
+
+async function readActivationUiState(page: Page): Promise<ActivationUiState> {
+  return page.evaluate(() => {
+    const normalize = (value: any) => String(value || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const getElementLabel = (el: Element) => {
+      const inputEl = el as HTMLInputElement;
+      const value = typeof inputEl.value === 'string' ? inputEl.value : '';
+      return `${el.textContent || ''} ${value}`.trim();
+    };
+
+    const isVisible = (el: Element) => {
+      const rect = (el as HTMLElement).getBoundingClientRect?.();
+      const style = window.getComputedStyle(el as HTMLElement);
+      const visibleByStyle = style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      const visibleByRect = !!rect && rect.width > 0 && rect.height > 0;
+      return visibleByStyle && visibleByRect;
+    };
+
+    const clickable = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'));
+    const activationForm = document.querySelector('form#activar_cliente_form, form[action*="/activar/"]');
+
+    const hasActivateButton = clickable.some((el) => {
+      if (!isVisible(el)) return false;
+      const txt = normalize(getElementLabel(el));
+      return txt.includes('activar instalacion') && !txt.includes('editar');
+    });
+
+    const hasDeactivateButton = clickable.some((el) => {
+      if (!isVisible(el)) return false;
+      const txt = normalize(getElementLabel(el));
+      return txt.includes('desactivar instalacion') || txt.includes('instalacion activa');
+    });
+
+    const successText = Array.from(document.querySelectorAll('.alert-success, .messages .success, .message.success, .toast-success'))
+      .map((el) => (el.textContent || '').trim())
+      .filter(Boolean)
+      .join(' | ');
+
+    const errorText = Array.from(document.querySelectorAll('.alert-danger, .messages .error, .message.error, .errorlist, .alert-warning'))
+      .map((el) => (el.textContent || '').trim())
+      .filter(Boolean)
+      .join(' | ');
+
+    const bodyText = normalize(document.body?.innerText || '');
+    const hasActivationPrompt =
+      bodyText.includes('estas seguro que desea activar instalacion') ||
+      bodyText.includes('estás seguro que desea activar instalación') ||
+      bodyText.includes('activar instalacion') ||
+      bodyText.includes('activar instalación');
+
+    const bodyLooksActive =
+      bodyText.includes('instalacion activa') ||
+      bodyText.includes('servicio activado') ||
+      bodyText.includes('instalacion activada') ||
+      (bodyText.includes('desactivar instalacion') && !bodyText.includes('activar instalacion'));
+
+    return {
+      hasActivateButton,
+      hasDeactivateButton,
+      hasActivationForm: !!activationForm,
+      hasActivationPrompt,
+      hasSuccessMessage: !!normalize(successText),
+      hasErrorMessage: !!normalize(errorText),
+      successText: successText || '',
+      errorText: errorText || '',
+      bodyLooksActive,
+      pageUrl: window.location.href
+    };
+  });
+}
+
+async function clickActivateButton(page: Page): Promise<boolean> {
+  const directSubmitBtn = await page
+    .$('form#activar_cliente_form button[type="submit"], form#activar_cliente_form input[type="submit"]');
+  if (directSubmitBtn) {
+    await directSubmitBtn.click();
+    return true;
+  }
+
+  const selectorXpath = "xpath///button[contains(text(), 'Activar Instalación') and not(contains(text(), 'Editar'))]";
+  const buttonByXpath = await page.waitForSelector(selectorXpath, {
+    visible: true,
+    timeout: 3500
+  }).catch(() => null);
+
+  if (buttonByXpath) {
+    await buttonByXpath.click();
+    return true;
+  }
+
+  const clickedByDom = await page.evaluate(() => {
+    const normalize = (value: any) => String(value || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const isVisible = (el: Element) => {
+      const rect = (el as HTMLElement).getBoundingClientRect?.();
+      const style = window.getComputedStyle(el as HTMLElement);
+      const visibleByStyle = style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      const visibleByRect = !!rect && rect.width > 0 && rect.height > 0;
+      return visibleByStyle && visibleByRect;
+    };
+
+    const nodes = Array.from(document.querySelectorAll('button, a, input[type="button"], input[type="submit"]'));
+    for (const node of nodes) {
+      if (!isVisible(node)) continue;
+      const inputNode = node as HTMLInputElement;
+      const label = normalize(`${node.textContent || ''} ${inputNode.value || ''}`);
+      if (label.includes('activar instalacion') && !label.includes('editar')) {
+        (node as HTMLElement).click();
+        return true;
+      }
+    }
+    return false;
+  });
+
+  return clickedByDom;
+}
+
+async function submitActivationForm(page: Page): Promise<{ submitted: boolean; mode: string; detail?: string }> {
+  return page.evaluate(() => {
+    const normalize = (value: any) => String(value || '')
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const form = document.querySelector('form#activar_cliente_form, form[action*="/activar/"]') as HTMLFormElement | null;
+    if (!form) {
+      return { submitted: false, mode: 'none', detail: 'No se encontró formulario de activación' };
+    }
+
+    const editFacturacion = form.querySelector('input[name="edit_facturacion"]') as HTMLInputElement | null;
+    if (editFacturacion) editFacturacion.value = '0';
+
+    const submitNodes = Array.from(form.querySelectorAll('button[type="submit"], input[type="submit"]')) as Array<HTMLButtonElement | HTMLInputElement>;
+    const preferredSubmit = submitNodes.find((node) => {
+      const label = normalize(`${(node as HTMLElement).textContent || ''} ${(node as HTMLInputElement).value || ''}`);
+      return label.includes('activar instalacion') && !label.includes('editar');
+    }) || submitNodes[0] || null;
+
+    if (preferredSubmit) {
+      preferredSubmit.click();
+      return { submitted: true, mode: 'button-click' };
+    }
+
+    if (typeof form.requestSubmit === 'function') {
+      form.requestSubmit();
+      return { submitted: true, mode: 'requestSubmit' };
+    }
+
+    form.submit();
+    return { submitted: true, mode: 'form-submit' };
+  });
+}
+
+async function waitForActivationUiConfirmation(page: Page, targetUrl: string): Promise<{ confirmed: boolean; reason: string }> {
+  let lastState: ActivationUiState | null = null;
+
+  for (let attempt = 1; attempt <= SCRAPING_TIMEOUTS.activationConfirmTries; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, SCRAPING_TIMEOUTS.activationConfirmDelay));
+
+    const state = await readActivationUiState(page);
+    lastState = state;
+
+    const normalizedUrl = normalizeStatusText(state.pageUrl);
+    const movedAwayFromActivation =
+      normalizedUrl.length > 0 &&
+      !normalizedUrl.includes('/activar/') &&
+      !normalizedUrl.includes('/accounts/login/');
+
+    const successOrAlreadyActive =
+      movedAwayFromActivation ||
+      state.hasDeactivateButton ||
+      state.bodyLooksActive ||
+      (state.hasSuccessMessage && !state.hasActivateButton && !state.hasActivationForm);
+
+    if (successOrAlreadyActive) {
+      return {
+        confirmed: true,
+        reason: state.successText || (movedAwayFromActivation ? `UI redirigió a ${state.pageUrl}` : 'UI indica instalación activa')
+      };
+    }
+
+    const normalizedError = normalizeStatusText(state.errorText);
+    if (normalizedError.includes('ya se encuentra activa') || normalizedError.includes('ya esta activa')) {
+      return {
+        confirmed: true,
+        reason: state.errorText || 'UI indica que ya estaba activa'
+      };
+    }
+
+    if (attempt < SCRAPING_TIMEOUTS.activationConfirmTries) {
+      await safeGoto(page, targetUrl, { timeout: SCRAPING_TIMEOUTS.mediumOperation }).catch(() => null);
+    }
+  }
+
+  const uiReason = lastState
+    ? `UI sin confirmación (activateButton=${lastState.hasActivateButton}, deactivateButton=${lastState.hasDeactivateButton}, activationForm=${lastState.hasActivationForm}, success='${lastState.successText}', error='${lastState.errorText}', url='${lastState.pageUrl}')`
+    : 'No se pudo leer estado UI tras click';
+
+  return { confirmed: false, reason: uiReason };
+}
+
+async function waitForActivationApiConfirmation(instalacionId: number | string): Promise<{ confirmed: boolean; reason: string }> {
+  let lastObserved = '';
+
+  for (let attempt = 1; attempt <= SCRAPING_TIMEOUTS.activationApiPollTries; attempt++) {
+    try {
+      const payload = await getClientByServiceId(instalacionId);
+      if (payload) {
+        const candidates = [
+          payload.estado,
+          payload.estado_instalacion,
+          payload.status,
+          payload?.raw?.estado,
+          payload?.raw?.estado_instalacion
+        ];
+        const observed = candidates.find((value) => {
+          const normalized = normalizeStatusText(value);
+          return !!normalized;
+        });
+        if (observed !== undefined) {
+          lastObserved = String(observed);
+          if (isLikelyActiveStatus(observed)) {
+            return { confirmed: true, reason: `API estado activo (${lastObserved})` };
+          }
+          if (isLikelyInactiveStatus(observed)) {
+            lastObserved = `API estado no-activo (${lastObserved})`;
+          }
+        }
+      }
+    } catch (err: any) {
+      lastObserved = `API error: ${err?.message || err}`;
+    }
+
+    if (attempt < SCRAPING_TIMEOUTS.activationApiPollTries) {
+      await new Promise((resolve) => setTimeout(resolve, SCRAPING_TIMEOUTS.activationApiPollDelay));
+    }
+  }
+
+  return {
+    confirmed: false,
+    reason: lastObserved || 'Sin confirmación de estado activo vía API'
+  };
+}
+
 // --- FUNCIONES WISPHUB (LECTURA API) ---
 
 export async function checkHealth(): Promise<{ ok: boolean; latencyMs?: number; error?: string }>{
@@ -531,6 +841,13 @@ export async function activarInstalacionGeonet(
   try {
     if (!await ensureSession(page)) throw new Error('Auth falló');
 
+    // Confirmación rápida por API: si ya está activa, no intentamos click.
+    const apiBefore = await waitForActivationApiConfirmation(instalacionId);
+    if (apiBefore.confirmed) {
+      console.log(`✅ Instalación ${instalacionId} ya estaba activa (${apiBefore.reason}).`);
+      return { ok: true, status: 200 };
+    }
+
     // 1. Cargar la página
     await safeGoto(page, targetUrl, { timeout: SCRAPING_TIMEOUTS.mediumOperation });
 
@@ -544,29 +861,75 @@ export async function activarInstalacionGeonet(
         if (backdrop) backdrop.remove();
     });
 
-    // 3. BUSCAR EL BOTÓN (Sintaxis compatible Puppeteer reciente)
-    // Usamos el prefijo 'xpath/' seguido de '//button...'
-    const selectorXpath = "xpath///button[contains(text(), 'Activar Instalación') and not(contains(text(), 'Editar'))]";
-    
-    const botonActivacion = await page.waitForSelector(selectorXpath, { visible: true, timeout: SCRAPING_TIMEOUTS.activationWait });
-
-    if (!botonActivacion) {
-        throw new Error("No se encontró el botón específico de activación.");
+    // Si UI ya muestra estado activo, consideramos éxito.
+    const uiBefore = await readActivationUiState(page);
+    if (uiBefore.hasDeactivateButton || uiBefore.bodyLooksActive) {
+      console.log(`✅ Instalación ${instalacionId} ya se veía activa en UI.`);
+      return { ok: true, status: 200 };
     }
 
-    console.log('[Puppeteer] Botón encontrado. Haciendo CLICK físico...');
+    // 3. Click en activación (si existe botón)
+    console.log('[Puppeteer] Enviando formulario de activación...');
+    const navigationPromise = page
+      .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: SCRAPING_TIMEOUTS.activationNavigation })
+      .catch(() => null);
 
-    // 4. CLICK Y CONFIRMACIÓN INMEDIATA
-    await Promise.all([
-        // Esperamos brevemente por si hay navegación, pero no bloqueamos el éxito
-        page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: SCRAPING_TIMEOUTS.activationNavigation }).catch(() => null),
-        botonActivacion.click()
-    ]);
+    let submitted = false;
+    let submitMode = '';
 
-    // 5. RETORNO DE ÉXITO
-    // Si llegamos aquí, el click se realizó sin lanzar error.
-    console.log(`✅ Activación enviada correctamente (Click realizado).`);
-    return { ok: true, status: 200 };
+    const submitResult = await submitActivationForm(page).catch((err: any) => ({
+      submitted: false,
+      mode: 'error',
+      detail: err?.message || String(err)
+    }));
+
+    if (submitResult.submitted) {
+      submitted = true;
+      submitMode = submitResult.mode;
+      console.log(`[Puppeteer] Formulario enviado (${submitResult.mode}).`);
+    } else {
+      console.warn(`[Puppeteer] submitActivationForm no logró enviar (${submitResult.detail || 'sin detalle'}). Intentando click fallback...`);
+      const clicked = await clickActivateButton(page);
+      if (clicked) {
+        submitted = true;
+        submitMode = 'click-fallback';
+      }
+    }
+
+    if (!submitted) {
+      const apiWithoutClick = await waitForActivationApiConfirmation(instalacionId);
+      if (apiWithoutClick.confirmed) {
+        console.log(`✅ Instalación ${instalacionId} confirmada activa sin click (${apiWithoutClick.reason}).`);
+        return { ok: true, status: 200 };
+      }
+      return {
+        ok: false,
+        status: 409,
+        error: 'No se logró enviar el formulario de activación y la API no confirmó estado activo.'
+      };
+    }
+
+    console.log(`[Puppeteer] Activación enviada (${submitMode}). Esperando confirmación...`);
+    await navigationPromise;
+
+    // 4. Confirmar por UI (polling) y luego por API
+    const uiAfter = await waitForActivationUiConfirmation(page, targetUrl);
+    if (uiAfter.confirmed) {
+      console.log(`✅ Activación confirmada por UI (${uiAfter.reason}).`);
+      console.log(`[Puppeteer] activarInstalacionGeonet tiempo total: ${Date.now() - start}ms`);
+      return { ok: true, status: 200 };
+    }
+
+    const apiAfter = await waitForActivationApiConfirmation(instalacionId);
+    if (apiAfter.confirmed) {
+      console.log(`✅ Activación confirmada por API (${apiAfter.reason}).`);
+      console.log(`[Puppeteer] activarInstalacionGeonet tiempo total: ${Date.now() - start}ms`);
+      return { ok: true, status: 200 };
+    }
+
+    const reason = `Click ejecutado pero sin confirmación de activación. ${uiAfter.reason}. ${apiAfter.reason}.`;
+    console.warn(`⚠️ ${reason}`);
+    return { ok: false, status: 409, error: reason };
 
   } catch (error: any) {
     console.error(`❌ Error activarInstalacionGeonet: ${error.message}`);

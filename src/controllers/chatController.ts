@@ -44,7 +44,8 @@ import {
   getOnuSignalGraphByExternalId,
   getOnuTrafficGraphByExternalId,
   type SmartoltGraphType,
-  resyncOnuConfigByExternalId
+  resyncOnuConfigByExternalId,
+  rebootOnuByExternalId
 } from '../services/smartoltClient';
 import { IsNull } from 'typeorm';
 
@@ -1377,6 +1378,7 @@ function buildMonitorPanelActions(onuExternalId?: string) {
     actions.push({ id: 'monitor_graph_yearly', type: 'button', label: '🗃️ Año', payload: `monitoreo grafico yearly ${onuExternalId}` });
     actions.push({ id: 'monitor_refresh', type: 'button', label: '🔄 Actualizar panel', payload: `monitoreo refresh ${onuExternalId}` });
     actions.push({ id: 'monitor_resync', type: 'button', label: '🛠️ Resync ONU', payload: `monitoreo resync ${onuExternalId}` });
+    actions.push({ id: 'monitor_reboot', type: 'button', label: '🔌 Reiniciar ONU', payload: `monitoreo reboot ${onuExternalId}` });
   }
   actions.push({ id: 'monitor_new_search', type: 'button', label: 'Buscar otro cliente', payload: 'monitoreo cliente' });
   return actions;
@@ -2095,14 +2097,14 @@ export async function respond(req: any, res: any) {
   // --- DETECCIÓN DE ACCIÓN DE REFRESCO (CAMBIO NUEVO) ---
   const lower = (content || '').toLowerCase().trim();
 
-  const monitorRefreshByText = /^monitoreo\s+(refresh|resync|grafico|gr[aá]fico|periodo|per[ií]odo)\b/i.test(lower);
+  const monitorRefreshByText = /^monitoreo\s+(refresh|resync|reboot|reiniciar|grafico|gr[aá]fico|periodo|per[ií]odo)\b/i.test(lower);
   const wifiSignalRefreshByText = /^wifi\s+signal\s+refresh\b/i.test(lower);
   const monitorRefreshByActions = Array.isArray(req.body.actions) && req.body.actions.some((a: any) => {
     const id = String(a?.id || '').toLowerCase();
     const value = String(a?.value || a?.payload || '').toLowerCase();
     if (id.startsWith('monitor_graph')) return true;
-    if (['monitor_refresh', 'monitor-refresh', 'monitor_resync', 'monitor-resync'].includes(id)) return true;
-    return /^monitoreo\s+(refresh|resync|grafico|gr[aá]fico|periodo|per[ií]odo)\b/i.test(value);
+    if (['monitor_refresh', 'monitor-refresh', 'monitor_resync', 'monitor-resync', 'monitor_reboot', 'monitor-reboot'].includes(id)) return true;
+    return /^monitoreo\s+(refresh|resync|reboot|reiniciar|grafico|gr[aá]fico|periodo|per[ií]odo)\b/i.test(value);
   });
   const wifiSignalRefreshByActions = Array.isArray(req.body.actions) && req.body.actions.some((a: any) => {
     const id = String(a?.id || '').toLowerCase();
@@ -2119,7 +2121,7 @@ export async function respond(req: any, res: any) {
     monitorRefreshByActions ||
     wifiSignalRefreshByActions ||
     (Array.isArray(req.body.actions) && req.body.actions.some((a: any) =>
-      ['refresh', 'instalaciones sync', 'auth refresh onu-list', 'change refresh onu-list', 'wifi signal refresh'].includes(a.value || a.payload)
+      ['refresh', 'instalaciones sync', 'auth refresh onu-list', 'change refresh onu-list', 'wifi signal refresh', 'monitoreo reboot'].includes(a.value || a.payload)
     ));
 
   // --- DETECTAR Y GUARDAR FORMULARIOS ---
@@ -2390,6 +2392,64 @@ export async function respond(req: any, res: any) {
               onuExternalId,
               graphType,
               refreshedAt: new Date().toISOString(),
+              statusSummary: monitor.statusSummary,
+              rx: monitor.rx,
+              tx: monitor.tx,
+              distanceOltOnu: monitor.distanceOltOnu,
+              onlineUptime: monitor.onlineUptime,
+              signalValue: monitor.signalValue,
+              signal1310: monitor.signal1310,
+              signal1490: monitor.signal1490,
+              runningConfig: monitor.runningConfig,
+              fullStatusInfo: monitor.fullStatusInfo,
+              signalGraphUrl: monitor.signalGraphUrl,
+              trafficGraphUrl: monitor.trafficGraphUrl,
+              smartolt: monitor.raw,
+              failedApis: monitor.failedApis
+            }
+          };
+        }
+      }
+      // --- CLIENT MONITOR FLOW: REBOOT ONU ---
+      else if (lower.startsWith('monitoreo reboot') || lower.startsWith('monitoreo reiniciar') || pickActionValue(req.body?.actions, ['monitor_reboot', 'monitor-reboot'])) {
+        const actionReboot = pickActionValue(req.body?.actions, ['monitor_reboot', 'monitor-reboot']);
+        const source = String(actionReboot || prompt || '');
+        const onuExternalId = (source.match(/(?:reboot|reiniciar)\s+([^\s]+)/i)?.[1] || session?.pendingMonitorClient?.onuExternalId || '').trim();
+
+        if (!onuExternalId) {
+          finalContent = '⚠️ No tengo el ID de ONU para ejecutar reinicio. Vuelve a seleccionar el cliente en monitoreo.';
+          actionsOut = buildMonitorPanelActions();
+        } else {
+          const rebootResult = await rebootOnuByExternalId(onuExternalId).catch((e: any) => ({ error: e?.message || 'error' }));
+          const graphType = normalizeMonitorGraphType(session?.monitorGraphType || 'daily');
+          const monitor = await loadMonitorSmartoltData(onuExternalId, graphType);
+          let selected = session?.pendingMonitorClient || {};
+          if (selected?.clientIdServicio) {
+            const clientApiPayload = await getClientByServiceId(selected.clientIdServicio).catch(() => null);
+            const wisphubSummary = extractMonitorWisphubSummary(selected, clientApiPayload || undefined);
+            selected = { ...selected, ...wisphubSummary };
+            session.pendingMonitorClient = { ...(session.pendingMonitorClient || {}), ...wisphubSummary };
+          }
+          const failedReboot = !!(rebootResult && (rebootResult as any).error);
+          const rebootLine = failedReboot
+            ? `❌ **Reinicio ONU:** ${(rebootResult as any).error}`
+            : `✅ **Reinicio ONU enviado** para ${onuExternalId}`;
+          const graphSection = buildMonitorGraphsSection(monitor);
+          const apiWarnings = monitor.failedApis.length ? `\n\n⚠️ APIs con error: ${monitor.failedApis.join(' | ')}` : '';
+          const lastInvoiceLabel = selected.lastInvoiceDate
+            ? `${selected.lastInvoiceDate}${selected.lastInvoicePaid ? ` (${selected.lastInvoicePaid})` : ''}`
+            : (selected.lastInvoicePaid || 'N/D');
+
+          finalContent = `📡 **Panel Monitoreo SmartOLT**\n\n${rebootLine}\n\n👤 **Cliente:** ${selected.clientName || 'N/D'}\n🆔 **Servicio:** ${selected.clientIdServicio || 'N/D'}\n🌍 **IP:** ${selected.ip || 'N/D'}\n🛰️ **Estado WispHub:** ${selected.wisphubServiceStatus || 'N/D'}\n💳 **Última factura:** ${lastInvoiceLabel}\n🔢 **ONU External ID:** ${onuExternalId}\n🗂️ **Período gráficos:** ${monitorGraphTypeLabel(graphType)}\n📶 **Estado ONU:** ${monitor.statusSummary}\n⏱️ **Tiempo en línea:** ${monitor.onlineUptime || 'N/D'}\n📏 **Distancia ONU-OLT:** ${monitor.distanceOltOnu || 'N/D'}\n📥 **RX:** ${monitor.rx}\n📤 **TX:** ${monitor.tx}${graphSection}${apiWarnings}`;
+          actionsOut = buildMonitorPanelActions(onuExternalId);
+          assistantMetadata = {
+            flow: 'monitor-client',
+            monitor: {
+              ...selected,
+              onuExternalId,
+              graphType,
+              refreshedAt: new Date().toISOString(),
+              rebootResult,
               statusSummary: monitor.statusSummary,
               rx: monitor.rx,
               tx: monitor.tx,
@@ -2682,6 +2742,9 @@ export async function respond(req: any, res: any) {
             actionsOut = [{ id: 'retry', type: 'button', label: '🔄 Reintentar', payload: `wisphub activate ${targetId}` }];
             if (actRes?.status === 429) {
               finalContent += `\n\n⚠️ Respuesta 429 (rate limit). Intenta nuevamente en unos segundos.`;
+            }
+            if (actRes?.error) {
+              finalContent += `\n\nDetalle técnico: ${String(actRes.error).slice(0, 260)}`;
             }
           }
         }

@@ -1087,6 +1087,19 @@ export async function resyncOnuConfigByExternalId(onuExternalId: string | number
   return unwrapSmartoltResponse(res.data);
 }
 
+export async function rebootOnuByExternalId(onuExternalId: string | number): Promise<any> {
+  if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
+  if (!SMARTOLT.apiKey) throw new Error('SMARTOLT_API_KEY not configured');
+  if (!onuExternalId) throw new Error('onuExternalId required');
+
+  const url = `${baseUrl}/api/onu/reboot/${encodeURIComponent(String(onuExternalId))}`;
+  const res = await axios.post(url, undefined, {
+    headers: getHeaders(),
+    timeout: 20000
+  });
+  return unwrapSmartoltResponse(res.data);
+}
+
 export default {
   authorizeOnu,
   getOnuBySerial,
@@ -1117,5 +1130,6 @@ export default {
   getOnuRunningConfigByExternalId,
   getOnuSignalGraphByExternalId,
   getOnuTrafficGraphByExternalId,
-  resyncOnuConfigByExternalId
+  resyncOnuConfigByExternalId,
+  rebootOnuByExternalId
 };
