@@ -1041,18 +1041,7 @@ export async function activarInstalacionGeonet(
     if (!await ensureSession(page)) throw new Error('Auth falló');
     console.log(`${logPrefix} Paso 2/8 - Sesión Geonet OK`);
 
-    // Pre-check corto para evitar bloquear antes de activar.
-    console.log(`${logPrefix} Paso 3/8 - Pre-check corto en /api/clientes (no bloqueante largo)`);
-    const apiBefore = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion, {
-      maxWaitMs: SCRAPING_TIMEOUTS.activationApiPrecheckMaxWaitMs,
-      logPrefix: `${logPrefix} [PRE]`
-    });
-    if (apiBefore.confirmed) {
-      console.log(`${logPrefix} ✅ ya estaba activa (${apiBefore.reason}).`);
-      return { ok: true, status: 200 };
-    }
-
-    console.log(`${logPrefix} Paso 4/8 - Cargando página de activación`);
+    console.log(`${logPrefix} Paso 3/8 - Cargando página de activación`);
     await safeGoto(page, targetUrl, { timeout: SCRAPING_TIMEOUTS.mediumOperation });
 
     // 2. PREPARACIÓN DEL TERRENO
@@ -1065,22 +1054,7 @@ export async function activarInstalacionGeonet(
         if (backdrop) backdrop.remove();
     });
 
-    console.log(`${logPrefix} Paso 5/8 - Revisando estado visual antes de enviar`);
-    const uiBefore = await readActivationUiState(page);
-    if (uiBefore.hasDeactivateButton || uiBefore.bodyLooksActive) {
-      console.log(`${logPrefix} UI parece activa; validando rápido en /api/clientes`);
-      const apiUiBefore = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion, {
-        maxWaitMs: SCRAPING_TIMEOUTS.activationApiPrecheckMaxWaitMs,
-        logPrefix: `${logPrefix} [UI-PRE]`
-      });
-      if (apiUiBefore.confirmed) {
-        console.log(`${logPrefix} ✅ confirmada activa por API (${apiUiBefore.reason}).`);
-        return { ok: true, status: 200 };
-      }
-      console.warn(`${logPrefix} UI sugiere activa pero API no confirma aún: ${apiUiBefore.reason}`);
-    }
-
-    console.log(`${logPrefix} Paso 6/8 - Enviando activación por axios (con csrf+cookies de Puppeteer)`);
+    console.log(`${logPrefix} Paso 4/8 - POST axios obligatorio (primer intento de activación)`);
     const navigationPromise = page
       .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: SCRAPING_TIMEOUTS.activationNavigation })
       .catch(() => null);
@@ -1088,14 +1062,18 @@ export async function activarInstalacionGeonet(
     let submitted = false;
     let submitMode = '';
 
-    const axiosPost = await postActivationViaAxios(page, targetUrl, `${logPrefix} [AXIOS]`);
+    const axiosPost = await postActivationViaAxios(page, targetUrl, `${logPrefix} [AXIOS-FIRST]`);
     if (axiosPost.ok) {
       submitted = true;
       submitMode = 'axios-post';
       console.log(`${logPrefix} activación enviada por axios (${axiosPost.detail || `status=${axiosPost.status}`})`);
     } else {
-      console.warn(`${logPrefix} POST axios no logró activar (${axiosPost.detail || 'sin detalle'}). Fallback a submit Puppeteer...`);
+      console.warn(`${logPrefix} POST axios obligatorio falló (${axiosPost.detail || 'sin detalle'}). Fallback a submit Puppeteer...`);
     }
+
+    console.log(
+      `${logPrefix} Paso 5/8 - ${submitted ? 'POST axios ejecutado correctamente' : 'Ejecutando fallback Puppeteer tras falla de axios'}`
+    );
 
     if (!submitted) {
       const submitResult = await submitActivationForm(page).catch((err: any) => ({
@@ -1120,7 +1098,7 @@ export async function activarInstalacionGeonet(
     }
 
     if (!submitted) {
-      console.log(`${logPrefix} Paso 7/8 - No se pudo enviar; verificación API rápida final`);
+      console.log(`${logPrefix} Paso 6/8 - No se pudo enviar; verificación API rápida final`);
       const apiWithoutClick = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion, {
         maxWaitMs: SCRAPING_TIMEOUTS.activationApiQuickConfirmMaxWaitMs,
         logPrefix: `${logPrefix} [NO-SUBMIT]`
@@ -1136,8 +1114,10 @@ export async function activarInstalacionGeonet(
       };
     }
 
-    console.log(`${logPrefix} Paso 7/8 - Activación enviada (${submitMode}). Confirmación rápida...`);
+    console.log(`${logPrefix} Paso 6/8 - Activación enviada (${submitMode}). Confirmación rápida...`);
     await navigationPromise;
+
+    console.log(`${logPrefix} Paso 7/8 - Verificando UI + API clientes`);
 
     const uiAfter = await waitForActivationUiConfirmation(page, targetUrl);
     if (uiAfter.confirmed) {
@@ -1157,7 +1137,7 @@ export async function activarInstalacionGeonet(
     const pendingReason = `Activación enviada; verificación en segundo plano iniciada. ${apiAfter.reason}`;
     console.warn(`${logPrefix} ⏳ ${pendingReason}`);
     startActivationBackgroundVerification(instalacionId, usuarioInstalacion);
-    console.log(`${logPrefix} Paso 8/8 - Retorno no bloqueante (pendiente)`);
+  console.log(`${logPrefix} Paso 8/8 - Retorno no bloqueante (pendiente)`);
     return { ok: true, status: 202, pending: true, detail: pendingReason };
 
   } catch (error: any) {
