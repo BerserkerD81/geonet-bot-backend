@@ -19,7 +19,7 @@ export const SMTP = {
   port: Number(process.env.SMTP_PORT) || 587,
   secure: (process.env.SMTP_SECURE || 'false').toLowerCase() === 'true',
   user: process.env.SMTP_USER || '',
-  pass: process.env.SMTP_PASS || '',
+  pass: process.env.SMTP_APP_PASS || '',
   from: process.env.SMTP_FROM || 'no-reply@geonet.local',
   appName: process.env.APP_NAME || 'GeoNet'
 };
