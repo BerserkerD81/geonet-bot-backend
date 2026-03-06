@@ -2711,10 +2711,18 @@ export async function respond(req: any, res: any) {
           const actRes = await activarInstalacionGeonet(targetId, fullGeonetUser);
 
           if (actRes?.ok) {
-            finalContent = `🚀 **¡Activación Exitosa!**\nLa instalación **${targetId}** ha sido activada correctamente bajo el usuario \`${fullGeonetUser}\`.\n\nYa puedes cargarle imágenes a la instalación del cliente.`;
+            const activationPending = actRes?.status === 202 || (actRes as any)?.pending === true;
+            if (activationPending) {
+              finalContent = `⏳ **Activación enviada**\nLa instalación **${targetId}** fue enviada a activación para el usuario \`${fullGeonetUser}\`.\n\nLa confirmación se está verificando en segundo plano en la terminal.`;
+              if ((actRes as any)?.detail) {
+                finalContent += `\n\nDetalle: ${String((actRes as any).detail).slice(0, 260)}`;
+              }
+            } else {
+              finalContent = `🚀 **¡Activación Exitosa!**\nLa instalación **${targetId}** ha sido activada correctamente bajo el usuario \`${fullGeonetUser}\`.\n\nYa puedes cargarle imágenes a la instalación del cliente.`;
+            }
 
             // Subida de fotos pendientes si existen
-            if (session.pendingPhotos && session.pendingPhotos.length > 0) {
+            if (!activationPending && session.pendingPhotos && session.pendingPhotos.length > 0) {
               finalContent += `\n\n📤 **Procesando ${session.pendingPhotos.length} fotos acumuladas...**`;
               let uploadedCount = 0;
               for (const photo of session.pendingPhotos) {
@@ -2969,11 +2977,11 @@ export async function respond(req: any, res: any) {
                 for (attempt = 1; attempt <= maxAttempts; attempt++) {
                   try {
                     const res = await activarInstalacionGeonet(targetId, fullUser);
+                    lastStatus = res?.status;
                     if (res && res.ok) {
                       activated = true;
                       break;
                     }
-                    lastStatus = res?.status;
                     if (lastStatus === 429) {
                       finalContent += `\nIntento ${attempt} falló por rate limit (429). Esperando ${Math.round(delayMs / 1000)}s antes de reintentar...`;
                       await sleep(delayMs);
@@ -2989,7 +2997,11 @@ export async function respond(req: any, res: any) {
                 }
 
                 if (activated) {
-                  finalContent += `\n\n🚀 Activación en WispHub completada para ${fullUser}.`;
+                  if (lastStatus === 202) {
+                    finalContent += `\n\n⏳ Activación enviada para ${fullUser}. Confirmación en segundo plano (revisa logs en terminal).`;
+                  } else {
+                    finalContent += `\n\n🚀 Activación en WispHub completada para ${fullUser}.`;
+                  }
                 } else {
                   finalContent += `\n\n⚠️ No se pudo activar automáticamente en WispHub tras ${maxAttempts} intentos.`;
                   if (lastStatus === 429) finalContent += `\n⚠️ Se detectaron errores 429 (rate limit). Espera antes de reintentar.`;

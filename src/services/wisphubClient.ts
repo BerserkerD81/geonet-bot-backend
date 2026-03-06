@@ -30,8 +30,12 @@ const SCRAPING_TIMEOUTS = {
   activationConfirmDelay: 2200,
   activationApiPollTries: 8,
   activationApiPollDelay: 2500,
+  activationApiPrecheckMaxWaitMs: Number(process.env.WISPHUB_ACTIVATION_PRECHECK_WAIT_MS || 8000),
+  activationApiQuickConfirmMaxWaitMs: Number(process.env.WISPHUB_ACTIVATION_QUICK_CONFIRM_WAIT_MS || 12000),
   activationApiMaxWaitMs: Number(process.env.WISPHUB_ACTIVATION_MAX_WAIT_MS || 300000)
 } as const;
+
+const activationBackgroundJobs = new Map<string, Promise<void>>();
 
 // Cache de cookies en memoria. 
 // Usamos 'any[]' para evitar el error de TypeScript TS2322/TS2305 entre Protocol y Puppeteer
@@ -528,6 +532,77 @@ async function submitActivationForm(page: Page): Promise<{ submitted: boolean; m
   });
 }
 
+async function buildCookieHeaderFromPage(page: Page, targetUrl: string): Promise<string> {
+  try {
+    const target = new URL(targetUrl);
+    const cookies = await page.cookies(target.origin, targetUrl);
+    const pairs = cookies
+      .filter((c) => c?.name && typeof c.value === 'string')
+      .map((c) => `${c.name}=${c.value}`);
+    return pairs.join('; ');
+  } catch {
+    const cookies = await page.cookies();
+    const pairs = cookies
+      .filter((c) => c?.name && typeof c.value === 'string')
+      .map((c) => `${c.name}=${c.value}`);
+    return pairs.join('; ');
+  }
+}
+
+async function postActivationViaAxios(
+  page: Page,
+  targetUrl: string,
+  logPrefix: string
+): Promise<{ ok: boolean; status?: number; detail?: string }> {
+  try {
+    const csrfFromInput = await page.$eval(
+      'input[name="csrfmiddlewaretoken"]',
+      (el) => (el as HTMLInputElement).value
+    ).catch(() => '');
+
+    const pageCookies = await page.cookies();
+    const csrfFromCookie = pageCookies.find((c) => c.name === 'csrftoken')?.value || '';
+    const csrfToken = String(csrfFromInput || csrfFromCookie || '').trim();
+
+    if (!csrfToken) {
+      return { ok: false, detail: 'No se encontró csrfmiddlewaretoken en la página/sesión.' };
+    }
+
+    const cookieHeader = await buildCookieHeaderFromPage(page, targetUrl);
+    if (!cookieHeader) {
+      return { ok: false, detail: 'No se pudo construir header Cookie desde la sesión Puppeteer.' };
+    }
+
+    const body = new URLSearchParams();
+    body.set('csrfmiddlewaretoken', csrfToken);
+    body.set('edit_facturacion', '0');
+
+    console.log(`${logPrefix} enviando POST axios a ${targetUrl}`);
+    const response = await axios.post(targetUrl, body.toString(), {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Origin': GEONET_BASE_URL,
+        'Referer': targetUrl,
+        'Cookie': cookieHeader,
+        'X-CSRFToken': csrfToken,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+      },
+      maxRedirects: 10,
+      timeout: SCRAPING_TIMEOUTS.mediumOperation,
+      validateStatus: (status) => status >= 200 && status < 400
+    });
+
+    console.log(`${logPrefix} POST axios status=${response.status}`);
+    return { ok: true, status: response.status, detail: `status=${response.status}` };
+  } catch (error: any) {
+    return {
+      ok: false,
+      status: error?.response?.status,
+      detail: error?.response?.data?.error || error?.message || 'Error POST axios activación'
+    };
+  }
+}
+
 async function waitForActivationUiConfirmation(page: Page, targetUrl: string): Promise<{ confirmed: boolean; reason: string }> {
   let lastState: ActivationUiState | null = null;
 
@@ -579,7 +654,7 @@ async function waitForActivationUiConfirmation(page: Page, targetUrl: string): P
 async function waitForActivationApiConfirmation(
   instalacionId: number | string,
   usuarioInstalacion?: string,
-  opts?: { maxWaitMs?: number }
+  opts?: { maxWaitMs?: number; logPrefix?: string }
 ): Promise<{ confirmed: boolean; reason: string }> {
   return waitForActivationApiConfirmationByClientes(instalacionId, usuarioInstalacion, opts);
 }
@@ -650,23 +725,27 @@ async function findClientForActivationByClientes(
 async function waitForActivationApiConfirmationByClientes(
   instalacionId: number | string,
   usuarioInstalacion?: string,
-  opts?: { maxWaitMs?: number }
+  opts?: { maxWaitMs?: number; logPrefix?: string }
 ): Promise<{ confirmed: boolean; reason: string }> {
   let lastObserved = '';
   const maxWaitMs = Math.max(10000, Number(opts?.maxWaitMs ?? SCRAPING_TIMEOUTS.activationApiMaxWaitMs));
   const startedAt = Date.now();
   let attempt = 0;
+  const logPrefix = opts?.logPrefix || `[Activation:${instalacionId}]`;
 
   while ((Date.now() - startedAt) < maxWaitMs) {
     attempt += 1;
     try {
+      console.log(`${logPrefix} [API] intento ${attempt}: consultando /api/clientes ...`);
       const found = await findClientForActivationByClientes(instalacionId, usuarioInstalacion);
       if (found.payload) {
         const observed = pickClientEstadoForActivation(found.payload);
         const normalized = normalizeStatusText(observed);
         if (normalized) {
           lastObserved = `API clientes estado=${observed} (source=${found.source})`;
+          console.log(`${logPrefix} [API] intento ${attempt}: estado observado=${observed} source=${found.source}`);
           if (isLikelyActiveStatus(observed)) {
+            console.log(`${logPrefix} [API] confirmado ACTIVO en intento ${attempt}`);
             return { confirmed: true, reason: `API clientes activo (${observed}, source=${found.source})` };
           }
           if (isLikelyInactiveStatus(observed) || !isLikelyActiveStatus(observed)) {
@@ -674,12 +753,15 @@ async function waitForActivationApiConfirmationByClientes(
           }
         } else {
           lastObserved = `cliente encontrado sin estado util (source=${found.source})`;
+          console.log(`${logPrefix} [API] intento ${attempt}: cliente encontrado pero estado vacío`);
         }
       } else {
         lastObserved = `sin cliente en /api/clientes/ (${found.debug})`;
+        console.log(`${logPrefix} [API] intento ${attempt}: ${found.debug}`);
       }
     } catch (err: any) {
       lastObserved = `API clientes error: ${err?.message || err}`;
+      console.warn(`${logPrefix} [API] intento ${attempt}: error ${err?.message || err}`);
     }
 
     const elapsed = Date.now() - startedAt;
@@ -694,6 +776,37 @@ async function waitForActivationApiConfirmationByClientes(
     confirmed: false,
     reason: `${lastObserved || 'Sin confirmación de estado activo vía /api/clientes/'} (timeout ${Math.round(maxWaitMs / 1000)}s)`
   };
+}
+
+function startActivationBackgroundVerification(instalacionId: number | string, usuarioInstalacion: string): void {
+  const key = `${String(instalacionId)}::${String(usuarioInstalacion).toLowerCase()}`;
+  if (activationBackgroundJobs.has(key)) {
+    console.log(`[Activation:${instalacionId}] [BG] ya existe verificación en segundo plano para ${usuarioInstalacion}`);
+    return;
+  }
+
+  const job = (async () => {
+    const logPrefix = `[Activation:${instalacionId}] [BG]`;
+    console.log(`${logPrefix} inicio verificación de activación en segundo plano para ${usuarioInstalacion}`);
+    const result = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion, {
+      maxWaitMs: SCRAPING_TIMEOUTS.activationApiMaxWaitMs,
+      logPrefix
+    });
+    if (result.confirmed) {
+      console.log(`${logPrefix} ✅ confirmado activo: ${result.reason}`);
+    } else {
+      console.warn(`${logPrefix} ⚠️ no se confirmó activo: ${result.reason}`);
+    }
+  })()
+    .catch((err: any) => {
+      console.error(`[Activation:${instalacionId}] [BG] error en verificación: ${err?.message || err}`);
+    })
+    .finally(() => {
+      activationBackgroundJobs.delete(key);
+      console.log(`[Activation:${instalacionId}] [BG] fin de verificación`);
+    });
+
+  activationBackgroundJobs.set(key, job);
 }
 
 // --- FUNCIONES WISPHUB (LECTURA API) ---
@@ -916,24 +1029,30 @@ export async function downloadContratoGeonet(instalacionId: number | string): Pr
 export async function activarInstalacionGeonet(
   instalacionId: number | string,
   usuarioInstalacion: string
-): Promise<{ ok: boolean; status?: number; error?: string }> {
+): Promise<{ ok: boolean; status?: number; error?: string; pending?: boolean; detail?: string }> {
   const start = Date.now();
   const { browser, page } = await openPage();
+  const logPrefix = `[Activation:${instalacionId}]`;
 
   const targetUrl = `${GEONET_BASE_URL}/Instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`;
-  console.log(`[Puppeteer] Navegando a: ${targetUrl}`);
+  console.log(`${logPrefix} Paso 1/8 - Navegando a: ${targetUrl}`);
 
   try {
     if (!await ensureSession(page)) throw new Error('Auth falló');
+    console.log(`${logPrefix} Paso 2/8 - Sesión Geonet OK`);
 
-    // Confirmación rápida por API: si ya está activa, no intentamos click.
-    const apiBefore = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion);
+    // Pre-check corto para evitar bloquear antes de activar.
+    console.log(`${logPrefix} Paso 3/8 - Pre-check corto en /api/clientes (no bloqueante largo)`);
+    const apiBefore = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion, {
+      maxWaitMs: SCRAPING_TIMEOUTS.activationApiPrecheckMaxWaitMs,
+      logPrefix: `${logPrefix} [PRE]`
+    });
     if (apiBefore.confirmed) {
-      console.log(`✅ Instalación ${instalacionId} ya estaba activa (${apiBefore.reason}).`);
+      console.log(`${logPrefix} ✅ ya estaba activa (${apiBefore.reason}).`);
       return { ok: true, status: 200 };
     }
 
-    // 1. Cargar la página
+    console.log(`${logPrefix} Paso 4/8 - Cargando página de activación`);
     await safeGoto(page, targetUrl, { timeout: SCRAPING_TIMEOUTS.mediumOperation });
 
     // 2. PREPARACIÓN DEL TERRENO
@@ -946,20 +1065,22 @@ export async function activarInstalacionGeonet(
         if (backdrop) backdrop.remove();
     });
 
-    // Si UI muestra estado activo, lo tomamos como pista, pero NO como éxito final.
+    console.log(`${logPrefix} Paso 5/8 - Revisando estado visual antes de enviar`);
     const uiBefore = await readActivationUiState(page);
     if (uiBefore.hasDeactivateButton || uiBefore.bodyLooksActive) {
-      console.log(`ℹ️ Instalación ${instalacionId} parece activa en UI; validando en /api/clientes/...`);
-      const apiUiBefore = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion);
+      console.log(`${logPrefix} UI parece activa; validando rápido en /api/clientes`);
+      const apiUiBefore = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion, {
+        maxWaitMs: SCRAPING_TIMEOUTS.activationApiPrecheckMaxWaitMs,
+        logPrefix: `${logPrefix} [UI-PRE]`
+      });
       if (apiUiBefore.confirmed) {
-        console.log(`✅ Instalación ${instalacionId} confirmada activa por API (${apiUiBefore.reason}).`);
+        console.log(`${logPrefix} ✅ confirmada activa por API (${apiUiBefore.reason}).`);
         return { ok: true, status: 200 };
       }
-      console.warn(`⚠️ UI sugiere activa pero API no confirma aún: ${apiUiBefore.reason}`);
+      console.warn(`${logPrefix} UI sugiere activa pero API no confirma aún: ${apiUiBefore.reason}`);
     }
 
-    // 3. Click en activación (si existe botón)
-    console.log('[Puppeteer] Enviando formulario de activación...');
+    console.log(`${logPrefix} Paso 6/8 - Enviando activación por axios (con csrf+cookies de Puppeteer)`);
     const navigationPromise = page
       .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: SCRAPING_TIMEOUTS.activationNavigation })
       .catch(() => null);
@@ -967,29 +1088,45 @@ export async function activarInstalacionGeonet(
     let submitted = false;
     let submitMode = '';
 
-    const submitResult = await submitActivationForm(page).catch((err: any) => ({
-      submitted: false,
-      mode: 'error',
-      detail: err?.message || String(err)
-    }));
-
-    if (submitResult.submitted) {
+    const axiosPost = await postActivationViaAxios(page, targetUrl, `${logPrefix} [AXIOS]`);
+    if (axiosPost.ok) {
       submitted = true;
-      submitMode = submitResult.mode;
-      console.log(`[Puppeteer] Formulario enviado (${submitResult.mode}).`);
+      submitMode = 'axios-post';
+      console.log(`${logPrefix} activación enviada por axios (${axiosPost.detail || `status=${axiosPost.status}`})`);
     } else {
-      console.warn(`[Puppeteer] submitActivationForm no logró enviar (${submitResult.detail || 'sin detalle'}). Intentando click fallback...`);
-      const clicked = await clickActivateButton(page);
-      if (clicked) {
+      console.warn(`${logPrefix} POST axios no logró activar (${axiosPost.detail || 'sin detalle'}). Fallback a submit Puppeteer...`);
+    }
+
+    if (!submitted) {
+      const submitResult = await submitActivationForm(page).catch((err: any) => ({
+        submitted: false,
+        mode: 'error',
+        detail: err?.message || String(err)
+      }));
+
+      if (submitResult.submitted) {
         submitted = true;
-        submitMode = 'click-fallback';
+        submitMode = submitResult.mode;
+        console.log(`${logPrefix} formulario enviado (${submitResult.mode})`);
+      } else {
+        console.warn(`${logPrefix} submitActivationForm no logró enviar (${submitResult.detail || 'sin detalle'}). Intentando click fallback...`);
+        const clicked = await clickActivateButton(page);
+        if (clicked) {
+          submitted = true;
+          submitMode = 'click-fallback';
+          console.log(`${logPrefix} fallback click ejecutado`);
+        }
       }
     }
 
     if (!submitted) {
-      const apiWithoutClick = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion);
+      console.log(`${logPrefix} Paso 7/8 - No se pudo enviar; verificación API rápida final`);
+      const apiWithoutClick = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion, {
+        maxWaitMs: SCRAPING_TIMEOUTS.activationApiQuickConfirmMaxWaitMs,
+        logPrefix: `${logPrefix} [NO-SUBMIT]`
+      });
       if (apiWithoutClick.confirmed) {
-        console.log(`✅ Instalación ${instalacionId} confirmada activa sin click (${apiWithoutClick.reason}).`);
+        console.log(`${logPrefix} ✅ confirmada activa sin submit (${apiWithoutClick.reason}).`);
         return { ok: true, status: 200 };
       }
       return {
@@ -999,28 +1136,32 @@ export async function activarInstalacionGeonet(
       };
     }
 
-    console.log(`[Puppeteer] Activación enviada (${submitMode}). Esperando confirmación...`);
+    console.log(`${logPrefix} Paso 7/8 - Activación enviada (${submitMode}). Confirmación rápida...`);
     await navigationPromise;
 
-    // 4. UI es señal de avance, pero el éxito final depende de /api/clientes/
     const uiAfter = await waitForActivationUiConfirmation(page, targetUrl);
     if (uiAfter.confirmed) {
-      console.log(`ℹ️ UI reporta activación (${uiAfter.reason}); validando API de clientes...`);
+      console.log(`${logPrefix} UI reporta activación (${uiAfter.reason}); validando API de clientes...`);
     }
 
-    const apiAfter = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion);
+    const apiAfter = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion, {
+      maxWaitMs: SCRAPING_TIMEOUTS.activationApiQuickConfirmMaxWaitMs,
+      logPrefix: `${logPrefix} [QUICK]`
+    });
     if (apiAfter.confirmed) {
-      console.log(`✅ Activación confirmada por API (${apiAfter.reason}).`);
-      console.log(`[Puppeteer] activarInstalacionGeonet tiempo total: ${Date.now() - start}ms`);
+      console.log(`${logPrefix} ✅ activación confirmada por API (${apiAfter.reason}).`);
+      console.log(`${logPrefix} Paso 8/8 - Fin en ${Date.now() - start}ms`);
       return { ok: true, status: 200 };
     }
 
-    const reason = `Click ejecutado pero sin confirmación de activación. ${uiAfter.reason}. ${apiAfter.reason}.`;
-    console.warn(`⚠️ ${reason}`);
-    return { ok: false, status: 409, error: reason };
+    const pendingReason = `Activación enviada; verificación en segundo plano iniciada. ${apiAfter.reason}`;
+    console.warn(`${logPrefix} ⏳ ${pendingReason}`);
+    startActivationBackgroundVerification(instalacionId, usuarioInstalacion);
+    console.log(`${logPrefix} Paso 8/8 - Retorno no bloqueante (pendiente)`);
+    return { ok: true, status: 202, pending: true, detail: pendingReason };
 
   } catch (error: any) {
-    console.error(`❌ Error activarInstalacionGeonet: ${error.message}`);
+    console.error(`${logPrefix} ❌ Error activarInstalacionGeonet: ${error.message}`);
     return { ok: false, error: error.message };
   } finally {
     await page.close();
