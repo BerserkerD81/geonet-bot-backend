@@ -791,8 +791,12 @@ function pickActionValue(actions: any[] | undefined, ids: string[]): string | un
   if (!Array.isArray(actions)) return undefined;
   for (const id of ids) {
     const hit = actions.find(a => String(a?.id || '').toLowerCase() === id.toLowerCase());
-    if (hit && hit.value !== undefined && hit.value !== null && String(hit.value).trim() !== '') {
-      return String(hit.value).trim();
+    if (hit) {
+      // Check both value and payload fields
+      const val = hit.value ?? hit.payload;
+      if (val !== undefined && val !== null && String(val).trim() !== '') {
+        return String(val).trim();
+      }
     }
   }
   return undefined;
