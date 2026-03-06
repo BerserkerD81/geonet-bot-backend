@@ -1697,6 +1697,17 @@ async function loadMonitorSmartoltData(onuExternalId: string, graphType: Smartol
   const runningConfig = runningRes.status === 'fulfilled' ? runningRes.value : null;
   const signalGraphUrl = signalGraphRes.status === 'fulfilled' ? persistGraphImage(signalGraphRes.value as Buffer) : undefined;
   const trafficGraphUrl = trafficGraphRes.status === 'fulfilled' ? persistGraphImage(trafficGraphRes.value as Buffer) : undefined;
+
+  // Debug: log raw API responses to diagnose empty signal data
+  try {
+    console.log(`[loadMonitorSmartoltData] onuExternalId=${onuExternalId}`);
+    console.log(`[loadMonitorSmartoltData] fullStatus keys:`, fullStatus ? Object.keys(fullStatus) : 'null', typeof fullStatus === 'string' ? fullStatus.slice(0, 300) : '');
+    console.log(`[loadMonitorSmartoltData] details keys:`, details ? Object.keys(details) : 'null', typeof details === 'string' ? details.slice(0, 300) : '');
+    console.log(`[loadMonitorSmartoltData] signal keys:`, signal ? Object.keys(signal) : 'null', typeof signal === 'string' ? signal.slice(0, 300) : '');
+    console.log(`[loadMonitorSmartoltData] signal data:`, JSON.stringify(signal)?.slice(0, 500));
+    console.log(`[loadMonitorSmartoltData] details data:`, JSON.stringify(details)?.slice(0, 500));
+    console.log(`[loadMonitorSmartoltData] fullStatus data:`, JSON.stringify(fullStatus)?.slice(0, 500));
+  } catch (e) { /* ignore logging errors */ }
   const fullStatusInfo = pickFirstString([fullStatus?.full_status_info, fullStatus?.fullStatusInfo]);
   const runningConfigText = pickFirstString([
     runningConfig?.running_config,
