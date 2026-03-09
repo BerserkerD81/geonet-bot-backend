@@ -21,7 +21,8 @@ import {
   agregarArticuloACliente,
   uploadDocumentoCliente,
   getClientByServiceId,
-  _placeholder
+  _placeholder,
+  authorizeOnuAndFixIp
 } from '../services/wisphubClient';
 import { replaceOnuForClient } from '../services/wisphubClient';
 import { getLatestSmartoltOnuSnapshot, scheduleSmartoltOnuSnapshots,captureSmartoltOnuSnapshot} from '../services/smartoltOnuSnapshot';
@@ -628,8 +629,8 @@ function freezeFormActions(originalActions: any[], submittedData: any): any[] {
 
 function defaultsFromEntity(entity: any, type: 'client' | 'installation'): Record<string, any> {
   const isInst = type === 'installation';
-  // Priorizar `plan_internet` (el nombre del plan) por sobre `servicio` (nombre de servicio/usuario)
-  const rawPlan = entity.plan_internet || entity.servicio || pickPlanFromRaw(entity.raw);
+  // Priorizar `plan_internet` (el nombre del plan) por sobre `pickPlanFromRaw`, nunca usar `servicio` para el plan
+  const rawPlan = entity.plan_internet || pickPlanFromRaw(entity.raw);
   const plan = typeof rawPlan === 'object'
     ? pickFirstString([
       rawPlan?.name,
@@ -647,10 +648,10 @@ function defaultsFromEntity(entity: any, type: 'client' | 'installation'): Recor
 
   return {
     sn: entity.sn_onu || undefined,
-    // Priorizar el identificador del servicio (`servicio`) para el campo 'name'
-    // Esto preserva la lógica de extracción de velocidad pero asegura que
-    // el `auth-name` muestre el usuario/servicio como '1256_jorge' cuando exista.
-    name: entity.servicio || plan || clientName || undefined,
+    // El campo 'name' sigue priorizando el identificador de servicio para el nombre de usuario
+    name: entity.servicio || clientName || undefined,
+    // El campo 'plan' es el display name real del plan
+    plan: plan || undefined,
     zone: entity.zona || entity.ciudad || entity.localidad || undefined,
     address_or_comment: entity.direccion || undefined,
     ipv4_address: entity.ipv4_address || entity.ip || entity.ip_publica || (isInst ? entity.ip_cliente : entity.ip_cliente) || undefined,
@@ -733,7 +734,8 @@ function buildClientDetails(entity: any, type: 'client' | 'installation'): strin
   const id = isInst ? (entity.id || entity.id_servicio) : entity.id_servicio;
   const name = `${entity.nombre || ''} ${entity.apellidos || ''}`.trim();
   const address = entity.direccion || 'Sin dirección';
-  const plan = entity.plan_internet || entity.servicio || 'Plan desconocido';
+  // Mostrar el plan real (display name) si está disponible
+  const plan = entity.plan_internet || entity.plan || pickPlanFromRaw(entity.raw) || 'Plan desconocido';
   const phone = entity.telefono || entity.celular || entity.movil || 'N/A';
   const emailData = extractEmails(entity);
   const emailLabel = emailData.primary && emailData.cc && emailData.cc !== emailData.primary
@@ -3986,14 +3988,20 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
   }
 
   // 2. WAN CONFIGURATION
-  const ip = pickFirstString([data.ipv4_address, data.ipv4, data.ip, data.client_ip]);
-  if (ip) {
-    const parts = ip.split('.');
+  // Si hay una nueva IP asignada por Geonet (fixResult.newIp), usarla para la WAN
+  let wanIp = undefined;
+  if (data && data._session && data._session.lastFixedIp) {
+    wanIp = data._session.lastFixedIp;
+  } else {
+    wanIp = pickFirstString([data.ipv4_address, data.ipv4, data.ip, data.client_ip]);
+  }
+  if (wanIp) {
+    const parts = wanIp.split('.');
     const gateway = data.gateway || (parts.length === 4 ? `${parts[0]}.${parts[1]}.${parts[2]}.254` : undefined);
     const subnet = data.subnet_mask || '255.255.255.0';
     try {
-      await setOnuWanModeStaticIp(String(onuId), ip, subnet, gateway || '', '8.8.8.8', '8.8.4.4', {});
-      messages.push(`✅ WAN Configurada (${ip}).`);
+      await setOnuWanModeStaticIp(String(onuId), wanIp, subnet, gateway || '', '8.8.8.8', '8.8.4.4', {});
+      messages.push(`✅ WAN Configurada (${wanIp}).`);
     } catch (e: any) {
       messages.push('❌ Error WAN.');
     }
@@ -4289,23 +4297,120 @@ export async function submitAuth(req: any, res: any) {
       upload_speed_profile_name: merged.upload_speed_profile_name
     };
 
-    // --- CORRECCIÓN ERROR 400 (DUPLICADO) AQUÍ ---
+    // --- CORRECCIÓN ERROR 400 (DUPLICADO) + CORRECCIÓN AUTOMÁTICA DE IP POR ZONA ---
     let result: any;
-    try {
-      result = await authorizeOnu(authPayload);
-    } catch (apiError: any) {
-      // Verificar si es error de ID Duplicado (SmartOLT devuelve 400)
-      const errData = apiError.response?.data || {};
-      const isDuplicate = errData.error_code === 'onu_external_id_not_unique' ||
-        (typeof errData.error === 'string' && errData.error.includes('unique'));
 
-      if (apiError.response?.status === 400 && isDuplicate) {
-        console.log(`⚠️ ONU ${explicitSn} ya existe en SmartOLT (registrada por Puppeteer). Ignorando error 400 y continuando.`);
-        // Simulamos una respuesta exitosa para que el flujo continúe
-        result = { status: true, response_code: 'success' };
+    // Detectar mismatch de zona automáticamente:
+    // - suggestedZone: zona que tiene el cliente en WispHub (viene de state.defaults)
+    // - selectedZone:  zona que el técnico seleccionó en el formulario
+    const suggestedZone: string = String(state.defaults?.zone || '').trim().toLowerCase();
+    const selectedZone: string  = String(merged.zone || '').trim().toLowerCase();
+    const zoneMismatch = !!(suggestedZone && selectedZone && suggestedZone !== selectedZone);
+
+    // Resolver usuario e ID de instalación desde la sesión
+    const geonetUser: string | undefined =
+      session.lastSelectedUsuarioInstalacion ||
+      session.lastAuthNameUsed ||
+      undefined;
+
+    const geonetInstallationId: number | string | undefined =
+      session.lastSelectedInstallationId ||
+      session.lastSelectedClientIdServicio ||
+      targetId ||
+      undefined;
+
+    // Solo corregir si hay mismatch Y tenemos los datos de Geonet necesarios
+    const shouldFixIp = zoneMismatch && !!geonetUser && !!geonetInstallationId;
+
+    if (shouldFixIp) {
+      console.log(
+        `[submitAuth] Mismatch de zona detectado → sugerida="${state.defaults?.zone}" seleccionada="${merged.zone}". Ejecutando corrección de IP...`
+      );
+
+      // Usar el valor original del plan (input raw)
+      // Usar el valor original (raw) que se pasa a normalizeSpeedProfileName como planName
+      // (el mismo que aparece en el log '[normalizeSpeedProfileName] input raw: ...')
+      let planNameSource = undefined;
+      if (typeof state === 'object' && state !== null && state.defaults?.plan_internet) {
+        planNameSource = state.defaults.plan_internet;
+      } else if (typeof merged === 'object' && merged !== null && merged.plan_internet) {
+        planNameSource = merged.plan_internet;
+      } else if (typeof merged === 'object' && merged !== null && merged.plan) {
+        planNameSource = merged.plan;
+      } else if (typeof merged === 'object' && merged !== null && merged.servicio) {
+        planNameSource = merged.servicio;
       } else {
-        // Si es otro error, lo lanzamos para que caiga en el catch principal
-        throw apiError;
+        planNameSource = session.lastSelectedPlan
+          || state.defaults?.plan
+          || merged?.name;
+      }
+      console.log('[submitAuth][DEBUG] planNameSource (raw para plan):', planNameSource);
+      // Router igual a zona si no se especifica
+      let routerName = merged.router || merged.zona || merged.zone || merged.zonaName || merged.zoneName || String(merged.zone || '');
+      // Forzar el planName a ser el display name real (como en la ficha)
+      const planDisplayName = merged.plan || merged.plan_internet || (merged.raw ? pickPlanFromRaw(merged.raw) : undefined) || planNameSource;
+      const fixResult = await authorizeOnuAndFixIp({
+        authorizeParams: authPayload as any,
+        externalIdOrUser: String(geonetUser),
+        installationId: geonetInstallationId!,
+        apName: String(merged.odb || merged.zone || ''),
+        zonaName: String(merged.zone || ''),
+        routerName,
+        comments: `Zona corregida automáticamente de "${state.defaults?.zone}" a "${merged.zone}"`,
+        authorizeFirst: false,
+        planName: planDisplayName,
+      });
+
+      if (fixResult.warnings.length) {
+        console.warn('[submitAuth] authorizeOnuAndFixIp warnings:', fixResult.warnings);
+      }
+      if (fixResult.newIp) {
+        session.lastFixedIp = fixResult.newIp;
+        console.log(`[submitAuth] Nueva IP asignada por Geonet: ${fixResult.newIp}`);
+      }
+
+      // Si SmartOLT no fue autorizado dentro de fixResult, reintentar como fallback
+      if (!fixResult.smartoltAuthorized) {
+        try {
+          result = await authorizeOnu(authPayload as any);
+        } catch (apiError: any) {
+          const errData = apiError.response?.data || {};
+          const isDuplicate = errData.error_code === 'onu_external_id_not_unique' ||
+            (typeof errData.error === 'string' && errData.error.includes('unique'));
+          if (apiError.response?.status === 400 && isDuplicate) {
+            console.log(`⚠️ ONU ${explicitSn} ya existe en SmartOLT. Ignorando error 400.`);
+            result = { status: true, response_code: 'success' };
+          } else {
+            throw apiError;
+          }
+        }
+      } else {
+        result = { status: true, response_code: 'success' };
+      }
+
+    } else {
+      // Ruta normal: sin mismatch o sin datos de Geonet → comportamiento original intacto
+      if (zoneMismatch && (!geonetUser || !geonetInstallationId)) {
+        console.warn(
+          `[submitAuth] Mismatch de zona detectado pero faltan datos de Geonet (user=${geonetUser}, installId=${geonetInstallationId}). Autorizando sin corrección de IP.`
+        );
+      }
+      try {
+        result = await authorizeOnu(authPayload as any);
+      } catch (apiError: any) {
+        // Verificar si es error de ID Duplicado (SmartOLT devuelve 400)
+        const errData = apiError.response?.data || {};
+        const isDuplicate = errData.error_code === 'onu_external_id_not_unique' ||
+          (typeof errData.error === 'string' && errData.error.includes('unique'));
+
+        if (apiError.response?.status === 400 && isDuplicate) {
+          console.log(`⚠️ ONU ${explicitSn} ya existe en SmartOLT (registrada por Puppeteer). Ignorando error 400 y continuando.`);
+          // Simulamos una respuesta exitosa para que el flujo continúe
+          result = { status: true, response_code: 'success' };
+        } else {
+          // Si es otro error, lo lanzamos para que caiga en el catch principal
+          throw apiError;
+        }
       }
     }
     // ------------------------------------------------

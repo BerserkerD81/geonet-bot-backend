@@ -778,6 +778,817 @@ async function waitForActivationApiConfirmationByClientes(
   };
 }
 
+
+// =============================================================================
+// AGREGAR AL FINAL DE wisphubClient.ts
+// Estas funciones usan los helpers privados ya existentes:
+// openPage, ensureSession, safeGoto, GEONET_BASE_URL
+// =============================================================================
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DICCIONARIOS DE MAPEO (copiados del installationService para ser autónomos)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const AP_MAPPING: Record<string, string> = {
+  "CTO 1 Z201 - Villa Maule": "CTO 1 Z201 - Villa Maule",
+  "CTO 2 Z201 - Villa Maule": "CTO 2 Z201 - Villa Maule",
+  "CTO1 - Torre 1- Z13": "CTO1 Z13 - Torre 1 - Brisas Las Rastras",
+  "CTO1 - Z10 - Batallas de Lircay": "CTO1 Z10 - Batallas de Lircay",
+  "CTO1 - Z11 - Batallas de Lircay": "CTO1 Z11 - Batallas de Lircay",
+  "CTO1 - Z12 - Batallas de Lircay": "CTO1 Z12 - Batallas de Lircay",
+  "CTO1 - Z203 -16": "CTO1 - Z203 (16)",
+  "CTO1 - Z306 - Reserva San Miguel": "CTO 1 - Zona 306 - Reserva San Miguel",
+  "CTO1 - Z401 - Parque del Sol": "CTO1 - Z401 - Parque del Sol",
+  "CTO1 - Z402 - Parque del Sol": "CTO1 - Z402 - Parque del Sol",
+  "CTO1 - Z403 - Parque del Sol": "CTO1 - Z403 - Parque del Sol",
+  "CTO1 - Z404 - Parque del Sol": "CTO1 - Z404 - Parque del Sol",
+  "CTO1 - Z406 - Valles de Linares": "CTO1 - Z406 - Valles de Linares",
+  "CTO1 - Z407 - Dona Agustina IV": "CTO1 - Z407 - Doña Agustina IV",
+  "CTO1 - Z9 - Batallas de Lircay": "CTO1 Z9 - Batallas de Lircay",
+  "CTO1 - Zona 302 - Empresas 11 Oriente": "CTO1 - Zona 302 - Empresas 11 Oriente",
+  "CTO1 Torre A - Z15 - Puertas de Lircay II": "CTO1 Torre A - Z15 - Puertas de Lircay II",
+  "CTO1 Z202 - Villa Maule": "CTO1 Z202 - Villa Maule",
+  "CTO1 Z204 - Dona Ignacia IX": "CTO1 - Z204 - Doña ignacia IX",
+  "CTO1 Z205 - Dona Antonia V": "CTO1 Z205 - Doña Antonia V",
+  "CTO1 Z3_16P": "CTO1 Z3",
+  "CTO1 Z4_8P": "CTO1 Z4",
+  "CTO1 Z7 Torre A_16P": "CTO1 Z7 Torre A (1-16)",
+  "CTO1 Z8 Torre E_16P": "CTO1 Z8 Torre E (1-16)",
+  "CTO1- Z14": "CTO1 - Z14",
+  "CTO1-Z5_8P": "CTO1 Z5 1-8",
+  "CTO1-Z6_8P": "CTO1 Z6 1-8",
+  "CTO2  Z3_16P": "CTO2 Z3",
+  "CTO2 - Torre 1- Z13": "CTO2 Z13 - Torre 1 - Brisas Las Rastras",
+  "CTO2 - Z10 - Batallas de Lircay": "CTO2 Z10 - Batallas de Lircay",
+  "CTO2 - Z11 - Batallas de Lircay": "CTO2 Z11 - Batallas de Lircay",
+  "CTO2 - Z12 - Batallas de Lircay": "CTO2 Z12 - Batallas de Lircay",
+  "CTO2 - Z203 -16": "CTO2 - Z203 (16)",
+  "CTO2 - Z306 - Reserva San Miguel": "CTO 2 - Zona 306 - Reserva San Miguel",
+  "CTO2 - Z401 - Parque del Sol": "CTO2 - Z401 - Parque del Sol",
+  "CTO2 - Z402 - Parque del Sol": "CTO2 - Z402 - Parque del Sol",
+  "CTO2 - Z403 - Parque del Sol": "CTO2 - Z403 - Parque del Sol",
+  "CTO2 - Z404 - Parque del Sol": "CTO2 - Z404 - Parque del Sol",
+  "CTO2 - Z406 - Valles de Linares": "CTO2 - Z406 - Valles de Linares",
+  "CTO2 - Z407 - Dona Agustina IV": "CTO2 - Z407 - Doña Agustina IV",
+  "CTO2 - Z9 - Batallas de Lircay": "CTO2 Z9 - Batallas de Lircay",
+  "CTO2 - Zona 302 - Empresas 11 Oriente": "CTO2 - Zona 302 - Empresas 11 Oriente",
+  "CTO2 Torre B - Z15 - Puertas de Lircay II": "CTO2 Torre B - Z15 - Puertas de Lircay II",
+  "CTO2 Z202 - Villa Maule": "CTO2 Z202 - Villa Maule",
+  "CTO2 Z204 - Dona Ignacia IX": "CTO2 - Z204 - Doña Ignacia IX",
+  "CTO2 Z205 - Dona Antonia V": "CTO2 Z205 - Doña Antonia V",
+  "CTO2 Z4_16P": "CTO2 Z4",
+  "CTO2 Z7 Torre B_16P": "CTO2 Z7 Torre B (1-16)",
+  "CTO2 Z8 Torre F_16P": "CTO2 Z8 Torre F (1-16)",
+  "CTO2- Z14": "CTO2 - Z14",
+  "CTO2-Z5_1-16": "CTO2 Z5 1-16",
+  "CTO2-Z6_1-16": "CTO2 Z6 1-16",
+  "CTO3  Z303 - Centro Comercial": "CTO3  Z303 - Centro Comercial",
+  "CTO3 - Z10 - Batallas de Lircay": "CTO3 Z10 - Batallas de Lircay",
+  "CTO3 - Z11 - Batallas de Lircay": "CTO3 Z11 - Batallas de Lircay",
+  "CTO3 - Z12 - Batallas de Lircay": "CTO3 Z12 - Batallas de Lircay",
+  "CTO3 - Z203 -16": "CTO3 - Z203 (16)",
+  "CTO3 - Z306 - Reserva San Miguel": "CTO 3 - Zona 306 - Reserva San Miguel",
+  "CTO3 - Z401 - Parque del Sol": "CTO3 - Z401 - Parque del Sol",
+  "CTO3 - Z402 - Parque del Sol": "CTO3 - Z402 - Parque del Sol",
+  "CTO3 - Z403 - Parque del Sol": "CTO3 - Z403 - Parque del Sol",
+  "CTO3 - Z404 - Parque del Sol": "CTO3 - Z404 - Parque del Sol",
+  "CTO3 - Z406 - Valles de Linares": "CTO3 - Z406 - Valles de Linares",
+  "CTO3 - Z407 - Dona Agustina IV": "CTO3 - Z407 - Doña Agustina IV",
+  "CTO3 - Z9 - Batallas de Lircay": "CTO3 Z9 - Batallas de Lircay",
+  "CTO3 - Zona 302 - Empresas 11 Oriente": "CTO3 - Zona 302 - Empresas 11 Oriente",
+  "CTO3 Torre C - Z15 - Puertas de Lircay II": "CTO3 Torre C - Z15 - Puertas de Lircay II",
+  "CTO3 Z201 - Villa Maule": "CTO3 Z201 - Villa Maule",
+  "CTO3 Z202 - Villa Maule": "CTO3 Z202 - Villa Maule",
+  "CTO3 Z204 - Dona Ignacia IX": "CTO3 - Z204 - Doña Ignacia IX",
+  "CTO3 Z205 - Dona Antonia V": "CTO3 Z205 - Doña Antonia V",
+  "CTO3 Z3_16P": "CTO3 Z3",
+  "CTO3 Z4": "CTO3 Z4",
+  "CTO3 Z7 Torre C": "CTO3 Z7 Torre C (1-16)",
+  "CTO3 Z8 Torre G": "CTO3 Z8 Torre G (1-16)",
+  "CTO3- Torre 2- Z13": "CTO3 Z13 - Torre 2 - Brisas Las Rastras",
+  "CTO3- Z14": "CTO3 - Z14",
+  "CTO3-Z5_1-16": "CTO3 Z5 1-16",
+  "CTO4  Z3": "CTO4 Z3",
+  "CTO4 - Torre 2- Z13": "CTO4 Z13 - Torre 2 - Brisas Las Rastras",
+  "CTO4 - Z10 - Batallas de Lircay": "CTO4 Z10 - Batallas de Lircay",
+  "CTO4 - Z11 - Batallas de Lircay": "CTO4 Z11 - Batallas de Lircay",
+  "CTO4 - Z12 - Batallas de Lircay": "CTO4 Z12 - Batallas de Lircay",
+  "CTO4 - Z203 -16": "CTO4 - Z203 (16)",
+  "CTO4 - Z306 - Reserva San Miguel": "CTO 4 - Zona 306 - Reserva San Miguel",
+  "CTO4 - Z401 - Parque del Sol": "CTO4 - Z401 - Parque del Sol",
+  "CTO4 - Z402 - Parque del Sol": "CTO4 - Z402 - Parque del Sol",
+  "CTO4 - Z403 - Parque del Sol": "CTO4 - Z403 - Parque del Sol",
+  "CTO4 - Z404 - Parque del Sol": "CTO4 - Z404 - Parque del Sol",
+  "CTO4 - Z406 - Valles de Linares": "CTO4 - Z406 - Valles de Linares",
+  "CTO4 - Z407 - Dona Agustina IV": "CTO4 - Z407 - Doña Agustina IV",
+  "CTO4 - Z9 - Batallas de Lircay": "CTO4 Z9 - Batallas de Lircay",
+  "CTO4 - Zona 302 - Empresas 11 Oriente": "CTO4 - Zona 302 - Empresas 11 Oriente",
+  "CTO4 Torre D - Z15 - Puertas de Lircay II": "CTO4 Torre D - Z15 - Puertas de Lircay II",
+  "CTO4 Z201 - Villa Maule": "CTO4 Z201 - Villa Maule",
+  "CTO4 Z202 - Villa Maule": "CTO4 Z202 - Villa Maule",
+  "CTO4 Z204 - Dona Ignacia IX": "CTO4 - Z204 - Doña Ignacia IX",
+  "CTO4 Z205 - Dona Antonia V": "CTO4 Z205 - Doña Antonia V",
+  "CTO4 Z4": "CTO4 Z4",
+  "CTO4 Z7 Torre D": "CTO4 Z7 Torre D (1-16)",
+  "CTO4 Z8 Torre H": "CTO4 Z8 Torre H (1-16)",
+  "CTO4- Z14": "CTO4 - Z14",
+  "CTO4-Z5_1-16": "CTO4 Z5 1-16",
+  "CTO5 - Torre 3- Z13": "CTO5 Z13 - Torre 3 - Brisas Las Rastras",
+  "CTO5 - Z11 - Batallas de Lircay": "CTO5 Z11 - Batallas de Lircay",
+  "CTO5 - Z12 - Batallas de Lircay": "CTO5 Z12 - Batallas de Lircay",
+  "CTO5 - Z203 -16": "CTO5 - Z203 (16)",
+  "CTO5 - Z401 - Parque del Sol": "CTO5 - Z401 - Parque del Sol",
+  "CTO5 - Z402 - Parque del Sol": "CTO5 - Z402 - Parque del Sol",
+  "CTO5 - Z403 - Parque del Sol": "CTO5 - Z403 - Parque del Sol",
+  "CTO5 - Z404 - Parque del Sol": "CTO5 - Z404 - Parque del Sol",
+  "CTO5 - Z406 - Valles de Linares": "CTO5 - Z406 - Valles de Linares",
+  "CTO5 - Z407 - Dona Agustina IV": "CTO5 - Z407 - Doña Agustina IV",
+  "CTO5 - Zona 302 - Empresas 11 Oriente": "CTO5 - Zona 302 - Empresas 11 Oriente",
+  "CTO5 Torre E - Z16 - Puertas de Lircay II": "CTO1 Torre E - Z16 - Puertas de Lircay II",
+  "CTO5 Z14 - Valles de Talca II": "CTO5 Z14 - Valles de Talca",
+  "CTO5 Z201 - Villa Maule": "CTO5 Z201 - Villa Maule",
+  "CTO5 Z202 - Villa Maule": "CTO5 Z202 - Villa Maule",
+  "CTO5 Z204 - Dona Ignacia IX": "CTO5 - Z204 - Doña Ignacia IX",
+  "CTO5 Z4": "CTO5 Z4",
+  "CTO5- Z306 - Reserva San Miguel": "CTO 5 - Zona 306 - Reserva San Miguel",
+  "CTO6 - Torre 3- Z13": "CTO6 Z13 - Torre 3 - Brisas Las Rastras",
+  "CTO6 - Z203 -16": "CTO6 - Z203 (16)",
+  "CTO6 - Z306 - Reserva San Miguel": "CTO 6 - Zona 306 - Reserva San Miguel",
+  "CTO6 - Z401 - Parque del Sol": "CTO6 - Z401 - Parque del Sol",
+  "CTO6 - Z402 - Parque del Sol": "CTO6 - Z402 - Parque del Sol",
+  "CTO6 - Z403 - Parque del Sol": "CTO6 - Z403 - Parque del Sol",
+  "CTO6 - Z404 - Parque del Sol": "CTO6 - Z404 - Parque del Sol",
+  "CTO6 - Z406 - Valles de Linares": "CTO6 - Z406 - Valles de Linares",
+  "CTO6 - Z407 - Dona Agustina IV": "CTO6 - Z407 - Doña Agustina IV",
+  "CTO6 - Zona 302 - Empresas 11 Oriente": "CTO6 - Zona 302 - Empresas 11 Oriente",
+  "CTO6 Torre F - Z16 - Puertas de Lircay II": "CTO2 Torre F - Z16 - Puertas de Lircay II",
+  "CTO6 Z14 - Valles de Talca II": "CTO6 Z14 - Valles de Talca.",
+  "CTO6 Z201 - Villa Maule": "CTO6 Z201 - Villa Maule",
+  "CTO6 Z202 - Villa Maule": "CTO6 Z202 - Villa Maule",
+  "CTO6 Z204 - Dona Ignacia IX": "CTO6 - Z204 - Dona Ignacia IX",
+  "CTO6 Z4 _8P": "CTO6 Z4",
+  "Spliter 1 Torre A - Mirador Urbano": "Edificio Mirador Urbano Torre A",
+  "Spliter 1 Torre B - Mirador Urbano": "Edificio Mirador Urbano Torre B",
+  "Spliter 1 Torre C - Mirador Urbano": "Edificio Mirador Urbano Torre C",
+  "Spliter 1 Torre D - Mirador Urbano": "Edificio Mirador Urbano Torre D",
+  "Spliter 2 Torre A - Mirador Urbano": "Edificio Mirador Urbano Torre A",
+  "Spliter 2 Torre B - Mirador Urbano": "Edificio Mirador Urbano Torre B",
+  "Spliter 2 Torre C - Mirador Urbano": "Edificio Mirador Urbano Torre C",
+  "Spliter 2 Torre D - Mirador Urbano": "Edificio Mirador Urbano Torre D",
+};
+
+const ZONE_MAPPING: Record<string, string> = {
+  "Villa Maule - Z201": "Villa Maule - Zona 201 - Vlan 201",
+  "Brisas las Rastras - Z13": "Brisas Las Rastras - Zona 13 - Vlan 112",
+  "Batallas de Lircay - Z10": "Batallas de Lircay - Zona 10 - Vlan 109",
+  "Batallas de Lircay - Z11": "Batallas de Lircay - Zona 11 - Vlan 110",
+  "Batallas de Lircay - Z12": "Batallas de Lircay - Zona 12 - Vlan 111",
+  "Portal Maule - Z203": "Portal II Maule - Zona 203 - Vlan 203",
+  "Reserva San Miguel - Zona 306 - Vlan 306": "Reserva San Miguel - Zona 306 - Vlan 306",
+  "Parque de Sol - Z401": "Parque del Sol - Zona 401 - Vlan 401",
+  "Parque de Sol - Z402": "Parque del Sol - Zona 402 - Vlan 402",
+  "Parque de Sol - Z403": "Parque del Sol - Zona 403 - Vlan 403",
+  "Parque de Sol 4 - Z404": "Parque del Sol 4 - Zona 404 - Vlan 404",
+  "Valles de Linares - Z406": "Valles de Linares - Zona 406 - Vlan 406",
+  "Dona Agustina IV - Z407": "Doña Agustina IV - Zona 407 - Vlan 407",
+  "Batallas de Lircay - Z9": "Batallas de Lircay - Zona 9 - Vlan 108",
+  "Empresas 11 Oriente - Z302": "Empresas 11 Oriente - Zona 302 - Vlan 302",
+  "Puertas de Lircay II - Torre A-D - Zona 15 - Vlan 114": "Puertas de Lircay II - Zona 15 - Vlan 114",
+  "Villa Maule - Z202": "Villa Maule - Zona 202 - Vlan 202",
+  "Dona Ignacia IX - Zona 204 - Vlan 204": "Doña Ignacia IX - Zona 204 - Vlan 204",
+  "Dona Antonia V - Zona 205 - Vlan 205": "Doña Antonia V - Zona 205 - Vlan 205",
+  "Valles de Talca - Z14": "Valles de Talca II - Zona 14 - Vlan 113",
+  "Parque_San_Valentin-Z5": "Parque San Valentin - Zona 5 - Vlan 104",
+  "Parque_San_Valentin-Z6": "Parque San Valentin - Zona 6 - Vlan 105",
+  "Edificio Hacienda Esmeralda lll - Z303": "Edificio Hacienda Esmeralda III - Zona 303 - Vlan 303",
+  "Puertas de Lircay II - Torre E-H - Zona 16 - Vlan 115": "Puertas de Lircay II - Zona 16 - Vlan 115",
+  "Alto Las Rastras - Z301": "Centro Comercial Alto Las Rastras - Zona 301 - Vlan 301.-",
+  "Centro Comercial Casa Boulevard  - Z304 - Vlan 304": "Centro Comercial Casa Boulevard - Zona 304 - Vlan 304",
+  "Centro Comercial Paseo Hacienda - Z305 - Vlan 305": "Centro Comercial Pase Hacienda - Zona 305 - Vlan 305",
+  "Mirador Urbano A-B": "Condominio Mirador Urbano Torre A y B - Vlan100",
+  "Mirador Urbano C-D": "Condominio Mirador Urbano Torre A y B - Vlan100",
+  "Parque de Sol 5- Z405": "Parque del Sol 5 - Zona 405 - Vlan 405",
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HELPERS INTERNOS DE TEXTO (misma lógica que ya usa el archivo)
+// ─────────────────────────────────────────────────────────────────────────────
+
+type SelectOption = { value: string; text: string; title?: string; dataEmail?: string };
+
+function _normalizeText(value: string): string {
+  return value.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim();
+}
+
+function _extractNumericTokens(value: string): string[] {
+  return value ? (value.match(/\d+/g) || []) : [];
+}
+
+function _extractTowerLetter(s: string): string {
+  return s.match(/torre\s*[:#\-]?\s*([A-Za-z0-9])/i)?.[1]?.toLowerCase() || '';
+}
+
+function _calcScore(target: string, candidate: string): number {
+  if (!target || !candidate) return 0;
+  if (candidate.includes(target)) return 1;
+  const tTokens = new Set(target.split(' ').filter(Boolean));
+  const cTokens = new Set(candidate.split(' ').filter(Boolean));
+  if (!tTokens.size || !cTokens.size) return 0;
+  let overlap = 0;
+  for (const t of tTokens) if (cTokens.has(t)) overlap++;
+  return overlap / new Set([...tTokens, ...cTokens]).size;
+}
+
+/**
+ * Busca el value del <select> cuyo texto más se parece a optionName.
+ * Si hay select2/buscador, simula escribir y selecciona la opción sugerida más cercana.
+ */
+function _findSelectValue(options: SelectOption[], optionName: string): string {
+  // Matching flexible: ignora tildes, mayúsculas, paréntesis, guiones y espacios extra
+  function clean(s: string) {
+    return s
+      .toLowerCase()
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/[\(\)\-]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+  const target = clean(optionName);
+  let bestValue = '';
+  let bestScore = 0;
+  for (const opt of options) {
+    const normText = clean(opt.text);
+    // Score: coincidencia exacta, incluye, o mayor cantidad de palabras compartidas
+    let score = 0;
+    if (normText === target) score = 100;
+    else if (normText.includes(target)) score = 80;
+    else {
+      // Palabras compartidas
+      const tSet = new Set(target.split(' '));
+      const nSet = new Set(normText.split(' '));
+      const shared = [...tSet].filter(x => nSet.has(x)).length;
+      score = shared * 10 - Math.abs(normText.length - target.length);
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      bestValue = opt.value;
+    }
+  }
+  return bestValue;
+}
+
+async function _extractSelectOptions(page: any, selector: string): Promise<SelectOption[]> {
+  return page.evaluate((sel: string) => {
+    const select = document.querySelector(sel) as HTMLSelectElement;
+    if (!select) return [];
+    return Array.from(select.options).map(opt => ({
+      value: opt.value,
+      text: opt.textContent?.trim() || '',
+      title: opt.getAttribute('title') || '',
+      dataEmail: opt.getAttribute('data-email') || ''
+    }));
+  }, selector);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FUNCIÓN PRINCIPAL: editarInstalacionGeonet
+// Equivalente al del installationService pero usando los helpers de este archivo
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type EditarInstalacionParams = {
+  /** username/externalId del cliente en Geonet (ej: "juan.perez_18572016") */
+  externalIdOrUser: string;
+  /** ID numérico de la instalación en Geonet */
+  installationId: string | number;
+  updates: {
+    /** Nombre del AP/CTO como aparece en SmartOLT o en el diccionario AP_MAPPING */
+    apName?: string;
+    /** Clave del ZONE_MAPPING (ej: "Parque de Sol - Z402") o nombre libre */
+    zonaName?: string;
+    /** Nombre del router (opcional) */
+    routerName?: string;
+    /** Nombre del técnico (opcional) */
+    technicianName?: string;
+    /** Nota que se agrega a los comentarios existentes */
+    comments?: string;
+    /** Cualquier otro campo del formulario (clave = nombre del input en Geonet) */
+    [key: string]: any;
+  };
+};
+
+export type EditarInstalacionResult = {
+  status: number;
+  /** URL final tras el POST (para validar si Geonet redirigió = éxito) */
+  location: string;
+  /** Errores de validación devueltos por Geonet */
+  formErrors: string[];
+  /** Campos efectivamente enviados al formulario */
+  appliedUpdates: Record<string, string>;
+  /** IP que quedó en el formulario tras la edición */
+  newIp: string | null;
+};
+
+export async function editarInstalacionGeonet(
+  params: EditarInstalacionParams
+): Promise<EditarInstalacionResult> {
+  const { externalIdOrUser, installationId: _installationId, updates } = params;
+  console.log('[editarInstalacionGeonet][DEBUG] Params recibidos:', {
+    externalIdOrUser,
+    installationId: _installationId,
+    updates
+  });
+
+  if (!externalIdOrUser) {
+    throw Object.assign(
+      new Error('externalIdOrUser es requerido'),
+      { statusCode: 400 }
+    );
+  }
+
+  // Extraer el primer número de externalIdOrUser como installationId
+  const numericMatch = String(externalIdOrUser).match(/\d+/);
+  const installationId = numericMatch ? numericMatch[0] : String(_installationId || '');
+  if (!installationId) {
+    throw Object.assign(
+      new Error('No se pudo determinar installationId desde externalIdOrUser'),
+      { statusCode: 400 }
+    );
+  }
+
+  const { browser, page } = await openPage();
+
+  try {
+    if (!await ensureSession(page)) throw new Error('Auth falló en Geonet');
+
+    const url = `${GEONET_BASE_URL}/Instalaciones/editar/${encodeURIComponent(externalIdOrUser)}/${installationId}/`;
+    console.log(`[editarInstalacionGeonet] Navegando a: ${url}`);
+
+    await safeGoto(page, url, { waitForSelector: 'form#agregar-cliente' });
+
+    // ── Mapear campos simples ─────────────────────────────────────────────
+    // (El log de resolvedUpdates se mueve después de su declaración)
+    const fieldMap: Record<string, string> = {
+      ip: 'cliente-ip',
+      mac: 'cliente-mac_cpe',
+      estado: 'cliente-estado_instalacion',
+      fechaInstalacion: 'cliente-fecha_instalacion',
+      fecha_instalacion: 'cliente-fecha_instalacion',
+      costo: 'cliente-costo_instalacion',
+      firstName: 'usr-first_name',
+      lastName: 'usr-last_name',
+      ci: 'perfil-cedula',
+      email: 'usr-email',
+      address: 'perfil-direccion',
+      city: 'perfil-ciudad',
+      phone: 'perfil-telefono',
+    };
+
+    const specialKeys = new Set(['apName', 'zonaName', 'routerName', 'technicianName', 'comments']);
+    const resolvedUpdates: Record<string, string> = {};
+    console.log('[editarInstalacionGeonet][DEBUG] resolvedUpdates iniciales:', resolvedUpdates);
+
+    for (const [key, value] of Object.entries(updates)) {
+      if (value === undefined || value === null) continue;
+      if (specialKeys.has(key)) continue;
+      resolvedUpdates[fieldMap[key] || key] = String(value);
+    }
+
+    // ── Resolver zona con ZONE_MAPPING ───────────────────────────────────
+    let planValue: string | null = null;
+    if (updates.zonaName) {
+      // Guardar el valor actual del plan antes de cambiar la zona
+      try {
+        planValue = await page.$eval('#id_cliente-plan_internet', (el: any) => el.value || '');
+      } catch {}
+
+      const zonaOpts = await _extractSelectOptions(page, '#id_cliente-zona_cliente, select[name*="zona_cliente" i]');
+      const mapped = ZONE_MAPPING[String(updates.zonaName).trim()] || updates.zonaName;
+      let zonaId = _findSelectValue(zonaOpts, mapped);
+      if (!zonaId && mapped !== updates.zonaName) {
+        zonaId = _findSelectValue(zonaOpts, updates.zonaName);
+      }
+      if (!zonaId && typeof page.type === 'function') {
+        // Si hay select2/buscador, simula escribir el texto y seleccionar la opción sugerida
+        await page.focus('#id_cliente-zona_cliente');
+        await page.type('#id_cliente-zona_cliente', mapped, {delay: 30});
+        // Espera a que aparezca la opción sugerida y selecciona la primera
+        await page.keyboard.press('ArrowDown');
+        await page.keyboard.press('Enter');
+        // Vuelve a extraer el valor seleccionado
+        const selected = await page.$eval('#id_cliente-zona_cliente', el => (el as HTMLSelectElement).value);
+        if (selected) zonaId = selected;
+      }
+      if (!zonaId) {
+        console.warn(`[editarInstalacionGeonet] Zona no encontrada. Target: "${mapped}". Opciones disponibles:`);
+        zonaOpts.forEach(opt => console.warn(`  - [${opt.value}] ${opt.text}`));
+      } else {
+        resolvedUpdates['cliente-zona_cliente'] = zonaId;
+        console.log(`[editarInstalacionGeonet] Zona resuelta: "${mapped}" → id=${zonaId}`);
+      }
+
+      // Validar y restaurar el plan
+      let planValid = false;
+      let planOptions: {value: string, text: string}[] = [];
+      try {
+        planOptions = await page.evaluate(() => {
+          const sel = document.querySelector('#id_cliente-plan_internet') as HTMLSelectElement | null;
+          if (!sel) return [];
+          return Array.from(sel.options).map(opt => ({ value: opt.value, text: opt.text }));
+        });
+        if (planValue && planOptions.some(opt => opt.value === planValue)) {
+          planValid = true;
+        }
+      } catch {}
+
+      if (!planValid && planOptions.length > 0) {
+        // Seleccionar el primer plan disponible
+        planValue = planOptions[0].value;
+        console.warn(`[editarInstalacionGeonet] El plan anterior no es válido para la nueva zona. Se usará el primer plan disponible: ${planValue}`);
+      } else if (!planValid) {
+        planValue = '';
+        console.warn(`[editarInstalacionGeonet] No se pudo determinar un plan válido para la zona seleccionada.`);
+      } else {
+        console.log(`[editarInstalacionGeonet] Plan restaurado: ${planValue}`);
+      }
+    }
+
+    // ── Resolver AP con AP_MAPPING ────────────────────────────────────────
+    if (updates.apName) {
+      const apOpts = await _extractSelectOptions(page, '#id_cliente-ap_cliente, select[name*="ap_cliente" i]');
+      const mapped = AP_MAPPING[String(updates.apName).trim()] || updates.apName;
+      let apId = _findSelectValue(apOpts, mapped);
+      if (!apId && mapped !== updates.apName) {
+        apId = _findSelectValue(apOpts, updates.apName);
+      }
+      if (!apId && typeof page.type === 'function') {
+        await page.focus('#id_cliente-ap_cliente');
+        await page.type('#id_cliente-ap_cliente', mapped, {delay: 30});
+        await page.keyboard.press('ArrowDown');
+        await page.keyboard.press('Enter');
+        const selected = await page.$eval('#id_cliente-ap_cliente', el => (el as HTMLSelectElement).value);
+        if (selected) apId = selected;
+      }
+      if (!apId) {
+        console.warn(`[editarInstalacionGeonet] AP no encontrado. Target: "${mapped}". Opciones disponibles:`);
+        apOpts.forEach(opt => console.warn(`  - [${opt.value}] ${opt.text}`));
+      } else {
+        resolvedUpdates['cliente-ap_cliente'] = apId;
+        console.log(`[editarInstalacionGeonet] AP resuelto: "${mapped}" → id=${apId}`);
+      }
+    }
+
+    // ── Resolver router ──────────────────────────────────────────────────
+    // Si no se especifica routerName, usar el mismo valor que zonaName
+    let routerToUse = updates.routerName;
+    if (!routerToUse && updates.zonaName) {
+      routerToUse = updates.zonaName;
+    }
+    if (routerToUse) {
+      const routerOpts = await _extractSelectOptions(page, '#id_cliente-router_cliente, select[name*="router_cliente" i]');
+      const routerId = _findSelectValue(routerOpts, String(routerToUse));
+      if (routerId) {
+        resolvedUpdates['cliente-router_cliente'] = routerId;
+        console.log(`[editarInstalacionGeonet] Router resuelto: "${routerToUse}" → id=${routerId}`);
+      }
+    }
+
+    // ── Resolver técnico ──────────────────────────────────────────────────
+    if (updates.technicianName) {
+      const techOpts = await _extractSelectOptions(page, '#id_cliente-tecnico, select[name*="tecnico" i]');
+      const techId = _findSelectValue(techOpts, String(updates.technicianName));
+      if (techId) {
+        resolvedUpdates['cliente-tecnico'] = techId;
+        console.log(`[editarInstalacionGeonet] Técnico resuelto: "${updates.technicianName}" → id=${techId}`);
+      }
+    }
+
+    // ── Disparar eventos change para que Geonet refresque las IPs ────────
+    // Esto es el paso clave: al cambiar zona/router en el DOM, Geonet
+    // recalcula las IPs disponibles igual que en el formulario de activación.
+    await page.evaluate((rVal: string, zVal: string, aVal: string) => {
+      const triggerChange = (selector: string, val: string) => {
+        const el = document.querySelector(selector) as HTMLSelectElement | null;
+        if (!el || !val) return;
+        el.value = val;
+        if (typeof (window as any).jQuery !== 'undefined') {
+          (window as any).jQuery(el).trigger('change');
+        } else {
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      };
+      triggerChange('#id_cliente-zona_cliente, select[name*="zona_cliente" i]', zVal);
+      triggerChange('#id_cliente-router_cliente, select[name*="router_cliente" i]', rVal);
+      triggerChange('#id_cliente-ap_cliente, select[name*="ap_cliente" i]', aVal);
+    },
+      resolvedUpdates['cliente-router_cliente'] || '',
+      resolvedUpdates['cliente-zona_cliente'] || '',
+      resolvedUpdates['cliente-ap_cliente'] || ''
+    );
+
+    // --- Seleccionar el plan SOLO una vez, después de refrescar zona/router/AP ---
+    if (updates.planName) {
+      // Esperar hasta 10 segundos a que el select tenga opciones válidas (no solo que exista)
+      await page.waitForFunction(() => {
+        const sel = document.querySelector('#id_cliente-plan_internet') as HTMLSelectElement | null;
+        return !!sel && Array.from(sel.options).filter(o => o.value && o.text && o.text.trim().length > 0).length > 0;
+      }, { timeout: 10000 }).catch(() => null);
+
+      // Fuzzy match robusto sobre toda la lista de planes
+      const planName = String(updates.planName).trim();
+      const normalize = (s: string): string => s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+      const planTokens: string[] = normalize(planName).split(' ').filter(Boolean);
+      const planOptions = await page.evaluate(() => {
+        const sel = document.querySelector('#id_cliente-plan_internet') as HTMLSelectElement | null;
+        if (!sel) return [];
+        return Array.from(sel.options).map(opt => ({ value: opt.value, text: opt.text }));
+      });
+      console.log('[editarInstalacionGeonet][PLAN] Valor recibido para planName:', planName);
+      console.log('[editarInstalacionGeonet][PLAN] Opciones disponibles (detallado):', planOptions);
+      if (planOptions.length > 0) {
+        for (const opt of planOptions) {
+          console.log(`[editarInstalacionGeonet][PLAN] Opción: value="${opt.value}" text="${opt.text}"`);
+        }
+      }
+      if (planOptions.length === 0) {
+        const planSelectHtml = await page.evaluate(() => {
+          const sel = document.querySelector('#id_cliente-plan_internet');
+          return sel ? sel.outerHTML : null;
+        });
+        console.warn('[editarInstalacionGeonet][PLAN] <select> de plan sigue vacío tras esperar. HTML:', planSelectHtml);
+        // No seleccionar ningún plan si el select está vacío
+      } else {
+        // Fuzzy match: usar la librería Fuse.js si está disponible, si no, usar scoring manual
+        let selectedPlanValue = '';
+        let bestScore = -1;
+        let bestText = '';
+        for (const opt of planOptions) {
+          const normOpt = normalize(opt.text || '');
+          // Score: +20 por cada token del planName que esté en la opción
+          let score = 0;
+          for (const token of planTokens) {
+            if (normOpt.includes(token)) score += 20;
+          }
+          // Bonus si incluye el precio y la velocidad
+          if (planTokens.some((t: string) => /\d+mbps?/.test(t)) && /\d+mbps?/.test(normOpt)) score += 10;
+          if (planTokens.some((t: string) => /\$\d+/.test(t)) && /\$\d+/.test(normOpt)) score += 10;
+          // Bonus si incluye el nombre completo (sin sufijos)
+          if (normOpt.includes(normalize(planName))) score += 30;
+          // Penalización si la opción es genérica (menos tokens en común)
+          score -= Math.abs(normOpt.length - normalize(planName).length);
+          if (score > bestScore) {
+            bestScore = score;
+            selectedPlanValue = opt.value;
+            bestText = opt.text;
+          }
+        }
+        if (selectedPlanValue && bestScore > 0) {
+          await page.evaluate((val) => {
+            const planEl = document.querySelector('#id_cliente-plan_internet') as HTMLSelectElement | null;
+            if (planEl) {
+              planEl.value = val;
+              if (typeof (window as any).jQuery !== 'undefined') {
+                (window as any).jQuery(planEl).trigger('change');
+              } else {
+                planEl.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+            }
+          }, selectedPlanValue);
+          console.log(`[editarInstalacionGeonet][PLAN] Plan seleccionado: input="${planName}" → match="${bestText}" (value=${selectedPlanValue}, score=${bestScore})`);
+        } else {
+          console.warn(`[editarInstalacionGeonet][PLAN] No se pudo seleccionar un plan por fuzzy match, y no se seleccionó ninguno.`);
+        }
+      }
+    }
+
+    // Esperar a que Geonet cargue IPs disponibles para la nueva zona
+    await page.waitForFunction(() => {
+      const popover = document.querySelector('#popover-ips-disponibles ul li a');
+      if (popover?.textContent && /\b(?:\d{1,3}\.){3}\d{1,3}\b/.test(popover.textContent)) return true;
+      const ipInput = document.querySelector('input[name*="ip" i]') as HTMLInputElement | null;
+      if (ipInput?.value && /\b(?:\d{1,3}\.){3}\d{1,3}\b/.test(ipInput.value)) return true;
+      return false;
+    }, { timeout: 4000 }).catch(() => null); // timeout silencioso: puede que ya haya IP
+
+    // ── Leer la primera IP disponible del popover ─────────────────────────
+    const firstAvailableIp: string | null = await page.evaluate(() => {
+      const popover = document.querySelector('#popover-ips-disponibles ul li a');
+      const matchPop = popover?.textContent?.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
+      if (matchPop) return matchPop[0];
+
+      const ipInput = document.querySelector('input[name*="ip" i]') as HTMLInputElement | null;
+      const matchInput = ipInput?.value?.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
+      if (matchInput) return matchInput[0];
+
+      return null;
+    });
+
+    if (firstAvailableIp) {
+      resolvedUpdates['cliente-ip'] = firstAvailableIp;
+      console.log(`[editarInstalacionGeonet] IP disponible detectada y asignada: ${firstAvailableIp}`);
+    } else {
+      console.warn('[editarInstalacionGeonet] No se detectó IP disponible en la UI para esta zona/router.');
+    }
+
+    // ── POST del formulario con los cambios ───────────────────────────────
+    const result = await page.evaluate(async (args: {
+      url: string;
+      resolvedUpdates: Record<string, string>;
+      newComments?: string;
+    }) => {
+      try {
+        const formEl = document.querySelector('form#agregar-cliente') as HTMLFormElement | null;
+        if (!formEl) return { status: 502, url: '', errors: ['Formulario no encontrado en el DOM'] };
+
+        const formData = new (window as any).FormData(formEl);
+        const csrf = (document.querySelector('input[name="csrfmiddlewaretoken"]') as HTMLInputElement)?.value || '';
+        formData.set('csrfmiddlewaretoken', csrf);
+
+        // Aplicar updates sobre el FormData existente
+        for (const [key, value] of Object.entries(args.resolvedUpdates)) {
+          formData.set(key, value);
+        }
+
+        // Agregar nota a comentarios si se pasa
+        if (args.newComments) {
+          const commentKey = 'cliente-comentarios';
+          let existing = '';
+          const ck = (window as any).CKEDITOR;
+          if (ck && ck.instances[`id_${commentKey}`]) {
+            existing = ck.instances[`id_${commentKey}`].getData();
+          } else {
+            existing = (document.querySelector(`#id_${commentKey}`) as HTMLTextAreaElement)?.value || '';
+          }
+          if (!existing.includes(args.newComments)) {
+            formData.set(commentKey, `${existing}\n\n[Nota Bot]: ${args.newComments}`.trim());
+          }
+        }
+
+        const res = await fetch(args.url, { method: 'POST', body: formData });
+
+        let effectiveStatus = res.status;
+        if (res.redirected && (res.url.includes('/Instalaciones') || res.url.includes('/clientes'))) {
+          effectiveStatus = 200;
+        } else if (!res.redirected && res.url.includes('/editar/')) {
+          effectiveStatus = 422;
+        }
+
+        let errors: string[] = [];
+        if (effectiveStatus === 422) {
+          const html = await res.text();
+          const doc = new DOMParser().parseFromString(html, 'text/html');
+          errors = Array.from(doc.querySelectorAll('.alert-danger, .errorlist, .text-danger, .help-block'))
+            .map(el => el.textContent?.trim() || '')
+            .filter(Boolean);
+        }
+
+        return { status: effectiveStatus, url: res.url, errors };
+      } catch (e: any) {
+        return { status: 500, url: '', errors: [e.toString()] };
+      }
+    }, { url, resolvedUpdates, newComments: updates.comments });
+
+    if (result.status >= 400) {
+      console.warn(`[editarInstalacionGeonet] Geonet rechazó la edición. status=${result.status}, errores=${JSON.stringify(result.errors)}`);
+    } else {
+      console.log(`[editarInstalacionGeonet] ✓ Éxito. status=${result.status}, ip=${firstAvailableIp ?? 'N/D'}`);
+    }
+
+    return {
+      status: result.status,
+      location: result.url,
+      formErrors: result.errors || [],
+      appliedUpdates: resolvedUpdates,
+      newIp: firstAvailableIp,
+    };
+
+  } finally {
+    await page.close();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FUNCIÓN DE ALTO NIVEL: autorizar ONU en SmartOLT + corregir IP en WispHub
+// ─────────────────────────────────────────────────────────────────────────────
+
+export type AuthorizeAndFixIpParams = {
+  /** Parámetros para authorizeOnu() de smartoltClient */
+  authorizeParams: Parameters<typeof authorizeOnu>[0];
+  /** username/externalId del cliente en Geonet */
+  externalIdOrUser: string;
+  /** ID de instalación en Geonet */
+  installationId: string | number;
+  /**
+   * Nombre del AP/CTO como viene en SmartOLT.
+   * Se buscará en AP_MAPPING para normalizar el nombre antes de enviarlo a Geonet.
+   */
+  apName: string;
+  /**
+   * Clave del ZONE_MAPPING (ej: "Parque de Sol - Z402").
+   * Si no se pasa, Geonet usará la zona ya seleccionada pero recalculará la IP.
+   */
+  zonaName?: string;
+  /** Nombre del router si también cambió */
+  routerName?: string;
+  /** Nota opcional que se agrega a comentarios */
+  comments?: string;
+  /**
+   * Si true, autoriza SmartOLT PRIMERO y luego corrige Geonet.
+   * Por defecto (false): corrige Geonet primero para tener la IP lista antes de autorizar.
+   */
+  authorizeFirst?: boolean;
+  /** Nombre del plan a seleccionar en Geonet (display name) */
+  planName?: string;
+};
+
+export type AuthorizeAndFixIpResult = {
+  ok: boolean;
+  smartoltAuthorized: boolean;
+  geonetFixed: boolean;
+  newIp: string | null;
+  warnings: string[];
+  error?: string;
+};
+
+export async function authorizeOnuAndFixIp(
+  params: AuthorizeAndFixIpParams
+): Promise<AuthorizeAndFixIpResult> {
+  const {
+    authorizeParams,
+    externalIdOrUser,
+    installationId,
+    apName,
+    zonaName,
+    routerName,
+    comments,
+    authorizeFirst = false,
+  } = params;
+
+  const warnings: string[] = [];
+  let smartoltAuthorized = false;
+  let geonetFixed = false;
+  let newIp: string | null = null;
+
+  const log = (msg: string) => console.log(`[authorizeOnuAndFixIp] ${msg}`);
+  const warn = (msg: string) => { console.warn(`[authorizeOnuAndFixIp] ⚠️ ${msg}`); warnings.push(msg); };
+
+  try {
+    // ── Paso 1 (opcional): SmartOLT primero ──────────────────────────────
+    if (authorizeFirst) {
+      log('Autorizando en SmartOLT (authorizeFirst=true)...');
+      try {
+        await authorizeOnu(authorizeParams as any);
+        smartoltAuthorized = true;
+        log('SmartOLT autorizado ✓');
+      } catch (e: any) {
+        warn(`SmartOLT falló: ${e?.message}`);
+      }
+    }
+
+    // ── Paso 2: Corregir zona/AP/IP en Geonet ────────────────────────────
+    log(`Corrigiendo Geonet: ap="${apName}", zona="${zonaName ?? 'N/A'}"...`);
+    try {
+      // Pasar planName si está presente
+      const updates: any = { apName, zonaName, routerName, comments };
+      if (typeof params.planName === 'string' && params.planName.trim()) {
+        updates.planName = params.planName;
+      }
+      const editResult = await editarInstalacionGeonet({
+        externalIdOrUser,
+        installationId,
+        updates,
+      });
+
+      if (editResult.status < 400) {
+        geonetFixed = true;
+        newIp = editResult.newIp;
+        log(`Geonet corregido ✓ nueva IP: ${newIp ?? 'no detectada en UI'}`);
+      } else {
+        warn(`Geonet rechazó la edición (status=${editResult.status}): ${editResult.formErrors.join(', ') || 'sin detalle'}`);
+      }
+    } catch (e: any) {
+      warn(`editarInstalacionGeonet error: ${e?.message}`);
+    }
+
+    // ── Paso 3 (default): SmartOLT después de tener la IP correcta ───────
+    if (!authorizeFirst) {
+      log('Autorizando en SmartOLT...');
+      try {
+        await authorizeOnu(authorizeParams as any);
+        smartoltAuthorized = true;
+        log('SmartOLT autorizado ✓');
+      } catch (e: any) {
+        warn(`SmartOLT falló: ${e?.message}`);
+      }
+    }
+
+    return { ok: geonetFixed || smartoltAuthorized, smartoltAuthorized, geonetFixed, newIp, warnings };
+
+  } catch (error: any) {
+    console.error(`[authorizeOnuAndFixIp] Error crítico: ${error?.message}`);
+    return { ok: false, smartoltAuthorized, geonetFixed, newIp: null, warnings, error: error?.message };
+  }
+}
+
 function startActivationBackgroundVerification(instalacionId: number | string, usuarioInstalacion: string): void {
   const key = `${String(instalacionId)}::${String(usuarioInstalacion).toLowerCase()}`;
   if (activationBackgroundJobs.has(key)) {
