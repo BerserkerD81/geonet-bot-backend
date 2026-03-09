@@ -102,6 +102,18 @@ function mapToInstallation(item: WisphubInstallationItem): Installation {
     ?? null;
   inst.zona = asString(rawObj, 'zona') ?? null;
   inst.router = asString(rawObj, 'router') ?? null;
+  // Sincronización zona-router
+  if (inst.zona && inst.router && inst.zona !== inst.router) {
+    console.log(`[sync] Zona y router diferentes: zona='${inst.zona}', router='${inst.router}'. Se ajusta router para igualar zona.`);
+    inst.router = inst.zona;
+  } else if (inst.zona && !inst.router) {
+    console.log(`[sync] Router no definido, se autoselecciona router igual a zona: zona='${inst.zona}'.`);
+    inst.router = inst.zona;
+  }
+  // Log de transición preinstalación a instalación
+  if (inst.tipo === 'preinstalacion' && inst.estado_instalacion && inst.estado_instalacion.toLowerCase().includes('instalacion')) {
+    console.log(`[transition] Pasando de preinstalación a instalación: id_servicio=${inst.id_servicio}, usuario=${inst.usuario}, zona=${inst.zona}, router=${inst.router}`);
+  }
   inst.sectorial = asString(rawObj, 'sectorial') ?? null;
   inst.tecnico = asString(rawObj, 'tecnico') ?? null;
   return inst;
