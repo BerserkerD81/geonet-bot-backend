@@ -885,10 +885,10 @@ async function findOnuDetailByServiceName(serviceName: string, ip?: string) {
   if (!ip) return null;
 
   try {
+    // Solo búsqueda exacta por IP
     const byIp = await repo
       .createQueryBuilder('o')
       .where('o.ipAddress = :ip', { ip })
-      .orWhere('o.ipAddress LIKE :like', { like: `%${ip}%` })
       .orderBy('o.capturedAt', 'DESC')
       .limit(1)
       .getOne();
