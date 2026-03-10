@@ -733,6 +733,9 @@ async function waitForActivationApiConfirmationByClientes(
   let attempt = 0;
   const logPrefix = opts?.logPrefix || `[Activation:${instalacionId}]`;
 
+
+  // Para reintentos de POST axios
+  let lastAxiosAttempt = 0;
   while ((Date.now() - startedAt) < maxWaitMs) {
     attempt += 1;
     try {
@@ -762,6 +765,31 @@ async function waitForActivationApiConfirmationByClientes(
     } catch (err: any) {
       lastObserved = `API clientes error: ${err?.message || err}`;
       console.warn(`${logPrefix} [API] intento ${attempt}: error ${err?.message || err}`);
+    }
+
+    // Cada 2 intentos, reintentar el POST axios de activación
+    if (attempt % 2 === 0) {
+      try {
+        console.log(`${logPrefix} [AXIOS-RETRY] Reintentando POST axios de activación en intento ${attempt}`);
+        // Usar helpers existentes para obtener la URL y lanzar el POST
+        const targetUrl = `${GEONET_BASE_URL}/Instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`;
+        // Abrir una nueva página para el POST axios
+        const { browser, page } = await openPage();
+        try {
+          if (await ensureSession(page)) {
+            await postActivationViaAxios(page, targetUrl, `${logPrefix} [AXIOS-RETRY]`);
+          } else {
+            console.warn(`${logPrefix} [AXIOS-RETRY] No se pudo obtener sesión para POST axios`);
+          }
+        } catch (errAxios: any) {
+          console.warn(`${logPrefix} [AXIOS-RETRY] Error en POST axios: ${errAxios?.message || errAxios}`);
+        } finally {
+          await page.close();
+          await browser.disconnect();
+        }
+      } catch (errOuter: any) {
+        console.warn(`${logPrefix} [AXIOS-RETRY] Error general en reintento POST axios: ${errOuter?.message || errOuter}`);
+      }
     }
 
     const elapsed = Date.now() - startedAt;
@@ -1369,22 +1397,40 @@ export async function editarInstalacionGeonet(
       return false;
     }, { timeout: 4000 }).catch(() => null); // timeout silencioso: puede que ya haya IP
 
-    // ── Leer la primera IP disponible del popover ─────────────────────────
-    const firstAvailableIp: string | null = await page.evaluate(() => {
-      const popover = document.querySelector('#popover-ips-disponibles ul li a');
-      const matchPop = popover?.textContent?.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
-      if (matchPop) return matchPop[0];
-
+    // ── Leer todas las IPs disponibles del popover ─────────────────────────
+    const availableIps: string[] = await page.evaluate(() => {
+      const ips: string[] = [];
+      const popoverLinks = document.querySelectorAll('#popover-ips-disponibles ul li a');
+      popoverLinks.forEach(link => {
+        const match = link.textContent?.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
+        if (match) ips.push(match[0]);
+      });
       const ipInput = document.querySelector('input[name*="ip" i]') as HTMLInputElement | null;
       const matchInput = ipInput?.value?.match(/\b(?:\d{1,3}\.){3}\d{1,3}\b/);
-      if (matchInput) return matchInput[0];
-
-      return null;
+      if (matchInput) ips.push(matchInput[0]);
+      return Array.from(new Set(ips));
     });
 
-    if (firstAvailableIp) {
-      resolvedUpdates['cliente-ip'] = firstAvailableIp;
-      console.log(`[editarInstalacionGeonet] IP disponible detectada y asignada: ${firstAvailableIp}`);
+    // ── Verificar si la IP ya existe en SmartoltOnuDetail ──────────────────
+    let ipToAssign: string | null = null;
+    if (availableIps.length > 0) {
+      // Importar datasource y modelo
+      const { AppDataSource } = require('../datasource');
+      const { SmartoltOnuDetail } = require('../models/SmartoltOnuDetail');
+      for (const ip of availableIps) {
+        // eslint-disable-next-line no-await-in-loop
+        const exists = await AppDataSource.getRepository(SmartoltOnuDetail).findOne({ where: { ipAddress: ip } });
+        if (!exists) {
+          ipToAssign = ip;
+          break;
+        }
+      }
+      if (!ipToAssign) {
+        console.warn('[editarInstalacionGeonet] Todas las IPs disponibles ya están usadas en SmartoltOnuDetail.');
+      } else {
+        resolvedUpdates['cliente-ip'] = ipToAssign;
+        console.log(`[editarInstalacionGeonet] IP disponible detectada y asignada: ${ipToAssign}`);
+      }
     } else {
       console.warn('[editarInstalacionGeonet] No se detectó IP disponible en la UI para esta zona/router.');
     }
@@ -1450,7 +1496,7 @@ export async function editarInstalacionGeonet(
     if (result.status >= 400) {
       console.warn(`[editarInstalacionGeonet] Geonet rechazó la edición. status=${result.status}, errores=${JSON.stringify(result.errors)}`);
     } else {
-      console.log(`[editarInstalacionGeonet] ✓ Éxito. status=${result.status}, ip=${firstAvailableIp ?? 'N/D'}`);
+      console.log(`[editarInstalacionGeonet] ✓ Éxito. status=${result.status}, ip=${ipToAssign ?? 'N/D'}`);
     }
 
     return {
@@ -1458,7 +1504,7 @@ export async function editarInstalacionGeonet(
       location: result.url,
       formErrors: result.errors || [],
       appliedUpdates: resolvedUpdates,
-      newIp: firstAvailableIp,
+      newIp: ipToAssign,
     };
 
   } finally {
