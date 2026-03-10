@@ -577,8 +577,8 @@ async function postActivationViaAxios(
     body.set('csrfmiddlewaretoken', csrfToken);
     body.set('edit_facturacion', '0');
 
-    console.log(`${logPrefix} enviando POST axios a ${targetUrl}`);
-    const response = await axios.post(targetUrl, body.toString(), {
+    console.log(`${logPrefix} [DEBUG] Payload POST axios:`, {
+      url: targetUrl,
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
         'Origin': GEONET_BASE_URL,
@@ -587,13 +587,39 @@ async function postActivationViaAxios(
         'X-CSRFToken': csrfToken,
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       },
-      maxRedirects: 10,
-      timeout: SCRAPING_TIMEOUTS.mediumOperation,
-      validateStatus: (status) => status >= 200 && status < 400
+      body: body.toString()
     });
-
-    console.log(`${logPrefix} POST axios status=${response.status}`);
-    return { ok: true, status: response.status, detail: `status=${response.status}` };
+    let response;
+    try {
+      response = await axios.post(targetUrl, body.toString(), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': GEONET_BASE_URL,
+          'Referer': targetUrl,
+          'Cookie': cookieHeader,
+          'X-CSRFToken': csrfToken,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+        },
+        maxRedirects: 10,
+        timeout: SCRAPING_TIMEOUTS.mediumOperation,
+        validateStatus: (status) => status >= 200 && status < 400
+      });
+      console.log(`${logPrefix} POST axios status=${response.status}`);
+      if (response.data && typeof response.data === 'string') {
+        const snippet = response.data.slice(0, 500);
+        console.log(`${logPrefix} [DEBUG] Respuesta HTML (primeros 500 chars):`, snippet);
+      }
+      return { ok: true, status: response.status, detail: `status=${response.status}` };
+    } catch (error: any) {
+      if (error?.response) {
+        console.warn(`${logPrefix} [DEBUG] Error POST axios status=${error.response.status}`);
+        if (typeof error.response.data === 'string') {
+          const snippet = error.response.data.slice(0, 500);
+          console.warn(`${logPrefix} [DEBUG] Respuesta HTML error (primeros 500 chars):`, snippet);
+        }
+      }
+      throw error;
+    }
   } catch (error: any) {
     return {
       ok: false,
@@ -689,6 +715,8 @@ async function findClientForActivationByClientes(
   const serviceId = String(instalacionId || '').trim();
   const userCandidates = buildUsuarioCandidates(usuarioInstalacion);
 
+  console.log(`[findClientForActivationByClientes][DEBUG] instalacionId:`, instalacionId, 'usuarioInstalacion:', usuarioInstalacion, 'userCandidates:', userCandidates);
+
   const queries: Array<{ params: Record<string, any>; source: string }> = [];
   if (serviceId) {
     queries.push({ params: { id_servicio: serviceId, limit: 5, offset: 0 }, source: 'id_servicio' });
@@ -702,6 +730,9 @@ async function findClientForActivationByClientes(
   }
 
   let lastDebug = '';
+  for (const item of queries) {
+    console.log(`[findClientForActivationByClientes][DEBUG] Buscando en /api/clientes/ con:`, item.params);
+  }
   for (const item of queries) {
     try {
       const data = await listClientsPage(item.params);
