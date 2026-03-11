@@ -3989,10 +3989,13 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
 
   // 2. WAN CONFIGURATION
   // Si hay una nueva IP asignada por Geonet (fixResult.newIp), usarla para la WAN
+  // Si no, usar la IP que tenía el cliente seleccionada para la autorización
   let wanIp = undefined;
   if (data && data._session && data._session.lastFixedIp) {
     wanIp = data._session.lastFixedIp;
-  } else {
+  }
+  // Si no hay lastFixedIp, forzar a usar la IP seleccionada para la autorización
+  if (!wanIp) {
     wanIp = pickFirstString([data.ipv4_address, data.ipv4, data.ip, data.client_ip]);
   }
   if (wanIp) {
@@ -4472,6 +4475,28 @@ export async function applyPendingWan(req: any, res: any) {
       data.subnet_mask || '255.255.255.0', data.gateway || '',
       data.dns1 || '8.8.8.8', data.dns2 || '8.8.4.4', data.extras || {}
     );
+
+    // Insertar registro en SmartoltOnuDetail
+    try {
+      const onuDetailRepo = AppDataSource.getRepository(SmartoltOnuDetail);
+      // El nombre puede venir en data.name, si no, intentar buscar en session.lastAuthNameUsed
+      let name = data.name || session?.lastAuthNameUsed || undefined;
+      if (typeof name === 'string') {
+        // Normalizar: sin tildes, permitir guiones bajos
+        name = name.normalize('NFD').replace(/\p{Diacritic}/gu, '');
+      }
+      await onuDetailRepo.save(onuDetailRepo.create({
+        capturedAt: new Date(),
+        uniqueExternalId: data.onu_external_id,
+        sn: data.onu_external_id,
+        ipAddress: data.ipv4_address,
+        name,
+        payload: { ...data }
+      }));
+    } catch (e) {
+      console.error('Error guardando SmartoltOnuDetail:', e);
+    }
+
     delete session.pendingWan;
     return res.json({ ok: true, message: 'WAN Configurado' });
   } catch (e: any) {
