@@ -1157,6 +1157,13 @@ async function buildOltListSection(): Promise<{ text: string; actions: any[]; ol
 
 async function prepareAuthSession(session: any, entity: any, type: 'client' | 'installation') {
   const defaults = defaultsFromEntity(entity, type);
+  // Log: IP del cliente al seleccionar
+  if (defaults && (defaults.ipv4_address || defaults.ipv4 || defaults.ip || defaults.client_ip)) {
+    const ipSeleccionada = defaults.ipv4_address || defaults.ipv4 || defaults.ip || defaults.client_ip;
+    console.log(`[WAN] IP del cliente seleccionada al elegir cliente/instalación: ${ipSeleccionada}`);
+  } else {
+    console.log('[WAN] No se encontró IP al seleccionar cliente/instalación.');
+  }
   session.pendingAuth = {
     installationId: type === 'installation' ? entity.id : undefined,
     clientIdServicio: type === 'client' ? entity.id_servicio : undefined,
@@ -3988,16 +3995,21 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
   }
 
   // 2. WAN CONFIGURATION
-  // Si hay una nueva IP asignada por Geonet (fixResult.newIp), usarla para la WAN
-  // Si no, usar la IP que tenía el cliente seleccionada para la autorización
+  // Solo usar la IP de fixResult.newIp (si existe) o la IP seleccionada para el cliente actual
   let wanIp = undefined;
-  if (data && data._session && data._session.lastFixedIp) {
-    wanIp = data._session.lastFixedIp;
+  const clienteIp = pickFirstString([data.ipv4_address, data.ipv4, data.ip, data.client_ip]);
+  // Si la función fue llamada con una IP nueva (por fixResult), úsala
+  if (data && data._fixResultNewIp) {
+    wanIp = data._fixResultNewIp;
   }
-  // Si no hay lastFixedIp, forzar a usar la IP seleccionada para la autorización
+  // Si no, usar la IP seleccionada para la autorización (nunca una IP vieja de la sesión)
   if (!wanIp) {
-    wanIp = pickFirstString([data.ipv4_address, data.ipv4, data.ip, data.client_ip]);
+    wanIp = clienteIp;
   }
+  // Log: IP antes de autorizar
+  console.log(`[WAN] IP del cliente antes de autorizar: ${clienteIp || 'N/D'}`);
+  // Log: IP que se usará para configurar WAN
+  console.log(`[WAN] IP usada para configurar WAN: ${wanIp || 'N/D'}`);
   if (wanIp) {
     const parts = wanIp.split('.');
     const gateway = data.gateway || (parts.length === 4 ? `${parts[0]}.${parts[1]}.${parts[2]}.254` : undefined);
@@ -4005,11 +4017,19 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
     try {
       await setOnuWanModeStaticIp(String(onuId), wanIp, subnet, gateway || '', '8.8.8.8', '8.8.4.4', {});
       messages.push(`✅ WAN Configurada (${wanIp}).`);
+      // Log: IP después de autorizar
+      if (clienteIp && wanIp !== clienteIp) {
+        console.log(`[WAN] La IP WAN fue cambiada por el sistema: ${clienteIp} → ${wanIp}`);
+      } else {
+        console.log(`[WAN] La IP WAN no cambió: ${wanIp}`);
+      }
     } catch (e: any) {
       messages.push('❌ Error WAN.');
+      console.error(`[WAN] Error al configurar WAN (${wanIp}):`, e);
     }
   } else {
     messages.push('⚠️ Falta IP para WAN.');
+    console.warn('[WAN] No se pudo determinar una IP para configurar WAN.');
   }
 
   // --- VERIFICACIÓN EN TABLA INSTALLATION Y GEONET ---
@@ -4421,6 +4441,7 @@ export async function submitAuth(req: any, res: any) {
     const success = result && (result.status === true || String(result.response_code) === 'success');
     if (!success) throw new Error(result?.error || result?.message || 'SmartOLT rechazó la solicitud.');
 
+    // Si hubo fixResult y tiene newIp, pásala explícitamente a processPostAuthActions
     const postResult = await processPostAuthActions({
       ...merged,
       onu_external_id: explicitSn,
@@ -4429,7 +4450,8 @@ export async function submitAuth(req: any, res: any) {
       odb_port: cleanOdbPort,
       onu_type: merged.onu_type,
       is_pyme: state.isPyme || state.defaults?.is_pyme,
-      _session: session
+      _session: session,
+      _fixResultNewIp: (typeof result !== 'undefined' && result && result.newIp) ? result.newIp : undefined
     }, targetId);
 
     cacheDelete('listOlts');
