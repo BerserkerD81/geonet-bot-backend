@@ -25,7 +25,7 @@ import {
   authorizeOnuAndFixIp
 } from '../services/wisphubClient';
 import { replaceOnuForClient } from '../services/wisphubClient';
-import { getLatestSmartoltOnuSnapshot, scheduleSmartoltOnuSnapshots,captureSmartoltOnuSnapshot} from '../services/smartoltOnuSnapshot';
+import { getLatestSmartoltOnuSnapshot, scheduleSmartoltOnuSnapshots, captureSmartoltOnuSnapshot } from '../services/smartoltOnuSnapshot';
 import { searchLocalInstallations, refreshInstallationsByTerm, listPendingLocalInstallations, listAllLocalInstallations, fullSyncInstallations } from '../services/wisphubInstallations';
 import {
   authorizeOnu, listOlts, type OltInfo, getZones, getOltVlans,
@@ -59,18 +59,18 @@ const _searchCache = new Map<string, { ts: number; results: any }>();
 function isTableOrListMessage(content: string): boolean {
   if (!content) return false;
   const lines = content.split('\n');
-  
+
   // Contar líneas que son tablas Markdown o solo headers/separadores
   const tableLikeLines = lines.filter(l => /^\|.*\|$/.test(l.trim())).length;
   const totalLines = lines.filter(l => l.trim()).length;
-  
+
   // Si más del 70% son líneas de tabla, es una tabla
   if (totalLines > 2 && tableLikeLines / totalLines > 0.7) return true;
-  
+
   // Detectar si es solo bullets/numbered list
   const listLines = lines.filter(l => /^[\d\-\*\+]\s+/.test(l.trim())).length;
   if (totalLines > 5 && listLines / totalLines > 0.8) return true;
-  
+
   return false;
 }
 
@@ -78,20 +78,20 @@ function isTableOrListMessage(content: string): boolean {
 function calculateRelevance(content: string, query: string): number {
   let score = 0;
   const queryLower = query.toLowerCase();
-  
+
   // Penaliza si es tabla
   if (isTableOrListMessage(content)) score -= 50;
-  
+
   // Bonifica por palabra completa exacta
   if (new RegExp(`\\b${queryLower}\\b`, 'i').test(content)) score += 30;
-  
+
   // Bonifica si aparece al inicio del mensaje
   if (content.toLowerCase().startsWith(queryLower)) score += 20;
-  
+
   // Bonifica por múltiples ocurrencias
   const matches = content.match(new RegExp(queryLower, 'gi')) || [];
   score += Math.min(matches.length * 5, 25);
-  
+
   return score;
 }
 
@@ -1693,10 +1693,10 @@ async function loadMonitorSmartoltData(onuExternalId: string, graphType: Smartol
     catch (reason) { return { status: 'rejected', reason }; }
   };
 
-  const fullStatusRes  = await safe(() => getOnuFullStatusInfoByExternalId(onuExternalId));
-  const detailsRes     = await safe(() => getOnuDetailsByExternalId(onuExternalId));
-  const signalRes      = await safe(() => getOnuSignalByExternalId(onuExternalId));
-  const runningRes     = await safe(() => getOnuRunningConfigByExternalId(onuExternalId));
+  const fullStatusRes = await safe(() => getOnuFullStatusInfoByExternalId(onuExternalId));
+  const detailsRes = await safe(() => getOnuDetailsByExternalId(onuExternalId));
+  const signalRes = await safe(() => getOnuSignalByExternalId(onuExternalId));
+  const runningRes = await safe(() => getOnuRunningConfigByExternalId(onuExternalId));
   const signalGraphRes = await safe(() => getOnuSignalGraphByExternalId(onuExternalId, normalizedGraphType));
   const trafficGraphRes = await safe(() => getOnuTrafficGraphByExternalId(onuExternalId, normalizedGraphType));
 
@@ -2051,7 +2051,7 @@ export async function addMessage(req: any, res: any) {
   });
 
   await msgRepo.save(msg);
-  
+
   // Invalidar cache de búsqueda del usuario para que obtenga resultados actualizados
   invalidateSearchCache(Number(userId));
 
@@ -4045,7 +4045,7 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
       } else {
         console.log(`[WAN] La IP WAN no cambió: ${wanIp}`);
       }
-            try {
+      try {
         const onuDetailRepo = AppDataSource.getRepository(SmartoltOnuDetail);
         let onuName: string | undefined = data.name || usuarioInstalacion || undefined;
         if (typeof onuName === 'string') {
@@ -4057,8 +4057,15 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
           existing.sn = String(onuId);
           existing.ipAddress = wanIp;
           if (onuName) existing.name = onuName;
-          existing.payload = { ...(existing.payload || {}), lastAuth: data };
-          await onuDetailRepo.save(existing);
+          existing.payload = {
+            sn: String(onuId),
+            ip: wanIp,
+            name: onuName,
+            zone: data.zone,
+            onu_type: data.onu_type,
+            plan: data.plan,
+            updatedAt: new Date().toISOString()
+          }; await onuDetailRepo.save(existing);
         } else {
           await onuDetailRepo.save(onuDetailRepo.create({
             capturedAt: new Date(),
@@ -4066,7 +4073,15 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
             sn: String(onuId),
             ipAddress: wanIp,
             name: onuName,
-            payload: { lastAuth: data }
+            payload: {
+              sn: String(onuId),
+              ip: wanIp,
+              name: onuName,
+              zone: data.zone,
+              onu_type: data.onu_type,
+              plan: data.plan,
+              createdAt: new Date().toISOString()
+            }
           }));
         }
       } catch (e) {
@@ -4364,7 +4379,7 @@ export async function submitAuth(req: any, res: any) {
     let fixResult: Awaited<ReturnType<typeof authorizeOnuAndFixIp>> | null = null;
 
     const suggestedZone: string = String(state.defaults?.zone || '').trim().toLowerCase();
-    const selectedZone: string  = String(merged.zone || '').trim().toLowerCase();
+    const selectedZone: string = String(merged.zone || '').trim().toLowerCase();
     const zoneMismatch = !!(suggestedZone && selectedZone && suggestedZone !== selectedZone);
 
     const geonetUser: string | undefined =
@@ -4722,7 +4737,7 @@ export async function searchUserMessages(req: any, res: any) {
     const cacheKey = `search:${userId}:${query}:${offset}:${limit}`;
     const cached = _searchCache.get(cacheKey);
     const now = Date.now();
-    
+
     if (cached && now - cached.ts < 60000) { // Cache de 1 minuto
       return res.json({ ...cached.results, cached: true });
     }
@@ -4856,7 +4871,7 @@ export async function getSessionMessages(req: any, res: any) {
       messages.reverse();
     }
 
-    return res.json({ 
+    return res.json({
       messages,
       sessionExists: true,
       messageCount: messages.length
