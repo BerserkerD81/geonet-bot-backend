@@ -2098,6 +2098,8 @@ export async function activarInstalacionGeonet(
       });
       if (apiWithoutClick.confirmed) {
         console.log(`${logPrefix} ✅ confirmada activa sin submit (${apiWithoutClick.reason}).`);
+        // Sincroniza clientes tras activación exitosa
+        await fullSyncClients();
         return { ok: true, status: 200 };
       }
       return {
@@ -2123,6 +2125,8 @@ export async function activarInstalacionGeonet(
     });
     if (apiAfter.confirmed) {
       console.log(`${logPrefix} ✅ activación confirmada por API (${apiAfter.reason}).`);
+      // Sincroniza clientes tras activación exitosa
+      await fullSyncClients();
       console.log(`${logPrefix} Paso 8/8 - Fin en ${Date.now() - start}ms`);
       return { ok: true, status: 200 };
     }
