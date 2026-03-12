@@ -1399,11 +1399,20 @@ export async function editarInstalacionGeonet(
       routerToUse = updates.zonaName;
     }
     if (routerToUse) {
+      // Aplicar ZONE_MAPPING al router igual que se hace con zonaName,
+      // para evitar que el fuzzy-match elija una zona incorrecta
+      const mappedRouter = ZONE_MAPPING[String(routerToUse).trim()] || routerToUse;
       const routerOpts = await _extractSelectOptions(page, '#id_cliente-router_cliente, select[name*="router_cliente" i]');
-      const routerId = _findSelectValue(routerOpts, String(routerToUse));
+      let routerId = _findSelectValue(routerOpts, mappedRouter);
+      if (!routerId && mappedRouter !== routerToUse) {
+        routerId = _findSelectValue(routerOpts, String(routerToUse));
+      }
       if (routerId) {
         resolvedUpdates['cliente-router_cliente'] = routerId;
-        console.log(`[editarInstalacionGeonet] Router resuelto: "${routerToUse}" → id=${routerId}`);
+        console.log(`[editarInstalacionGeonet] Router resuelto: "${routerToUse}" → mapped="${mappedRouter}" → id=${routerId}`);
+      } else {
+        console.warn(`[editarInstalacionGeonet] Router no encontrado. Target: "${mappedRouter}". Opciones disponibles:`);
+        routerOpts.forEach(opt => console.warn(`  - [${opt.value}] ${opt.text}`));
       }
     }
 
