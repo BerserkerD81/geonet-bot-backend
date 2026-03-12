@@ -3924,17 +3924,15 @@ export async function respond(req: any, res: any) {
 
 async function processPostAuthActions(data: any, targetId?: string | number) {
 
-  // Consolidated variable declarations at the top
   let messages = ['✅ ONU Autorizada.'];
   let onuId = data.onu_external_id;
   let clientid = targetId;
 
-  // --- LOG PARA ACTIVAR INSTALACION ---
   let usuarioInstalacion = '';
   let usuarioInstalacionSource = '';
   let sessionUsuarioInstalacion = data._session && data._session.lastSelectedUsuarioInstalacion;
   let sessionDump = JSON.stringify(data._session || {});
-  // Buscar usuarioInstalacion: PRIORIDAD a la sesión si coincide con el target (comportamiento similar a "wisphub activate")
+
   try {
     const sess = data._session || {};
     const sessionTargetMatches = Boolean(
@@ -3977,8 +3975,9 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
     else if (data._session && data._session.lastAuthNameUsed) usuarioInstalacionSource = 'session.lastAuthNameUsed';
     else usuarioInstalacionSource = 'default';
   }
+
   console.log(`[processPostAuthActions] activarInstalacionGeonet: clientid=${clientid}, usuarioInstalacion='${usuarioInstalacion}' (source: ${usuarioInstalacionSource}), onuId=${onuId}`);
-  // Asegurar formato del usuario para Geonet (incluir @geonet si hace falta)
+
   if (usuarioInstalacion && !String(usuarioInstalacion).toLowerCase().includes('@geonet')) {
     usuarioInstalacion = `${String(usuarioInstalacion).trim()}@geonet`;
   }
@@ -3995,21 +3994,45 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
   }
 
   // 2. WAN CONFIGURATION
-  // Solo usar la IP de fixResult.newIp (si existe) o la IP seleccionada para el cliente actual
+  // ✅ Leer IP fresca desde DB para garantizar que corresponde al cliente actual,
+  //    eliminando el riesgo de usar una IP de sesión anterior almacenada en collected.
+  let freshIpFromDb: string | undefined;
+  try {
+    if (clientid) {
+      const instRepo = AppDataSource.getRepository(Installation);
+      const instFresh = await instRepo.findOne({
+        where: [{ id: Number(clientid) }, { id_servicio: Number(clientid) }]
+      });
+      freshIpFromDb = instFresh?.ip || instFresh?.ip || (instFresh as any)?.ip_cliente || undefined;
+      if (!freshIpFromDb) {
+        const clientRepo = AppDataSource.getRepository(Client);
+        const clientFresh = await clientRepo.findOne({ where: { id_servicio: Number(clientid) } });
+        freshIpFromDb = clientFresh?.ip || (clientFresh as any)?.ipv4_address || undefined;
+      }
+      if (freshIpFromDb) {
+        console.log(`[WAN] IP fresca leída desde DB para cliente ${clientid}: ${freshIpFromDb}`);
+      }
+    }
+  } catch (e) {
+    console.error('[WAN] Error leyendo IP fresca desde DB:', e);
+  }
+
   let wanIp = undefined;
-  const clienteIp = pickFirstString([data.ipv4_address, data.ipv4, data.ip, data.client_ip]);
-  // Si la función fue llamada con una IP nueva (por fixResult), úsala
+  // Prioridad: 1) fixResult.newIp  2) IP fresca de DB  3) campos del formulario (fallback)
+  const clienteIp = pickFirstString([freshIpFromDb, data.ipv4_address, data.ipv4, data.ip, data.client_ip]);
+
+  // Si la función fue llamada con una IP nueva (por fixResult), úsala con máxima prioridad
   if (data && data._fixResultNewIp) {
     wanIp = data._fixResultNewIp;
   }
-  // Si no, usar la IP seleccionada para la autorización (nunca una IP vieja de la sesión)
+  // Si no, usar clienteIp (que prioriza la IP fresca de DB)
   if (!wanIp) {
     wanIp = clienteIp;
   }
-  // Log: IP antes de autorizar
+
   console.log(`[WAN] IP del cliente antes de autorizar: ${clienteIp || 'N/D'}`);
-  // Log: IP que se usará para configurar WAN
   console.log(`[WAN] IP usada para configurar WAN: ${wanIp || 'N/D'}`);
+
   if (wanIp) {
     const parts = wanIp.split('.');
     const gateway = data.gateway || (parts.length === 4 ? `${parts[0]}.${parts[1]}.${parts[2]}.254` : undefined);
@@ -4017,7 +4040,6 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
     try {
       await setOnuWanModeStaticIp(String(onuId), wanIp, subnet, gateway || '', '8.8.8.8', '8.8.4.4', {});
       messages.push(`✅ WAN Configurada (${wanIp}).`);
-      // Log: IP después de autorizar
       if (clienteIp && wanIp !== clienteIp) {
         console.log(`[WAN] La IP WAN fue cambiada por el sistema: ${clienteIp} → ${wanIp}`);
       } else {
@@ -4063,7 +4085,6 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
     else messages.push(`❌ Registro ONU en Geonet (${onuId}) falló.`);
 
     if (clientid !== undefined) {
-      // Buscar el usuario correcto desde la entidad Client o Installation
       let clienteUsuario = '';
       let clienteUsuarioSource = '';
       let sessionUsuario = data._session && data._session.lastAuthNameUsed;
@@ -4109,7 +4130,6 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
         else if (sessionUsuarioInstalacion) clienteUsuarioSource = 'session.lastSelectedUsuarioInstalacion';
         else clienteUsuarioSource = 'default';
       }
-      // Asegurar que el usuario tenga el sufijo @geonet
       if (clienteUsuario && !String(clienteUsuario).toLowerCase().includes('@geonet')) {
         clienteUsuario = `${String(clienteUsuario).trim()}@geonet`;
       }
@@ -4121,7 +4141,6 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
     }
   } else {
     messages.push('ℹ️ ONU ya registrada en BD (SN coincidente).');
-    // Intentar asignar si no se hizo aún
     if (clientid !== undefined) {
       let clienteUsuario = '';
       let clienteUsuarioSource = '';
@@ -4181,10 +4200,6 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
   const wifiModels = ['ZTEF6600P', 'ZXHNF600P'];
 
   if (wifiModels.includes(rawType)) {
-    // Botón para saltar la configuración WiFi y continuar con generación/activación
-    // Payload y etiqueta varían si el cliente es PyME: para PyME solo activamos
-    // la instalación (no generar contrato). Para clientes residenciales se
-    // permite "Generar Contrato y Activar".
     const skipPayload = (clientid || clientid === 0)
       ? (isPyme ? `wisphub activate ${clientid}` : `generar contrato activar ${clientid}`)
       : undefined;
@@ -4205,9 +4220,6 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
     return { message: messages.join(' '), actions: wifiActions };
   }
   else {
-    // Si estamos en un flujo explícito de cambio WiFi, no adjuntar acciones
-    // post-instalación (p. ej. generar contrato). Esto evita confundir al usuario
-    // mostrando botones ajenos al cambio de WiFi.
     const session = data._session || {};
     if (
       session?.wifiFlowMode ||
@@ -4241,7 +4253,6 @@ export async function submitAuth(req: any, res: any) {
   const userId = session.userId;
   if (!userId) return res.status(401).json({ error: 'unauthenticated' });
 
-  // Extraemos sessionId del request body
   const sessionId = req.body.sessionId ? Number(req.body.sessionId) : undefined;
 
   if (req.body.sessionId && (!Number.isFinite(sessionId) || Number(sessionId) <= 0)) {
@@ -4322,15 +4333,13 @@ export async function submitAuth(req: any, res: any) {
 
     // --- CORRECCIÓN ERROR 400 (DUPLICADO) + CORRECCIÓN AUTOMÁTICA DE IP POR ZONA ---
     let result: any;
+    // ✅ fixResult declarado FUERA del if para que sea accesible al llamar processPostAuthActions
+    let fixResult: Awaited<ReturnType<typeof authorizeOnuAndFixIp>> | null = null;
 
-    // Detectar mismatch de zona automáticamente:
-    // - suggestedZone: zona que tiene el cliente en WispHub (viene de state.defaults)
-    // - selectedZone:  zona que el técnico seleccionó en el formulario
     const suggestedZone: string = String(state.defaults?.zone || '').trim().toLowerCase();
     const selectedZone: string  = String(merged.zone || '').trim().toLowerCase();
     const zoneMismatch = !!(suggestedZone && selectedZone && suggestedZone !== selectedZone);
 
-    // Resolver usuario e ID de instalación desde la sesión
     const geonetUser: string | undefined =
       session.lastSelectedUsuarioInstalacion ||
       session.lastAuthNameUsed ||
@@ -4342,7 +4351,6 @@ export async function submitAuth(req: any, res: any) {
       targetId ||
       undefined;
 
-    // Solo corregir si hay mismatch Y tenemos los datos de Geonet necesarios
     const shouldFixIp = zoneMismatch && !!geonetUser && !!geonetInstallationId;
 
     if (shouldFixIp) {
@@ -4350,9 +4358,6 @@ export async function submitAuth(req: any, res: any) {
         `[submitAuth] Mismatch de zona detectado → sugerida="${state.defaults?.zone}" seleccionada="${merged.zone}". Ejecutando corrección de IP...`
       );
 
-      // Usar el valor original del plan (input raw)
-      // Usar el valor original (raw) que se pasa a normalizeSpeedProfileName como planName
-      // (el mismo que aparece en el log '[normalizeSpeedProfileName] input raw: ...')
       let planNameSource = undefined;
       if (typeof state === 'object' && state !== null && state.defaults?.plan_internet) {
         planNameSource = state.defaults.plan_internet;
@@ -4368,11 +4373,12 @@ export async function submitAuth(req: any, res: any) {
           || merged?.name;
       }
       console.log('[submitAuth][DEBUG] planNameSource (raw para plan):', planNameSource);
-      // Router igual a zona si no se especifica
+
       let routerName = merged.router || merged.zona || merged.zone || merged.zonaName || merged.zoneName || String(merged.zone || '');
-      // Forzar el planName a ser el display name real (como en la ficha)
       const planDisplayName = merged.plan || merged.plan_internet || (merged.raw ? pickPlanFromRaw(merged.raw) : undefined) || planNameSource;
-      const fixResult = await authorizeOnuAndFixIp({
+
+      // ✅ Asignar a fixResult (declarado arriba, accesible en processPostAuthActions)
+      fixResult = await authorizeOnuAndFixIp({
         authorizeParams: authPayload as any,
         externalIdOrUser: String(geonetUser),
         installationId: geonetInstallationId!,
@@ -4392,7 +4398,6 @@ export async function submitAuth(req: any, res: any) {
         console.log(`[submitAuth] Nueva IP asignada por Geonet: ${fixResult.newIp}`);
       }
 
-      // Si SmartOLT no fue autorizado dentro de fixResult, reintentar como fallback
       if (!fixResult.smartoltAuthorized) {
         try {
           result = await authorizeOnu(authPayload as any);
@@ -4412,7 +4417,6 @@ export async function submitAuth(req: any, res: any) {
       }
 
     } else {
-      // Ruta normal: sin mismatch o sin datos de Geonet → comportamiento original intacto
       if (zoneMismatch && (!geonetUser || !geonetInstallationId)) {
         console.warn(
           `[submitAuth] Mismatch de zona detectado pero faltan datos de Geonet (user=${geonetUser}, installId=${geonetInstallationId}). Autorizando sin corrección de IP.`
@@ -4421,17 +4425,14 @@ export async function submitAuth(req: any, res: any) {
       try {
         result = await authorizeOnu(authPayload as any);
       } catch (apiError: any) {
-        // Verificar si es error de ID Duplicado (SmartOLT devuelve 400)
         const errData = apiError.response?.data || {};
         const isDuplicate = errData.error_code === 'onu_external_id_not_unique' ||
           (typeof errData.error === 'string' && errData.error.includes('unique'));
 
         if (apiError.response?.status === 400 && isDuplicate) {
           console.log(`⚠️ ONU ${explicitSn} ya existe en SmartOLT (registrada por Puppeteer). Ignorando error 400 y continuando.`);
-          // Simulamos una respuesta exitosa para que el flujo continúe
           result = { status: true, response_code: 'success' };
         } else {
-          // Si es otro error, lo lanzamos para que caiga en el catch principal
           throw apiError;
         }
       }
@@ -4441,7 +4442,6 @@ export async function submitAuth(req: any, res: any) {
     const success = result && (result.status === true || String(result.response_code) === 'success');
     if (!success) throw new Error(result?.error || result?.message || 'SmartOLT rechazó la solicitud.');
 
-    // Si hubo fixResult y tiene newIp, pásala explícitamente a processPostAuthActions
     const postResult = await processPostAuthActions({
       ...merged,
       onu_external_id: explicitSn,
@@ -4451,7 +4451,7 @@ export async function submitAuth(req: any, res: any) {
       onu_type: merged.onu_type,
       is_pyme: state.isPyme || state.defaults?.is_pyme,
       _session: session,
-      _fixResultNewIp: (typeof result !== 'undefined' && result && result.newIp) ? result.newIp : undefined
+      _fixResultNewIp: fixResult?.newIp ?? undefined  // ✅ usa fixResult, no result
     }, targetId);
 
     cacheDelete('listOlts');
@@ -4483,7 +4483,6 @@ export async function submitAuth(req: any, res: any) {
     return res.status(500).json({ ok: false, error: errorMsg });
   }
 }
-
 export async function applyPendingWan(req: any, res: any) {
   const session = req.session;
   const body = req.body || {};
