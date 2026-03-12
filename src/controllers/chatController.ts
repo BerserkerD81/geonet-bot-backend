@@ -4045,6 +4045,33 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
       } else {
         console.log(`[WAN] La IP WAN no cambió: ${wanIp}`);
       }
+            try {
+        const onuDetailRepo = AppDataSource.getRepository(SmartoltOnuDetail);
+        let onuName: string | undefined = data.name || usuarioInstalacion || undefined;
+        if (typeof onuName === 'string') {
+          onuName = onuName.normalize('NFD').replace(/\p{Diacritic}/gu, '');
+        }
+        const existing = await onuDetailRepo.findOne({ where: { uniqueExternalId: String(onuId) } });
+        if (existing) {
+          existing.capturedAt = new Date();
+          existing.sn = String(onuId);
+          existing.ipAddress = wanIp;
+          if (onuName) existing.name = onuName;
+          existing.payload = { ...(existing.payload || {}), lastAuth: data };
+          await onuDetailRepo.save(existing);
+        } else {
+          await onuDetailRepo.save(onuDetailRepo.create({
+            capturedAt: new Date(),
+            uniqueExternalId: String(onuId),
+            sn: String(onuId),
+            ipAddress: wanIp,
+            name: onuName,
+            payload: { lastAuth: data }
+          }));
+        }
+      } catch (e) {
+        console.error('[SmartoltOnuDetail] Error en upsert post-auth:', e);
+      }
     } catch (e: any) {
       messages.push('❌ Error WAN.');
       console.error(`[WAN] Error al configurar WAN (${wanIp}):`, e);
