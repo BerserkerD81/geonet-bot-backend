@@ -727,6 +727,11 @@ export async function setOnuWanModeStaticIp(onuExternalId: string, ipv4Address: 
 
   const url = `${baseUrl}/api/onu/set_onu_wan_mode_static_ip/${encodeURIComponent(String(onuExternalId))}`;
   const fd = new FormData();
+  try {
+    await AllowRemoteAccess(onuExternalId).catch(() => {}); // Intentamos permitir acceso remoto, pero no bloqueamos si falla
+  } catch (error) {
+    console.error('Error occurred while trying to allow remote access:', error);
+  }
   fd.append('ipv4_address', String(ipv4Address));
   fd.append('subnet_mask', String(subnetMask));
   if (gateway) fd.append('gateway', String(gateway));
@@ -743,6 +748,7 @@ export async function setOnuWanModeStaticIp(onuExternalId: string, ipv4Address: 
   const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(url, fd as any, { headers, timeout: 20000, maxBodyLength: Infinity, maxContentLength: Infinity }));
   return res.data;
 }
+
 
 
 /**
@@ -804,6 +810,22 @@ export async function getAvailablePortsForOdb(externalId: string | number): Prom
     return unwrap(data);
   }
 }
+
+export async function AllowRemoteAccess(onuExternalId: string | number) {
+  if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
+  if (!SMARTOLT.apiKey) throw new Error('SMARTOLT_API_KEY not configured');
+  if (!onuExternalId) throw new Error('onuExternalId required');
+
+  const url = `${baseUrl}/api/onu/enable_allow_remote_access_to_wan_ip/{{onu_external_id}}`.replace('{{onu_external_id}}', encodeURIComponent(String(onuExternalId)));
+  const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(url, undefined, {
+    headers: getHeaders(),
+    timeout: 15000
+  }));
+  if (res && typeof res === 'object' && 'data' in res) {
+    return (res as { data: any }).data;
+  }
+  throw new Error('Unexpected response from smartoltAxios.post');
+} 
 
 /**
  * Helper interno: Obtiene mapeo data-id vs portIndex.

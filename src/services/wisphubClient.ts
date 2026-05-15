@@ -59,7 +59,7 @@ const http = axios.create({
 
 ensureRequestDelay(http);
 
-http.interceptors.request.use((config) => {
+http.interceptors.request.use((config: any) => {
   if (!config.headers) config.headers = new AxiosHeaders();
   if (WISPHUB.apiKey) {
     if (config.headers instanceof AxiosHeaders) {
@@ -68,6 +68,27 @@ http.interceptors.request.use((config) => {
       (config.headers as any)['Authorization'] = `Api-Key ${WISPHUB.apiKey}`;
     }
   }
+  // Replace spaces by hyphens in URL, query params and body for WispHub API calls
+  const replaceSpacesInValue = (v: any): any => {
+    if (v === null || v === undefined) return v;
+    if (typeof v === 'string') return v.replace(/\s+/g, '-');
+    if (Array.isArray(v)) return v.map(replaceSpacesInValue);
+    if (typeof v === 'object') {
+      const out: any = {};
+      for (const k of Object.keys(v)) out[k] = replaceSpacesInValue(v[k]);
+      return out;
+    }
+    return v;
+  };
+
+  try {
+    if (typeof config.url === 'string') config.url = config.url.replace(/\s+/g, '-');
+    if (config.params) config.params = replaceSpacesInValue(config.params);
+    if (config.data) config.data = replaceSpacesInValue(config.data);
+  } catch (e) {
+    // ignore any unexpected structure
+  }
+
   return config;
 });
 
@@ -177,7 +198,7 @@ export async function openPage(): Promise<{ browser: Browser; page: Page }> {
         'matomo'
       ];
 
-      page.on('request', (req) => {
+      page.on('request', (req: { url: () => string; resourceType: () => any; abort: () => any; continue: () => void; }) => {
         try {
           const url = req.url().toLowerCase();
           const rType = req.resourceType();
@@ -537,14 +558,14 @@ async function buildCookieHeaderFromPage(page: Page, targetUrl: string): Promise
     const target = new URL(targetUrl);
     const cookies = await page.cookies(target.origin, targetUrl);
     const pairs = cookies
-      .filter((c) => c?.name && typeof c.value === 'string')
-      .map((c) => `${c.name}=${c.value}`);
+      .filter((c: { name: any; value: any; }) => c?.name && typeof c.value === 'string')
+      .map((c: { name: any; value: any; }) => `${c.name}=${c.value}`);
     return pairs.join('; ');
   } catch {
     const cookies = await page.cookies();
     const pairs = cookies
-      .filter((c) => c?.name && typeof c.value === 'string')
-      .map((c) => `${c.name}=${c.value}`);
+      .filter((c: { name: any; value: any; }) => c?.name && typeof c.value === 'string')
+      .map((c: { name: any; value: any; }) => `${c.name}=${c.value}`);
     return pairs.join('; ');
   }
 }
@@ -557,11 +578,11 @@ async function postActivationViaAxios(
   try {
     const csrfFromInput = await page.$eval(
       'input[name="csrfmiddlewaretoken"]',
-      (el) => (el as HTMLInputElement).value
+      (el: HTMLInputElement) => (el as HTMLInputElement).value
     ).catch(() => '');
 
     const pageCookies = await page.cookies();
-    const csrfFromCookie = pageCookies.find((c) => c.name === 'csrftoken')?.value || '';
+    const csrfFromCookie = pageCookies.find((c: { name: string; }) => c.name === 'csrftoken')?.value || '';
     const csrfToken = String(csrfFromInput || csrfFromCookie || '').trim();
 
     if (!csrfToken) {
@@ -602,7 +623,7 @@ async function postActivationViaAxios(
         },
         maxRedirects: 10,
         timeout: SCRAPING_TIMEOUTS.mediumOperation,
-        validateStatus: (status) => status >= 200 && status < 400
+        validateStatus: (status: number) => status >= 200 && status < 400
       });
       console.log(`${logPrefix} POST axios status=${response.status}`);
       if (response.data && typeof response.data === 'string') {
@@ -1330,7 +1351,7 @@ export async function editarInstalacionGeonet(
         await page.keyboard.press('ArrowDown');
         await page.keyboard.press('Enter');
         // Vuelve a extraer el valor seleccionado
-        const selected = await page.$eval('#id_cliente-zona_cliente', el => (el as HTMLSelectElement).value);
+const selected = await page.$eval('#id_cliente-zona_cliente', (el: Element) => (el as HTMLSelectElement).value).catch(() => '');
         if (selected) zonaId = selected;
       }
       if (!zonaId) {
@@ -1380,7 +1401,7 @@ export async function editarInstalacionGeonet(
         await page.type('#id_cliente-ap_cliente', mapped, {delay: 30});
         await page.keyboard.press('ArrowDown');
         await page.keyboard.press('Enter');
-        const selected = await page.$eval('#id_cliente-ap_cliente', el => (el as HTMLSelectElement).value);
+const selected = await page.$eval('#id_cliente-ap_cliente', (el: Element) => (el as HTMLSelectElement).value).catch(() => '');
         if (selected) apId = selected;
       }
       if (!apId) {
@@ -1506,7 +1527,7 @@ export async function editarInstalacionGeonet(
           }
         }
         if (selectedPlanValue && bestScore > 0) {
-          await page.evaluate((val) => {
+          await page.evaluate((val: string) => {
             const planEl = document.querySelector('#id_cliente-plan_internet') as HTMLSelectElement | null;
             if (planEl) {
               planEl.value = val;
@@ -2023,122 +2044,88 @@ export async function activarInstalacionGeonet(
   instalacionId: number | string,
   usuarioInstalacion: string
 ): Promise<{ ok: boolean; status?: number; error?: string; pending?: boolean; detail?: string }> {
-  const start = Date.now();
-  const { browser, page } = await openPage();
   const logPrefix = `[Activation:${instalacionId}]`;
-
   const targetUrl = `${GEONET_BASE_URL}/Instalaciones/${usuarioInstalacion}/${instalacionId}/activar/`;
-  console.log(`${logPrefix} Paso 1/8 - Navegando a: ${targetUrl}`);
+  const { browser, page } = await openPage();
 
   try {
-    if (!await ensureSession(page)) throw new Error('Auth falló');
-    console.log(`${logPrefix} Paso 2/8 - Sesión Geonet OK`);
+    // 1. Sesión
+    if (!await ensureSession(page)) {
+      return { ok: false, status: 401, error: 'Auth falló en Geonet' };
+    }
 
-    console.log(`${logPrefix} Paso 3/8 - Cargando página de activación`);
+    // 2. Cargar la página solo para obtener el CSRF token
     await safeGoto(page, targetUrl, { timeout: SCRAPING_TIMEOUTS.mediumOperation });
 
-    // 2. PREPARACIÓN DEL TERRENO
-    // Borramos el GIF de carga para evitar intercepciones de click
-    await page.evaluate(() => {
-        const gif = document.getElementById('content-loading-gif');
-        if (gif) gif.remove();
-        
-        const backdrop = document.querySelector('.modal-backdrop');
-        if (backdrop) backdrop.remove();
-    });
+    // 3. Extraer CSRF desde cookie (más fiable que el input)
+    const cookies = await page.cookies();
+    const csrfToken = cookies.find((c: { name: string; }) => c.name === 'csrftoken')?.value ?? '';
 
-    console.log(`${logPrefix} Paso 4/8 - POST axios obligatorio (primer intento de activación)`);
-    const navigationPromise = page
-      .waitForNavigation({ waitUntil: 'domcontentloaded', timeout: SCRAPING_TIMEOUTS.activationNavigation })
-      .catch(() => null);
-
-    let submitted = false;
-    let submitMode = '';
-
-    const axiosPost = await postActivationViaAxios(page, targetUrl, `${logPrefix} [AXIOS-FIRST]`);
-    if (axiosPost.ok) {
-      submitted = true;
-      submitMode = 'axios-post';
-      console.log(`${logPrefix} activación enviada por axios (${axiosPost.detail || `status=${axiosPost.status}`})`);
-    } else {
-      console.warn(`${logPrefix} POST axios obligatorio falló (${axiosPost.detail || 'sin detalle'}). Fallback a submit Puppeteer...`);
+    if (!csrfToken) {
+      return { ok: false, status: 403, error: 'No se encontró csrftoken en la sesión' };
     }
 
-    console.log(
-      `${logPrefix} Paso 5/8 - ${submitted ? 'POST axios ejecutado correctamente' : 'Ejecutando fallback Puppeteer tras falla de axios'}`
-    );
+    // 4. POST directo (igual al que capturaste en DevTools)
+    const cookieHeader = cookies
+      .filter((c: { name: any; value: any; }) => c?.name && typeof c.value === 'string')
+      .map((c: { name: any; value: any; }) => `${c.name}=${c.value}`)
+      .join('; ');
 
-    if (!submitted) {
-      const submitResult = await submitActivationForm(page).catch((err: any) => ({
-        submitted: false,
-        mode: 'error',
-        detail: err?.message || String(err)
-      }));
+    const body = new URLSearchParams();
+    body.set('csrfmiddlewaretoken', csrfToken);
+    body.set('edit_facturacion', '0');
 
-      if (submitResult.submitted) {
-        submitted = true;
-        submitMode = submitResult.mode;
-        console.log(`${logPrefix} formulario enviado (${submitResult.mode})`);
-      } else {
-        console.warn(`${logPrefix} submitActivationForm no logró enviar (${submitResult.detail || 'sin detalle'}). Intentando click fallback...`);
-        const clicked = await clickActivateButton(page);
-        if (clicked) {
-          submitted = true;
-          submitMode = 'click-fallback';
-          console.log(`${logPrefix} fallback click ejecutado`);
-        }
-      }
-    }
-
-    if (!submitted) {
-      console.log(`${logPrefix} Paso 6/8 - No se pudo enviar; verificación API rápida final`);
-      const apiWithoutClick = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion, {
-        maxWaitMs: SCRAPING_TIMEOUTS.activationApiQuickConfirmMaxWaitMs,
-        logPrefix: `${logPrefix} [NO-SUBMIT]`
+    let postStatus = 0;
+    try {
+      const response = await axios.post(targetUrl, body.toString(), {
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'Origin': GEONET_BASE_URL,
+          'Referer': targetUrl,
+          'Cookie': cookieHeader,
+          'X-CSRFToken': csrfToken,
+        },
+        maxRedirects: 10,
+        timeout: SCRAPING_TIMEOUTS.mediumOperation,
+        validateStatus: (s: number) => s < 500,
       });
-      if (apiWithoutClick.confirmed) {
-        console.log(`${logPrefix} ✅ confirmada activa sin submit (${apiWithoutClick.reason}).`);
-        // Sincroniza clientes tras activación exitosa
-        await fullSyncClients();
-        return { ok: true, status: 200 };
-      }
-      return {
-        ok: false,
-        status: 409,
-        error: 'No se logró enviar el formulario de activación y la API no confirmó estado activo.'
-      };
+      postStatus = response.status;
+      console.log(`${logPrefix} POST status=${postStatus}`);
+    } catch (err: any) {
+      return { ok: false, status: err?.response?.status, error: err?.message };
     }
 
-    console.log(`${logPrefix} Paso 6/8 - Activación enviada (${submitMode}). Confirmación rápida...`);
-    await navigationPromise;
-
-    console.log(`${logPrefix} Paso 7/8 - Verificando UI + API clientes`);
-
-    const uiAfter = await waitForActivationUiConfirmation(page, targetUrl);
-    if (uiAfter.confirmed) {
-      console.log(`${logPrefix} UI reporta activación (${uiAfter.reason}); validando API de clientes...`);
-    }
-
-    const apiAfter = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion, {
+    // 5. Una sola verificación por API (sin reintentos en loop)
+    const apiCheck = await waitForActivationApiConfirmation(instalacionId, usuarioInstalacion, {
       maxWaitMs: SCRAPING_TIMEOUTS.activationApiQuickConfirmMaxWaitMs,
-      logPrefix: `${logPrefix} [QUICK]`
+      logPrefix,
     });
-    if (apiAfter.confirmed) {
-      console.log(`${logPrefix} ✅ activación confirmada por API (${apiAfter.reason}).`);
-      // Sincroniza clientes tras activación exitosa
-      await fullSyncClients();
-      console.log(`${logPrefix} Paso 8/8 - Fin en ${Date.now() - start}ms`);
+
+    if (apiCheck.confirmed) {
+      console.log(`${logPrefix} ✅ Activación confirmada: ${apiCheck.reason}`);
+      // Sync en background para no bloquear el retorno
+      fullSyncClients().catch(() => {});
       return { ok: true, status: 200 };
     }
 
-    const pendingReason = `Activación enviada; verificación en segundo plano iniciada. ${apiAfter.reason}`;
-    console.warn(`${logPrefix} ⏳ ${pendingReason}`);
-    startActivationBackgroundVerification(instalacionId, usuarioInstalacion);
-  console.log(`${logPrefix} Paso 8/8 - Retorno no bloqueante (pendiente)`);
-    return { ok: true, status: 202, pending: true, detail: pendingReason };
+// 6. Si el POST llegó bien pero la API aún no refleja el cambio → pending
+if (postStatus >= 200 && postStatus < 400) {
+  console.warn(`${logPrefix} ⏳ POST OK pero API no confirmó aún. Verificación en background.`);
+  startActivationBackgroundVerification(instalacionId, usuarioInstalacion);
+
+  // 👇 AGREGAR ESTO
+  axios.post('https://n8n.geonet.cl/webhook/activacion-fallback', {
+    instalacionId,
+    usuarioInstalacion
+  }).catch((err: { message: any; }) => console.warn('[N8N fallback] No se pudo disparar:', err.message));
+
+  return { ok: true, status: 202, pending: true, detail: apiCheck.reason };
+}
+
+    return { ok: false, status: postStatus, error: `POST status=${postStatus}, API: ${apiCheck.reason}` };
 
   } catch (error: any) {
-    console.error(`${logPrefix} ❌ Error activarInstalacionGeonet: ${error.message}`);
+    console.error(`${logPrefix} ❌ ${error.message}`);
     return { ok: false, error: error.message };
   } finally {
     await page.close();
@@ -2164,7 +2151,7 @@ export async function getAutoLoginContractLink(
       if (response?.status() === 404) continue;
 
       // Buscamos el elemento y extraemos su atributo href
-      const href = await page.$eval('#auto-login', (el) => (el as HTMLAnchorElement).href).catch(() => null);
+const href = await page.$eval('#auto-login', (el: Element) => (el as HTMLAnchorElement).href).catch(() => null);
 
       if (href) {
         console.log(`✅ Link encontrado para ${usuario}`);
@@ -2210,7 +2197,7 @@ export async function registrarOnuGeonet(model: string, sn: string, mac: string 
     await page.waitForSelector('#id_dwifi-producto', { visible: true });
 
     // --- LÓGICA DE SELECCIÓN INTELIGENTE ---
-    const selection = await page.evaluate((targetModel) => {
+    const selection = await page.evaluate((targetModel: string) => {
         const productSelect = document.querySelector('#id_dwifi-producto') as HTMLSelectElement;
         const sucursalSelect = document.querySelector('#id_dwifi-sucursal') as HTMLSelectElement;
         const proveedorSelect = document.querySelector('#id_dwifi-proveedor') as HTMLSelectElement;
@@ -2342,7 +2329,7 @@ export async function agregarArticuloACliente(
       // 2. INYECTAR LÓGICA DIRECTA USANDO EL PROPIO JQUERY DE GEONET
       console.log(`[Puppeteer] Buscando e inyectando equipo ${numSerie}...`);
 
-      const result = await page.evaluate(async (args) => {
+      const result = await page.evaluate(async (args: { serial: string; mac: any; }) => {
         try {
             // A. Consultar el inventario al backend de Geonet
             const res = await fetch('/autocomplete-almacen/?exclude_services');
@@ -2465,7 +2452,7 @@ export async function deleteWifiProductByUuid(uuid: string): Promise<boolean> {
     if (!await ensureSession(page)) return false;
 
     // Hacer POST directo via fetch para borrar.
-    const result = await page.evaluate(async (uid) => {
+    const result = await page.evaluate(async (uid: string) => {
         const getCookie = (name: string) => {
             const v = document.cookie.match('(^|;) ?' + name + '=([^;]*)(;|$)');
             return v ? v[2] : null;
@@ -2619,7 +2606,7 @@ export async function uploadDocumentoCliente(
     console.log('[Puppeteer] Inyectando archivo y forzando envío directo (Fetch)...');
 
     // 2. SUBIDA DIRECTA VIA FETCH (Ignora todo el código defectuoso de la página web)
-    const result = await page.evaluate(async (args) => {
+    const result = await page.evaluate(async (args: { b64: string; mime: any; title: string | Blob; desc: string | Blob; name: string | undefined; isVisible: any; }) => {
         try {
             // Extraer el token de seguridad obligatorio de Django
             const csrf = (document.querySelector('input[name="csrfmiddlewaretoken"]') as HTMLInputElement)?.value || '';

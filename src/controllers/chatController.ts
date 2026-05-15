@@ -196,6 +196,39 @@ async function saveChatContext(session: any, sessionId: number) {
   }
 }
 
+// Agregar esta función helper cerca de sanitizeContextForDb
+function truncateMetadataForDb(metadata: any): any {
+  if (!metadata) return metadata;
+  
+  const clone = { ...metadata };
+  
+  // Eliminar la lista completa de ODBs del metadata guardado en DB
+  // (son datos de referencia, no necesitan persistirse en cada mensaje)
+  if (clone.smartoltOdbs) delete clone.smartoltOdbs;
+  if (clone.smartoltZones) delete clone.smartoltZones;
+  
+  // Para el flujo de autorización, recortar oltAvailability a lo esencial
+  if (clone.smartoltAvailability?.olts) {
+    clone.smartoltAvailability = {
+      ...clone.smartoltAvailability,
+      olts: clone.smartoltAvailability.olts.map((olt: any) => ({
+        oltId: olt.oltId,
+        oltName: olt.oltName,
+        availableCount: olt.availableCount
+        // omitir lista completa de onus individuales
+      }))
+    };
+  }
+  
+  // Para el flujo monitor, no guardar el raw completo de SmartOLT
+  if (clone.monitor?.smartolt) delete clone.monitor.smartolt;
+  if (clone.monitor?.runningConfig) delete clone.monitor.runningConfig;
+  if (clone.monitor?.fullStatusInfo) delete clone.monitor.fullStatusInfo;
+  
+  return clone;
+}
+
+
 // Sanitiza snapshot de contexto antes de guardar en DB: enmascara claves sensibles
 function sanitizeContextForDb(snapshot: any) {
   const sensitiveKeyRegex = /pass(word)?|pwd|token|secret|otp|ssn|credit|card|cvv|clave/i;
@@ -209,17 +242,11 @@ function sanitizeContextForDb(snapshot: any) {
       const out: any = {};
       for (const [k, v] of Object.entries(val)) {
         try {
-          if (sensitiveKeyRegex.test(k)) {
-            out[k] = '***';
-            continue;
-          }
+          if (sensitiveKeyRegex.test(k)) { out[k] = '***'; continue; }
         } catch { }
-        // Protección específica: no guardar contraseñas WiFi en claro
         if ((k === 'pass' || k === 'password' || k === 'wifi_password') && typeof v === 'string') {
-          out[k] = '***';
-          continue;
+          out[k] = '***'; continue;
         }
-
         out[k] = cloneAndMask(v);
       }
       return out;
@@ -227,7 +254,24 @@ function sanitizeContextForDb(snapshot: any) {
     return val;
   }
 
-  return cloneAndMask(snapshot);
+  const masked = cloneAndMask(snapshot);
+
+  // --- NUEVO: Eliminar datos de referencia grandes que se pueden reconstruir desde la DB/API ---
+  // Estos datos (ODBs, zonas, VLANs) se cargan frescos en cada sesión,
+  // no necesitan persistirse y causan ER_DATA_TOO_LONG
+  if (masked?.pendingAuth) {
+    delete masked.pendingAuth.smartoltOdbs;
+    delete masked.pendingAuth.smartoltZones;
+    delete masked.pendingAuth.smartoltVlans;
+    delete masked.pendingAuth.smartoltOnuTypes;
+  }
+  // Por si acaso están también en la raíz del snapshot
+  delete masked.smartoltOdbs;
+  delete masked.smartoltZones;
+  delete masked.smartoltVlans;
+  delete masked.smartoltOnuTypes;
+
+  return masked;
 }
 
 async function cacheGet<T>(key: string, ttlSeconds: number, fetcher: () => Promise<T>): Promise<T> {
@@ -833,6 +877,39 @@ async function resolveContactEmail(targetId: number | string): Promise<{ primary
   return {};
 }
 
+/** Normaliza nombre de usuario Geonet: {id}_{nombre-normalizado}@geonet */
+function normalizeGeonetUsername(username: string): string {
+  const normalized = String(username || '').trim();
+  
+  // Extraer ID si existe (números al inicio seguidos de espacio o guion)
+  const idMatch = normalized.match(/^(\d+)\s+(.+?)(?:@geonet)?$/i);
+  if (idMatch) {
+    const id = idMatch[1];
+    const name = idMatch[2]
+      .trim()
+      .toLowerCase()
+      .replace(/@.+$/i, '') // Quitar @domain si existe
+      .replace(/\s+/g, '-')
+      .replace(/[^a-z0-9\-_]/g, ''); // Solo permitir letras, números, guiones y underscores
+    return `${id}_${name}@geonet`;
+  }
+  
+  // Si viene sin ID (ej: usuario@slug-empresa o usuario_empresa)
+  const withoutGeonet = normalized.replace(/@geonet$/i, '').trim();
+  const cleaned = withoutGeonet
+    .toLowerCase()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9\-_@]/g, ''); // Permitir @, guiones y underscores
+  
+  // Si tiene @, devolverlo como está (ya es usuario@domain)
+  if (cleaned.includes('@')) {
+    return cleaned;
+  }
+  
+  // Si no tiene @, agregar @geonet
+  return `${cleaned}@geonet`;
+}
+
 async function resolveGeonetInstallationUser(targetId: number | string, session?: any): Promise<{ fullUser: string; source: string }> {
   let resolvedUser: string | null = null;
   let source = 'id_fallback';
@@ -847,6 +924,22 @@ async function resolveGeonetInstallationUser(targetId: number | string, session?
     source = 'session.lastAuthNameUsed';
   }
 
+    // 1. Intentar obtener desde WispHub API (ya tiene el formato correcto)
+  if (!resolvedUser) {
+    try {
+      const { getClientByServiceId } = await import('../services/wisphubClient');
+      const wisphubClient = await getClientByServiceId(targetId);
+      if (wisphubClient?.usuario) {
+          // El usuario de WispHub ya viene en formato: {id}_{nombre-normalizado}@geonet
+          resolvedUser = String(wisphubClient.usuario).trim();
+        source = 'wisphub.usuario';
+      }
+    } catch (e) {
+      console.warn('[resolveGeonetInstallationUser] Error fetching from WispHub:', (e as any)?.message);
+    }
+  }
+
+  // 2. Fallback: Installation DB
   if (!resolvedUser) {
     try {
       const instRepo = AppDataSource.getRepository(Installation);
@@ -860,6 +953,7 @@ async function resolveGeonetInstallationUser(targetId: number | string, session?
     }
   }
 
+  // 3. Fallback: Client DB
   if (!resolvedUser) {
     try {
       const clientRepo = AppDataSource.getRepository(Client);
@@ -873,8 +967,8 @@ async function resolveGeonetInstallationUser(targetId: number | string, session?
     }
   }
 
-  const rawUser = resolvedUser || String(targetId).trim();
-  const fullUser = rawUser.toLowerCase().includes('@geonet') ? rawUser : `${rawUser}@geonet`;
+    // Usar el usuario como viene, o usar normalizeGeonetUsername como fallback
+    const fullUser = resolvedUser ? normalizeGeonetUsername(resolvedUser) : normalizeGeonetUsername(`${targetId}`);
   return { fullUser, source };
 }
 
@@ -2237,12 +2331,11 @@ export async function respond(req: any, res: any) {
           fullGeonetUser = session.lastAuthNameUsed;
         } else if (clienteUsuario) {
           fullGeonetUser = clienteUsuario;
-        } else {
-          fullGeonetUser = `${session.lastAuthNameUsed || 'tecnico'}@geonet`;
         }
         if (fullGeonetUser && !String(fullGeonetUser).toLowerCase().includes('@geonet')) {
           fullGeonetUser = `${String(fullGeonetUser).trim()}@geonet`;
         }
+        fullGeonetUser = normalizeGeonetUsername(fullGeonetUser);
 
         try {
           const subidaExitosa = await uploadDocumentoCliente(
@@ -3036,7 +3129,7 @@ export async function respond(req: any, res: any) {
 
                 if (activated) {
                   if (lastStatus === 202) {
-                    finalContent += `\n\n⏳ Activación enviada para ${fullUser}. Confirmación en segundo plano (revisa logs en terminal).`;
+                    finalContent += `\n\n⏳ Activación enviada para ${fullUser}. Hubo un error en la activacion via Wisphub Avise a Soporte.`;
                   } else {
                     finalContent += `\n\n🚀 Activación en WispHub completada para ${fullUser}.`;
                   }
@@ -3887,7 +3980,7 @@ export async function respond(req: any, res: any) {
         role: 'assistant',
         content: finalContent,
         actions: actionsOut,
-        metadata: assistantMetadata
+metadata: truncateMetadataForDb(assistantMetadata)
       }));
     }
   } else {
@@ -3898,7 +3991,7 @@ export async function respond(req: any, res: any) {
       role: 'assistant',
       content: finalContent,
       actions: actionsOut,
-      metadata: assistantMetadata
+metadata: truncateMetadataForDb(assistantMetadata)
     }));
   }
 
