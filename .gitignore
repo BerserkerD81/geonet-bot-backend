@@ -18,3 +18,4 @@ yarn-error.log*
 
 docker-compose.dev.yml
 docker-compose.prod.yml
+backup.sql

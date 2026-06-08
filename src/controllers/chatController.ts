@@ -498,7 +498,7 @@ function isPymeText(value: any): boolean {
   return norm.includes('pyme') || norm.includes('empresa');
 }
 
-async function resolveIsPyme(session: any, targetId?: number | string): Promise<boolean> {
+export async function resolveIsPyme(session: any, targetId?: number | string): Promise<boolean> {
   if (session?.lastSelectedIsPyme === true) return true;
 
   if (session?.lastSelectedPlan && isPymeText(session.lastSelectedPlan)) {
@@ -916,7 +916,7 @@ function normalizeGeonetUsername(username: string): string {
   return `${cleaned}@geonet`;
 }
 
-async function resolveGeonetInstallationUser(targetId: number | string, session?: any): Promise<{ fullUser: string; source: string }> {
+export async function resolveGeonetInstallationUser(targetId: number | string, session?: any): Promise<{ fullUser: string; source: string }> {
   let resolvedUser: string | null = null;
   let source = 'id_fallback';
 
@@ -1255,7 +1255,7 @@ async function buildOltListSection(): Promise<{ text: string; actions: any[]; ol
   return { text, actions, olts: limited };
 }
 
-async function prepareAuthSession(session: any, entity: any, type: 'client' | 'installation') {
+export async function prepareAuthSession(session: any, entity: any, type: 'client' | 'installation') {
   const defaults = defaultsFromEntity(entity, type);
   // Log: IP del cliente al seleccionar
   if (defaults && (defaults.ipv4_address || defaults.ipv4 || defaults.ip || defaults.client_ip)) {
@@ -1601,7 +1601,7 @@ function parseDbmNumber(value: any): number | undefined {
   return Number.isNaN(parsed) ? undefined : parsed;
 }
 
-function classifyOnuSignalQuality(input: { signal1490?: string; signalValue?: string; rx?: string; statusSummary?: string }): { label: string; tone: string; detail?: string } {
+export function classifyOnuSignalQuality(input: { signal1490?: string; signalValue?: string; rx?: string; statusSummary?: string }): { label: string; tone: string; detail?: string } {
   const dbm = parseDbmNumber(input.signal1490) ?? parseDbmNumber(input.signalValue) ?? parseDbmNumber(input.rx);
 
   if (dbm !== undefined) {
@@ -1791,7 +1791,7 @@ function buildMonitorGraphsSection(monitor: { signalGraphUrl?: string; trafficGr
   return lines.length ? `\n${lines.join('\n')}` : '';
 }
 
-async function loadMonitorSmartoltData(onuExternalId: string, graphType: SmartoltGraphType = 'daily') {
+export async function loadMonitorSmartoltData(onuExternalId: string, graphType: SmartoltGraphType = 'daily') {
   const normalizedGraphType = normalizeMonitorGraphType(graphType);
 
   // Ejecutamos secuencialmente para no disparar 6 requests simultáneos

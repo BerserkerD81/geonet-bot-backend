@@ -18,6 +18,7 @@ import integrationsRoutes from './routes/integrations';
 import installationsRoutes from './routes/installations';
 import smartoltRoutes from './routes/smartolt';
 import odbRoutes from './routes/odb';
+import wizardRoutes from './routes/wizard';
 
 // Servicios y Scripts
 import { ensureDefaultAdmin } from './services/adminBootstrap';
@@ -52,7 +53,7 @@ app.use('/', globalLimiter);
 
 // --- CONFIGURACIÓN ESTRICTA DE CORS ---
 const allowedOrigins = [
-  'https://jmm.geonet.cl', 
+  'https://smart.geonet.cl', 
   'http://localhost:5173', // Solo para entorno de desarrollo local
   'http://127.0.0.1:5173'
 ];
@@ -120,6 +121,7 @@ app.use('/smartolt', smartoltRoutes);
 app.use('/odb', odbRoutes); 
 app.use('/admin', adminRoutes);
 app.use('/installations', installationsRoutes);
+app.use('/wizard', wizardRoutes);
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
