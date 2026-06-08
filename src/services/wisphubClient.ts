@@ -7,7 +7,7 @@ import { parseRaw, asString, asDateString, stripHtml } from './rawParser';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ensureRequestDelay } from '../utils/apiThrottle';
-import { authorizeOnu, getOnuBySerial, updateOnuSn, changeOnuType, updateOnuLocation } from './smartoltClient';
+import { authorizeOnu, getAllOnusDetails, getOnuBySerial, updateOnuSn, changeOnuType, updateOnuLocation, deleteOnuBySn } from './smartoltClient';
 
 // --- CONFIGURACIÓN PUPPETEER / BROWSERLESS ---
 // Asegúrate de que esta URL apunta a tu servicio 'browser' en docker-compose
@@ -1226,6 +1226,82 @@ async function _extractSelectOptions(page: any, selector: string): Promise<Selec
   }, selector);
 }
 
+function normalizeSerialLike(value: unknown): string {
+  return String(value ?? '').trim().toUpperCase();
+}
+
+function buildWifiProductSearchTerms(clientUser: string): string[] {
+  const normalized = String(clientUser ?? '').trim().toLowerCase();
+  const withoutGeonet = normalized.replace(/@geonet\b/i, '').trim();
+  const withoutDomain = normalized.replace(/@.*$/, '').trim();
+  const prefix = withoutGeonet.split(/[\s-]+/)[0]?.trim() || '';
+
+  return Array.from(new Set([normalized, withoutGeonet, withoutDomain, prefix].filter(Boolean)));
+}
+
+async function resolveSmartoltSnByClientIp(clientUser: string): Promise<{
+  clientId: number | null;
+  clientIp: string | null;
+  smartoltSn: string | null;
+  smartoltDetail: any | null;
+}> {
+  const searchTerm = String(clientUser || '').trim();
+  if (!searchTerm) {
+    return { clientId: null, clientIp: null, smartoltSn: null, smartoltDetail: null };
+  }
+
+  const normalizedTerms = Array.from(new Set([
+    searchTerm,
+    searchTerm.replace(/@geonet$/i, '').trim(),
+    searchTerm.replace(/@.*$/, '').trim()
+  ].filter(Boolean)));
+
+  const clientRepo = AppDataSource.getRepository(Client);
+  const client = await clientRepo.findOne({
+    where: normalizedTerms.flatMap((term) => [
+      { usuario: term },
+      { usuario_rb: term },
+      { email: term }
+    ]),
+    order: { updatedAt: 'DESC' }
+  } as any);
+
+  const clientIp = String(client?.ip || '').trim();
+  if (!clientIp) {
+    return { clientId: client?.id_servicio ?? null, clientIp: null, smartoltSn: null, smartoltDetail: null };
+  }
+
+  const smartoltOnus = await getAllOnusDetails().catch(() => []);
+  const liveMatch = smartoltOnus.find((item: any) => {
+    const ips = [item?.ip, item?.ipv4_address, item?.ipv4Address, item?.wan_ip, item?.client_ip];
+    return ips.some((value) => String(value || '').trim() === clientIp);
+  }) || null;
+
+  if (liveMatch) {
+    const liveSn = String(liveMatch?.sn || liveMatch?.serial || liveMatch?.onu_sn || '').trim() || null;
+    return {
+      clientId: client?.id_servicio ?? null,
+      clientIp,
+      smartoltSn: liveSn,
+      smartoltDetail: liveMatch
+    };
+  }
+
+  const { SmartoltOnuDetail } = require('../models/SmartoltOnuDetail');
+  const smartoltRepo = AppDataSource.getRepository(SmartoltOnuDetail);
+  const smartoltDetail = await smartoltRepo.findOne({
+    where: { ipAddress: clientIp },
+    order: { capturedAt: 'DESC' }
+  });
+
+  return {
+    clientId: client?.id_servicio ?? null,
+    clientIp,
+    smartoltSn: String(smartoltDetail?.sn || '').trim() || null,
+    smartoltDetail: smartoltDetail || null
+  };
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // FUNCIÓN PRINCIPAL: editarInstalacionGeonet
 // Equivalente al del installationService pero usando los helpers de este archivo
@@ -1853,6 +1929,343 @@ export async function getClientByServiceId(id_servicio: number | string): Promis
   }
 }
 
+export async function darDeBajaClienteByServiceId(id_servicio: number | string): Promise<{ ok: boolean; status?: number; mode?: string; error?: string }> {
+  const serviceId = String(id_servicio || '').trim();
+  if (!serviceId) return { ok: false, error: 'invalid_service_id' };
+  const clientRepo = AppDataSource.getRepository(Client);
+  const client = await clientRepo.findOne({ where: { id_servicio: Number(serviceId) } });
+
+  if (!client) {
+    return { ok: false, mode: 'geonet_actions', error: 'client_not_found' };
+  }
+
+  const clienteUsuario = String(client.usuario || client.usuario_rb || client.email || serviceId).trim();
+  const actionResult = await ejecutarAccionesClienteGeonet({
+    clienteId: serviceId,
+    clienteUsuario,
+    clientIp: client.ip || null
+  });
+
+  if (!actionResult.ok) {
+    return {
+      ok: false,
+      status: actionResult.status,
+      mode: 'geonet_actions',
+      error: actionResult.error || 'geonet_actions_failed'
+    };
+  }
+
+  try {
+    const nowIso = new Date().toISOString();
+    await clientRepo.update({ id_servicio: client.id_servicio }, {
+      estado: 'Cancelado',
+      fecha_cancelacion: nowIso,
+      ultimo_cambio: nowIso
+    });
+  } catch (error: any) {
+    console.warn(`[darDeBajaClienteByServiceId] No se pudo actualizar el estado local del cliente ${serviceId}: ${error?.message || error}`);
+  }
+
+  return { ok: true, status: actionResult.status, mode: 'geonet_actions' };
+}
+
+/**
+ * Busca y elimina un producto WiFi por usuario del cliente desde la página de admin
+ * Busca en la columna "Cliente" que tiene formato: usuario@geonet - Nombre Completo
+ * @param clientUser Usuario del cliente (ej: "juan.perez" o "juan.perez@geonet")
+ * @returns { ok: boolean, productId?: string, deleted?: boolean, error?: string }
+ */
+export async function deleteWifiProductByName(clientUser: string): Promise<{ ok: boolean; productId?: string; deleted?: boolean; error?: string; clientIp?: string | null; smartoltSn?: string | null; usedSmartoltFallback?: boolean; note?: string }> {
+  if (!clientUser || !String(clientUser).trim()) {
+    return { ok: false, error: 'empty_search_term' };
+  }
+
+  const searchUser = String(clientUser).trim();
+  const searchTerms = buildWifiProductSearchTerms(searchUser);
+  const validation = await resolveSmartoltSnByClientIp(searchUser);
+  let smartoltDeleteSucceeded = false;
+  let smartoltDeleteNote: string | undefined;
+
+  const { browser, page } = await openPage();
+  try {
+    const productsUrl = `${GEONET_BASE_URL}/productos-wifi/`;
+    console.log(`[deleteWifiProductByName] Navegando a ${productsUrl} para buscar usuario: ${clientUser}`);
+
+    // Asegurar sesión y navegar a la página de productos
+    const sessionOk = await ensureSession(page, { force: false });
+    if (!sessionOk) {
+      return { ok: false, error: 'authentication_failed' };
+    }
+
+    await safeGoto(page, productsUrl, { waitForSelector: 'table, .datatable, [data-test="products-table"]', timeout: SCRAPING_TIMEOUTS.mediumOperation });
+    const productFound = await (async () => {
+      try {
+        return await page.evaluate((terms: string[]) => {
+          const normalize = (value: unknown) => String(value ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+          const candidates = terms.map(normalize).filter(Boolean);
+          const headers = Array.from(document.querySelectorAll('table thead th'));
+          const clienteIndex = Math.max(
+            headers.findIndex((header) => normalize(header.textContent || '').includes('cliente')),
+            0
+          );
+
+          const rowMatches = (row: Element) => {
+            const rowEl = row as HTMLTableRowElement;
+            const clienteText = normalize(rowEl.cells?.[clienteIndex]?.textContent || '');
+            return candidates.some((term) => clienteText.includes(term));
+          };
+
+          const rows = document.querySelectorAll('table tbody tr');
+          for (const row of rows) {
+            if (rowMatches(row)) {
+              const dataId = row.getAttribute('data-id') || row.getAttribute('data-product-id') || '';
+              const rowEl = row as HTMLTableRowElement;
+              const numSerie = rowEl.cells?.[2]?.textContent?.trim() || '';
+              const cliente = rowEl.cells?.[clienteIndex]?.textContent?.trim() || '';
+              return {
+                found: true,
+                productId: dataId || numSerie || undefined,
+                serial: numSerie || undefined,
+                cliente: cliente || undefined,
+                rowHtml: row.outerHTML.substring(0, 300)
+              };
+            }
+          }
+
+          return { found: false, productId: undefined, serial: undefined, cliente: undefined, rowHtml: undefined };
+        }, searchTerms);
+      } catch (error: any) {
+        console.warn(`[deleteWifiProductByName] Falló la búsqueda en WispHub para ${searchUser}; se usará SmartOLT por IP si está disponible. Error: ${error?.message || error}`);
+        return { found: false, productId: undefined, serial: undefined, cliente: undefined, rowHtml: undefined };
+      }
+    })();
+
+    if (!productFound.found) {
+      console.log(`[deleteWifiProductByName] Producto no encontrado para usuario: ${searchUser}`);
+    }
+
+    const productId = productFound.productId || undefined;
+    const productSerial = String(productFound.serial || productFound.productId || '').trim();
+    const smartoltSerial = String(validation.smartoltSn || '').trim();
+    const fallbackUsed = Boolean(validation.clientIp && smartoltSerial && (!productFound.found || !productSerial || normalizeSerialLike(productSerial) !== normalizeSerialLike(smartoltSerial)));
+
+    if (!productFound.found && !smartoltSerial) {
+      if (validation.clientIp) {
+        console.warn(`[deleteWifiProductByName] La IP ${validation.clientIp} no devolvió SN en SmartOLT para el cliente ${searchUser}`);
+        return { ok: false, error: 'smartolt_sn_not_found_for_client_ip', productId, clientIp: validation.clientIp, smartoltSn: null, usedSmartoltFallback: false } as any;
+      }
+
+      return { ok: false, error: 'product_not_found', productId, clientIp: null, smartoltSn: null, usedSmartoltFallback: false } as any;
+    }
+
+    const serialToDelete = smartoltSerial || productSerial;
+    if (!serialToDelete) {
+      console.warn('[deleteWifiProductByName] No se pudo obtener un SN válido ni desde WispHub ni desde SmartOLT');
+      return { ok: false, error: 'product_serial_not_found', productId, clientIp: validation.clientIp || null, smartoltSn: validation.smartoltSn || null, usedSmartoltFallback: fallbackUsed } as any;
+    }
+
+    if (validation.clientIp) {
+      if (!smartoltSerial) {
+        console.warn(`[deleteWifiProductByName] La IP ${validation.clientIp} no devolvió SN en SmartOLT para el cliente ${searchUser}; se usará el SN de WispHub.`);
+      } else if (productSerial && normalizeSerialLike(productSerial) !== normalizeSerialLike(smartoltSerial)) {
+        console.warn(
+          `[deleteWifiProductByName] SN de la fila (${productSerial}) no coincide con SmartOLT (${smartoltSerial}) para IP ${validation.clientIp}. Se usará el SN de SmartOLT.`
+        );
+      }
+    }
+
+    console.log(`[deleteWifiProductByName] Eliminando ONU en SmartOLT para SN ${serialToDelete}${validation.clientIp ? ` (IP ${validation.clientIp})` : ''}`);
+    console.log(`[deleteWifiProductByName] SmartOLT delete trace => source=${smartoltSerial ? 'smartolt_ip_lookup' : 'wispHub_row'} method=POST endpoint=/api/onu/delete/${encodeURIComponent(serialToDelete)}`);
+
+    const smartoltDeleteResult = await deleteOnuBySn(serialToDelete);
+    if (!smartoltDeleteResult.ok) {
+      console.warn(`[deleteWifiProductByName] No se pudo eliminar la ONU en SmartOLT para SN ${serialToDelete}`, smartoltDeleteResult);
+      return { ok: false, error: smartoltDeleteResult.error || 'smartolt_delete_failed', productId, clientIp: validation.clientIp || null, smartoltSn: serialToDelete, usedSmartoltFallback: fallbackUsed } as any;
+    }
+
+    console.log(`[deleteWifiProductByName] ONU eliminada en SmartOLT para SN ${serialToDelete} (status=${smartoltDeleteResult.status ?? 'ok'}, endpoint=/api/onu/delete/${encodeURIComponent(serialToDelete)})`);
+    smartoltDeleteSucceeded = true;
+
+    const note = productFound.found
+      ? `Se eliminó la ONU en SmartOLT usando la IP ${validation.clientIp || 'sin IP'}. ${smartoltSerial && productSerial && normalizeSerialLike(productSerial) !== normalizeSerialLike(smartoltSerial) ? `El SN de WispHub (${productSerial}) no coincidía con el SN de SmartOLT (${smartoltSerial}).` : ''}`.trim()
+      : `El producto WiFi ya no existía en WispHub; se eliminó la ONU en SmartOLT usando la IP ${validation.clientIp || 'sin IP'} y el SN ${serialToDelete}.`;
+    smartoltDeleteNote = note;
+
+    if (!productFound.found) {
+      return { ok: true, productId, deleted: true, clientIp: validation.clientIp || null, smartoltSn: serialToDelete, usedSmartoltFallback: true, note } as any;
+    }
+
+    // Buscar y hacer clic en el botón de eliminar
+    const deleteClicked = await (async () => {
+      try {
+        return await page.evaluate((term: string) => {
+          const normalizedTerm = String(term ?? '').toLowerCase().trim();
+          const headers = Array.from(document.querySelectorAll('table thead th'));
+          const clienteIndex = Math.max(
+            headers.findIndex((header) => String(header.textContent || '').toLowerCase().includes('cliente')),
+            0
+          );
+          const rows = document.querySelectorAll('table tbody tr');
+          for (const row of rows) {
+            const rowEl = row as HTMLTableRowElement;
+            const clienteText = String(rowEl.cells?.[clienteIndex]?.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            if (clienteText.includes(normalizedTerm) || clienteText.includes(`${normalizedTerm}@geonet`)) {
+              const checkbox = row.querySelector('input[type="checkbox"]') as HTMLInputElement;
+              if (checkbox && !checkbox.checked) {
+                checkbox.click();
+              }
+
+              const actionSelect = document.querySelector('#id_accion_select') as HTMLSelectElement | null;
+              if (actionSelect) {
+                actionSelect.value = 'delete_selected';
+                actionSelect.dispatchEvent(new Event('input', { bubbles: true }));
+                actionSelect.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+
+              const executeBtn = document.querySelector('#form-acciones button[type="submit"][name="form-acciones"]') as HTMLButtonElement | null;
+              if (executeBtn) {
+                executeBtn.click();
+                return { deleted: true, found: true, method: 'batch_action' };
+              }
+
+              const form = document.querySelector('#form-acciones') as HTMLFormElement | null;
+              if (form) {
+                if (typeof (form as any).requestSubmit === 'function') {
+                  (form as any).requestSubmit();
+                } else {
+                  form.submit();
+                }
+                return { deleted: true, found: true, method: 'batch_action_form' };
+              }
+
+              return { deleted: true, found: true, method: 'batch_action_no_submit' };
+            }
+          }
+          return { deleted: false, found: false, method: undefined };
+        }, searchUser);
+      } catch (error: any) {
+        console.warn(`[deleteWifiProductByName] Búsqueda/borrado en WispHub falló para ${searchUser}; se tomará como no encontrado. Error: ${error?.message || error}`);
+        return { deleted: false, found: false, method: undefined };
+      }
+    })();
+
+    if (!deleteClicked.deleted) {
+      console.log(`[deleteWifiProductByName] No se pudo encontrar botón de eliminar para: ${searchUser}`);
+      return { ok: false, error: 'delete_button_not_found', productId, clientIp: validation.clientIp || null, smartoltSn: serialToDelete, usedSmartoltFallback: fallbackUsed } as any;
+    }
+
+    console.log(`[deleteWifiProductByName] Botón de eliminar clickeado (método: ${deleteClicked.method})`);
+
+    // Esperar a que cargue la página de confirmación
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+
+    // Hacer clic en el botón "Sí, Estoy Seguro" para confirmar la eliminación
+    const confirmationClicked = await page.evaluate(() => {
+      // Buscar el botón rojo "Sí, Estoy Seguro"
+      const buttons = document.querySelectorAll('button');
+      for (const btn of buttons) {
+        const text = (btn.textContent || '').trim();
+        if (text.includes('Sí, Estoy Seguro') || text.includes('Sí, estoy seguro')) {
+          console.log('[Browser] Clickeando botón de confirmación:', text);
+          btn.click();
+          return { confirmed: true, buttonText: text };
+        }
+      }
+      
+      // Alternativa: buscar por clase o atributo
+      const confirmBtn = document.querySelector('[type="submit"], .btn-danger, .btn-success, button.confirm') as HTMLElement;
+      if (confirmBtn && (confirmBtn.textContent || '').toLowerCase().includes('seguro')) {
+        confirmBtn.click?.();
+        return { confirmed: true, buttonText: confirmBtn.textContent || 'confirm' };
+      }
+      
+      return { confirmed: false, buttonText: undefined };
+    });
+
+    if (!confirmationClicked.confirmed) {
+      console.warn(`[deleteWifiProductByName] No se encontró botón de confirmación`);
+      return { ok: false, error: 'confirmation_button_not_found', productId, clientIp: validation.clientIp || null, smartoltSn: serialToDelete, usedSmartoltFallback: fallbackUsed } as any;
+    }
+
+    console.log(`[deleteWifiProductByName] Confirmación clickeada: "${confirmationClicked.buttonText}"`);
+
+    // Esperar a que se complete la eliminación y la página se redirija
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    
+    try {
+      // Esperar a que vuelva a la lista de productos (o una página de éxito)
+      await page.waitForSelector('table, .datatable, [data-test="products-table"], h1, .alert', { 
+        timeout: 5000 
+      }).catch(() => null);
+    } catch (e) {
+      // No es crítico si el selector no aparece
+    }
+
+    // Verificar si la eliminación fue exitosa buscando un mensaje de éxito
+    const successMessage = await page.evaluate(() => {
+      const alerts = document.querySelectorAll('.alert, .message, .notification, [role="alert"]');
+      for (const alert of alerts) {
+        const text = (alert.textContent || '').toLowerCase();
+        if (text.includes('eliminad') || text.includes('success') || text.includes('exitoso')) {
+          return text;
+        }
+      }
+      return undefined;
+    });
+
+    if (successMessage) {
+      console.log(`[deleteWifiProductByName] Mensaje de éxito detectado: ${successMessage.substring(0, 100)}`);
+    }
+
+    // Verificar si aún existe el producto en la tabla
+    const stillExists = await page.evaluate((term: string) => {
+      const normalizedTerm = String(term ?? '').toLowerCase().trim();
+      const headers = Array.from(document.querySelectorAll('table thead th'));
+      const clienteIndex = Math.max(
+        headers.findIndex((header) => String(header.textContent || '').toLowerCase().includes('cliente')),
+        0
+      );
+      const rows = document.querySelectorAll('table tbody tr');
+      for (const row of rows) {
+        const rowEl = row as HTMLTableRowElement;
+        const clienteText = String(rowEl.cells?.[clienteIndex]?.textContent || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        if (clienteText.includes(normalizedTerm) || clienteText.includes(`${normalizedTerm}@geonet`)) {
+          return true;
+        }
+      }
+      return false;
+    }, searchUser);
+
+    if (stillExists) {
+      console.warn(`[deleteWifiProductByName] El producto aún existe después de intentar eliminar: ${searchUser}`);
+      return { ok: false, error: 'product_still_exists', productId, clientIp: validation.clientIp || null, smartoltSn: serialToDelete, usedSmartoltFallback: fallbackUsed } as any;
+    }
+
+    console.log(`[deleteWifiProductByName] Producto eliminado exitosamente para usuario: ${searchUser}`);
+    return { ok: true, productId, deleted: true, clientIp: validation.clientIp || null, smartoltSn: serialToDelete, usedSmartoltFallback: fallbackUsed, note } as any;
+
+  } catch (err: any) {
+    console.error(`[deleteWifiProductByName] Error: ${err.message}`);
+    if (smartoltDeleteSucceeded) {
+      return {
+        ok: true,
+        deleted: true,
+        clientIp: validation.clientIp || null,
+        smartoltSn: validation.smartoltSn || null,
+        usedSmartoltFallback: Boolean(validation.clientIp && validation.smartoltSn),
+        note: `${smartoltDeleteNote || 'Se eliminó la ONU en SmartOLT.'} WispHub devolvió un error de navegación, pero la baja de SmartOLT ya quedó aplicada.`
+      } as any;
+    }
+    return { ok: false, error: err?.message || 'scraping_error', clientIp: validation.clientIp || null, smartoltSn: validation.smartoltSn || null, usedSmartoltFallback: Boolean(validation.clientIp && validation.smartoltSn) } as any;
+  } finally {
+    try {
+      await page.close();
+    } catch (e) {
+      // ignore
+    }
+  }
+}
+
 // --- FUNCIONES DB & SYNC (SIN CAMBIOS) ---
 
 let lastFullSyncAt: Date | null = null;
@@ -1920,15 +2333,40 @@ export async function upsertClients(items: WisphubClientListItem[]): Promise<num
 export async function fullSyncClients(batchSize = 200, maxPages = 1000) {
   let offset = 0;
   let processed = 0;
+  const syncedIds = new Set<number>();
+  
   for (let page = 0; page < maxPages; page++) {
     const data = await listClientsPage({ limit: batchSize, offset });
-    const added = await upsertClients(data.results || []);
+    const results = data.results || [];
+    
+    // Recolectar IDs de clientes sincronizados
+    for (const item of results) {
+      syncedIds.add(item.id_servicio);
+    }
+    
+    const added = await upsertClients(results);
     processed += added;
-    if (!data.next || (data.results || []).length === 0) break;
+    if (!data.next || results.length === 0) break;
     offset += batchSize;
   }
+  
+  const deleted = await pruneMissingClientsByIds(syncedIds);
+  
   lastFullSyncAt = new Date();
-  return { processed, lastFullSyncAt };
+  return { processed, deleted, lastFullSyncAt };
+}
+
+async function pruneMissingClientsByIds(syncedIds: Set<number>): Promise<number> {
+  const repo = AppDataSource.getRepository(Client);
+  const allClients = await repo.find();
+  const toDelete = allClients.filter((client: Client) => !syncedIds.has(client.id_servicio));
+
+  if (toDelete.length > 0) {
+    console.log(`[WisphubClient] Eliminando ${toDelete.length} clientes que ya no están en wisphub`);
+    await repo.remove(toDelete);
+  }
+
+  return toDelete.length;
 }
 
 export { fullSyncInstallations as _placeholder } from './wisphubInstallations';
@@ -2673,6 +3111,78 @@ export async function uploadDocumentoCliente(
   } catch (error: any) {
     console.error(`❌ Error crítico en uploadDocumentoCliente: ${error.message}`);
     return false;
+  } finally {
+    await page.close();
+    await browser.disconnect();
+  }
+}
+
+export type GeonetClientActionsParams = {
+  clienteId: number | string;
+  clienteUsuario: string;
+  clientIp?: string | null;
+};
+
+export async function ejecutarAccionesClienteGeonet(
+  params: GeonetClientActionsParams
+): Promise<{ ok: boolean; status?: number; url?: string; error?: string; detail?: string }> {
+  const { clienteId, clienteUsuario, clientIp } = params;
+  const selectedUser = String(clienteUsuario || '').trim();
+  const selectedId = String(clienteId || '').trim();
+  if (!selectedUser || !selectedId) {
+    return { ok: false, error: 'invalid_client_context' };
+  }
+
+  const username = selectedUser.includes('@geonet') ? selectedUser : `${selectedUser}@geonet`;
+  const { browser, page } = await openPage();
+
+  try {
+    if (!await ensureSession(page)) return { ok: false, error: 'authentication_failed' };
+
+    const url = `${GEONET_BASE_URL}/clientes/acciones/`;
+    await safeGoto(page, url, { waitForSelector: 'input[name="csrfmiddlewaretoken"]', timeout: SCRAPING_TIMEOUTS.mediumOperation });
+
+    const result = await page.evaluate(async (args: { username: string; idServicio: string; clientIp?: string | null; }) => {
+      try {
+        const csrf = (document.querySelector('input[name="csrfmiddlewaretoken"]') as HTMLInputElement)?.value || '';
+        const formData = new FormData();
+        formData.append('csrfmiddlewaretoken', csrf);
+        formData.append('accion_ip', 'suspender_ip');
+        formData.append('cancelar_suscripcion', 'on');
+        formData.append('username', args.username);
+        formData.append('id_servicio', args.idServicio);
+        if (args.clientIp) {
+          formData.append('web_proxy_address_list_map', args.clientIp);
+        }
+        formData.append('cancelar_servicio', 'on');
+
+        const res = await fetch('/clientes/acciones/', {
+          method: 'POST',
+          body: formData,
+          credentials: 'include',
+          redirect: 'follow'
+        });
+
+        const responseText = await res.text().catch(() => '');
+        return {
+          ok: res.ok,
+          status: res.status,
+          url: res.url,
+          detail: responseText.slice(0, 500),
+          error: null
+        };
+      } catch (e: any) {
+        return { ok: false, status: 0, url: '', detail: '', error: e.toString() };
+      }
+    }, { username, idServicio: selectedId, clientIp: clientIp || null });
+
+    if (!result.ok) {
+      return { ok: false, status: result.status, url: result.url, error: result.error || 'geonet_actions_failed', detail: result.detail };
+    }
+
+    return { ok: true, status: result.status, url: result.url, detail: result.detail };
+  } catch (error: any) {
+    return { ok: false, error: error?.message || 'geonet_actions_failed' };
   } finally {
     await page.close();
     await browser.disconnect();

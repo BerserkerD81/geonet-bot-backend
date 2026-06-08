@@ -21,8 +21,11 @@ import {
   agregarArticuloACliente,
   uploadDocumentoCliente,
   getClientByServiceId,
+  deleteWifiProductByName,
+  darDeBajaClienteByServiceId,
+  ejecutarAccionesClienteGeonet,
   _placeholder,
-  authorizeOnuAndFixIp
+  authorizeOnuAndFixIp,
 } from '../services/wisphubClient';
 import { replaceOnuForClient } from '../services/wisphubClient';
 import { getLatestSmartoltOnuSnapshot, scheduleSmartoltOnuSnapshots, captureSmartoltOnuSnapshot } from '../services/smartoltOnuSnapshot';
@@ -130,6 +133,9 @@ const CHAT_CONTEXT_KEYS = [
   'pendingPhotoClientSearch',
   'changeOnuFlowMode',
   'pendingChangeOnuClientSearch',
+  'bajaClienteFlowMode',
+  'pendingBajaClienteSearch',
+  'pendingBajaCliente',
   'pendingWifiClientSearch',
   'pendingWifiChange',
   'monitorClientFlowMode',
@@ -1475,6 +1481,14 @@ function buildMonitorClientSearchActions() {
   ];
 }
 
+function buildBajaClienteSearchActions() {
+  return [
+    { id: 'baja_search_fullname', type: 'input', label: 'Nombre Completo', placeholder: 'Ej: Juan Pérez', payload: 'dar baja buscar nombre {baja_search_fullname} rut {baja_search_rut}' },
+    { id: 'baja_search_rut', type: 'input', label: 'RUT', placeholder: 'Ej: 12.345.678-9', payload: 'dar baja buscar nombre {baja_search_fullname} rut {baja_search_rut}' },
+    { id: 'baja_search_submit', type: 'button', label: 'Buscar Cliente', payload: 'dar baja buscar nombre {baja_search_fullname} rut {baja_search_rut}' }
+  ];
+}
+
 function buildMonitorPanelActions(onuExternalId?: string) {
   const actions: any[] = [];
   if (onuExternalId) {
@@ -2115,6 +2129,9 @@ export async function addMessage(req: any, res: any) {
     req.session.changeOnuFlowMode = undefined;
     req.session.pendingChangeOnuClientSearch = undefined;
     req.session.pendingChangeOnu = undefined;
+    req.session.bajaClienteFlowMode = undefined;
+    req.session.pendingBajaClienteSearch = undefined;
+    req.session.pendingBajaCliente = undefined;
     req.session.wifiFlowMode = undefined;
     req.session.pendingWifiClientSearch = undefined;
     req.session.pendingWifiChange = undefined;
@@ -2160,7 +2177,9 @@ function sanitizeSsid(value?: string | null): string | undefined {
   if (value === undefined || value === null) return undefined;
   const trimmed = value.trim();
   if (!trimmed) return undefined;
-  return trimmed.replace(/\s+/g, '_');
+  const noDiacritics = trimmed.normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+  const normalized = noDiacritics.replace(/\s+/g, '_').replace(/[^A-Za-z0-9_-]/g, '');
+  return normalized || undefined;
 }
 
 export async function respond(req: any, res: any) {
@@ -2202,6 +2221,9 @@ export async function respond(req: any, res: any) {
     session.changeOnuFlowMode = undefined;
     session.pendingChangeOnuClientSearch = undefined;
     session.pendingChangeOnu = undefined;
+    session.bajaClienteFlowMode = undefined;
+    session.pendingBajaClienteSearch = undefined;
+    session.pendingBajaCliente = undefined;
     session.wifiFlowMode = undefined;
     session.pendingWifiClientSearch = undefined;
     session.pendingWifiChange = undefined;
@@ -2387,6 +2409,9 @@ export async function respond(req: any, res: any) {
         session.pendingMonitorClientSearch = true;
         session.pendingMonitorClient = undefined;
         session.monitorGraphType = 'daily';
+        session.bajaClienteFlowMode = false;
+        session.pendingBajaClienteSearch = false;
+        session.pendingBajaCliente = undefined;
         session.changeOnuFlowMode = false;
         session.pendingChangeOnuClientSearch = false;
         session.pendingChangeOnu = undefined;
@@ -2487,35 +2512,6 @@ export async function respond(req: any, res: any) {
               failedApis: monitor.failedApis
             }
           };
-        }
-      }
-      // --- CLIENT MONITOR FLOW: REFRESH PANEL ---
-      else if (lower.startsWith('monitoreo refresh') || pickActionValue(req.body?.actions, ['monitor_refresh', 'monitor-refresh'])) {
-        const actionRefresh = pickActionValue(req.body?.actions, ['monitor_refresh', 'monitor-refresh']);
-        const source = String(actionRefresh || prompt || '');
-        const onuExternalId = (source.match(/refresh\s+([^\s]+)/i)?.[1] || session?.pendingMonitorClient?.onuExternalId || '').trim();
-
-        if (!onuExternalId) {
-          finalContent = '⚠️ No tengo el ID de ONU para refrescar monitoreo. Vuelve a seleccionar el cliente en el flujo de monitoreo.';
-          actionsOut = buildMonitorPanelActions();
-        } else {
-          const graphType = normalizeMonitorGraphType(session?.monitorGraphType || 'daily');
-          const monitor = await loadMonitorSmartoltData(onuExternalId, graphType);
-          let selected = session?.pendingMonitorClient || {};
-          if (selected?.clientIdServicio) {
-            const clientApiPayload = await getClientByServiceId(selected.clientIdServicio).catch(() => null);
-            const wisphubSummary = extractMonitorWisphubSummary(selected, clientApiPayload || undefined);
-            selected = { ...selected, ...wisphubSummary };
-            session.pendingMonitorClient = { ...(session.pendingMonitorClient || {}), ...wisphubSummary };
-          }
-          const graphSection = buildMonitorGraphsSection(monitor);
-          const apiWarnings = monitor.failedApis.length ? `\n\n⚠️ APIs con error: ${monitor.failedApis.join(' | ')}` : '';
-          const lastInvoiceLabel = selected.lastInvoiceDate
-            ? `${selected.lastInvoiceDate}${selected.lastInvoicePaid ? ` (${selected.lastInvoicePaid})` : ''}`
-            : (selected.lastInvoicePaid || 'N/D');
-
-          finalContent = `📡 **Panel Monitoreo SmartOLT**\n\n👤 **Cliente:** ${selected.clientName || 'N/D'}\n🆔 **Servicio:** ${selected.clientIdServicio || 'N/D'}\n🌍 **IP:** ${selected.ip || 'N/D'}\n🛰️ **Estado WispHub:** ${selected.wisphubServiceStatus || 'N/D'}\n💳 **Última factura:** ${lastInvoiceLabel}\n🔢 **ONU External ID:** ${onuExternalId}\n🗂️ **Período gráficos:** ${monitorGraphTypeLabel(graphType)}\n📶 **Estado ONU:** ${monitor.statusSummary}\n⏱️ **Tiempo en línea:** ${monitor.onlineUptime || 'N/D'}\n📏 **Distancia ONU-OLT:** ${monitor.distanceOltOnu || 'N/D'}\n📥 **RX:** ${monitor.rx}\n📤 **TX:** ${monitor.tx}${graphSection}${apiWarnings}`;
-          actionsOut = buildMonitorPanelActions(onuExternalId);
           assistantMetadata = {
             flow: 'monitor-client',
             monitor: {
@@ -2657,12 +2653,71 @@ export async function respond(req: any, res: any) {
           };
         }
       }
+      // --- BAJA CLIENTE FLOW: START ---
+      else if (/(dar\s+de\s+bajacliente|dar\s+de\s+baja\s+cliente|dar\s+baja\s+cliente|eliminar\s+cliente|bajar\s+cliente)/i.test(lower) && !/(buscar|submit)/i.test(lower)) {
+        session.monitorClientFlowMode = false;
+        session.pendingMonitorClientSearch = false;
+        session.pendingMonitorClient = undefined;
+        session.monitorGraphType = undefined;
+        session.changeOnuFlowMode = false;
+        session.pendingChangeOnuClientSearch = false;
+        session.pendingChangeOnu = undefined;
+        session.wifiFlowMode = false;
+        session.pendingWifiClientSearch = false;
+        session.pendingWifiChange = undefined;
+        session.bajaClienteFlowMode = true;
+        session.pendingBajaClienteSearch = true;
+        session.pendingBajaCliente = { stage: 'search' };
+        session.lastContextType = 'baja-cliente-search';
+        finalContent = 'Perfecto. Ingresa el nombre completo y/o el RUT para buscar al cliente y darlo de baja.';
+        actionsOut = buildBajaClienteSearchActions();
+      }
+      // --- BAJA CLIENTE FLOW: SEARCH ---
+      else if (lower.startsWith('dar baja buscar') || lower.startsWith('dar de baja buscar') || (session.pendingBajaClienteSearch && (collected?.baja_search_fullname || collected?.baja_search_rut))) {
+        const nameMatch = prompt.match(/nombre\s+(.+?)(?=\s+rut|$)/i);
+        const rutMatch = prompt.match(/rut\s+([^\s]+)/i);
+
+        let fullName = (collected?.baja_search_fullname || nameMatch?.[1] || '').trim();
+        let rut = (collected?.baja_search_rut || rutMatch?.[1] || '').trim();
+
+        if (fullName.includes('{baja_search_fullname}')) fullName = '';
+        if (rut.includes('{baja_search_rut}')) rut = '';
+
+        if (!fullName && !rut) {
+          finalContent = 'Ingresa nombre completo y/o RUT para buscar al cliente.';
+          actionsOut = buildBajaClienteSearchActions();
+          session.pendingBajaClienteSearch = true;
+          session.bajaClienteFlowMode = true;
+        } else {
+          const clients = await findClientsByNameRutWithSync(fullName, rut);
+          session.pendingBajaClienteSearch = false;
+          session.bajaClienteFlowMode = true;
+          session.lastContextType = 'baja-cliente-search';
+
+          if (clients.length) {
+            const fmt = formatEntityList(clients, 'client');
+            const table = buildClientsTable(clients);
+            finalContent = `🛑 **Dar de baja cliente**\n\nResultados para "${[fullName, rut].filter(Boolean).join(' / ') || 'búsqueda'}":\n\n${table}`;
+            actionsOut = fmt.actions.map(a => ({
+              ...a,
+              payload: String(a.payload || '').trim() + ' baja'
+            }));
+          } else {
+            finalContent = 'No encontré clientes con esos datos. Intenta nuevamente.';
+            actionsOut = buildBajaClienteSearchActions();
+            session.pendingBajaClienteSearch = true;
+          }
+        }
+      }
       // --- CHANGE ONU FLOW: START ---
       else if (/(cambiar\s+onu|cambio\s+onu|cambio\s+de\s+onu)/i.test(lower) && !/(buscar|submit)/i.test(lower)) {
         session.monitorClientFlowMode = false;
         session.pendingMonitorClientSearch = false;
         session.pendingMonitorClient = undefined;
         session.monitorGraphType = undefined;
+        session.bajaClienteFlowMode = false;
+        session.pendingBajaClienteSearch = false;
+        session.pendingBajaCliente = undefined;
         session.changeOnuFlowMode = true;
         session.pendingChangeOnuClientSearch = true;
         session.pendingChangeOnu = { stage: 'search' };
@@ -2679,6 +2734,9 @@ export async function respond(req: any, res: any) {
         session.pendingMonitorClientSearch = false;
         session.pendingMonitorClient = undefined;
         session.monitorGraphType = undefined;
+        session.bajaClienteFlowMode = false;
+        session.pendingBajaClienteSearch = false;
+        session.pendingBajaCliente = undefined;
         session.wifiFlowMode = true;
         session.pendingWifiClientSearch = true;
         session.pendingWifiChange = { stage: 'search' };
@@ -3498,6 +3556,115 @@ export async function respond(req: any, res: any) {
           }
         }
       }
+      // --- BAJA CLIENTE SUBMIT (Trigger) ---
+      else if (lower.startsWith('dar baja submit') || lower.startsWith('dar de baja submit') || pickActionValue(req.body?.actions, ['baja_cliente_submit', 'baja-cliente-submit'])) {
+        const actionSubmit = pickActionValue(req.body?.actions, ['baja_cliente_submit', 'baja-cliente-submit']);
+        const source = String(actionSubmit || prompt || '');
+        const idMatch = source.match(/submit\s+(\d+)/i) || source.match(/cliente\s+(\d+)/i) || source.match(/(\d+)/);
+        const serviceId = Number(idMatch?.[1] || session?.pendingBajaCliente?.clientIdServicio || session?.lastSelectedClientIdServicio);
+
+        if (!serviceId || Number.isNaN(serviceId)) {
+          finalContent = '⚠️ No pude detectar el ID del cliente para dar de baja.';
+          actionsOut = [];
+        } else {
+          try {
+            // Primero obtener datos del cliente para buscar el producto
+            const clientRepo = AppDataSource.getRepository(Client);
+            const client = await clientRepo.findOne({ where: { id_servicio: serviceId } });
+
+            if (!client) {
+              finalContent = `❌ No encontré el cliente con ID ${serviceId} en la base de datos.`;
+              actionsOut = [];
+            } else {
+              // Intentar eliminar el producto WiFi primero
+              const searchTerm = client.usuario || client.nombre || `${client.nombre} ${client.apellidos}`;
+              const runFinalGeonetActions = async () => {
+                const actionResult = await ejecutarAccionesClienteGeonet({
+                  clienteId: serviceId,
+                  clienteUsuario: client.usuario || searchTerm,
+                  clientIp: client.ip || null
+                });
+
+                if (actionResult.ok) {
+                  finalContent += `✅ Acciones finales de Geonet ejecutadas correctamente.${actionResult.status ? ` (status ${actionResult.status})` : ''}\n\n`;
+                  return true;
+                }
+
+                finalContent += `⚠️ La baja quedó hecha, pero falló el cierre final en Geonet: ${actionResult.error || 'desconocido'}\n\n`;
+                return false;
+              };
+
+              if (searchTerm && searchTerm.trim()) {
+                finalContent = `⏳ Buscando y eliminando producto WiFi para: **${searchTerm}**\n\n`;
+                
+                const deleteResult = await deleteWifiProductByName(searchTerm);
+                const continueWithBaja = Boolean(deleteResult.ok && deleteResult.deleted) || [
+                  'product_not_found',
+                  'delete_button_not_found',
+                  'confirmation_button_not_found',
+                  'product_still_exists',
+                  'product_serial_not_found',
+                  'smartolt_sn_not_found_for_client_ip',
+                  'smartolt_delete_failed'
+                ].includes(String(deleteResult.error || ''));
+                
+                if (deleteResult.ok && deleteResult.deleted) {
+                  if (deleteResult.note) {
+                    finalContent += `📝 ${deleteResult.note}\n\n`;
+                  }
+                  finalContent += `✅ Producto WiFi eliminado exitosamente.\n\n`;
+                } else if (deleteResult.ok === false && deleteResult.error === 'product_not_found') {
+                  // El producto no existe (podría estar ya eliminado), continuar con la baja del cliente
+                  finalContent += `⚠️ Producto WiFi no encontrado (podría estar ya eliminado).\n\nContinuando con la baja del cliente...\n\n`;
+                } else if (deleteResult.ok === false && deleteResult.error === 'smartolt_delete_failed') {
+                  finalContent += `⚠️ No se pudo eliminar la ONU en SmartOLT, pero la baja del servicio seguirá adelante.\n\nSe dejará constancia de este intento fallido en el mensaje final.\n\n`;
+                } else if (!continueWithBaja) {
+                  finalContent += `❌ Error eliminando el producto WiFi: ${deleteResult.error || 'desconocido'}\n\n⚠️ La baja no se completó por seguridad.`;
+                  actionsOut = [
+                    { id: 'baja_retry', type: 'button', label: '🔄 Reintentar', payload: `dar baja submit ${serviceId}` },
+                    { id: 'baja_cancel', type: 'button', label: '✖️ Cancelar', payload: 'dar de baja cliente' }
+                  ];
+                  return;
+                } else {
+                  finalContent += `⚠️ No se pudo completar el borrado del producto en WispHub (${deleteResult.error || 'desconocido'}), pero se intentará igualmente la baja del servicio.\n\n`;
+                }
+
+                const bajaResult = await darDeBajaClienteByServiceId(serviceId);
+
+                if (bajaResult.ok) {
+                  finalContent += `✅ Cliente **${serviceId}** (${client.usuario}) ha sido dado de baja exitosamente.\n\n`;
+                  finalContent += `📋 Estado local actualizado a **Cancelado** en la tabla de clientes.\n\n`;
+                  finalContent += `🔧 Ejecutando acciones finales de Geonet con el cliente seleccionado...\n\n`;
+                  await runFinalGeonetActions();
+                  finalContent += `**Información del cliente:**\n`;
+                  finalContent += `- Usuario: ${client.usuario}\n`;
+                  finalContent += `- Nombre: ${client.nombre} ${client.apellidos}\n`;
+                  finalContent += `- Email: ${client.email}\n`;
+                  finalContent += `- Estado anterior: ${client.estado}\n`;
+                  
+                  actionsOut = [
+                    { id: 'baja_new_search', type: 'button', label: '🔍 Buscar otro cliente', payload: 'dar de baja cliente' },
+                    { id: 'baja_back', type: 'button', label: '← Volver al menú', payload: 'menu' }
+                  ];
+                  session.bajaClienteFlowMode = false;
+                  session.pendingBajaClienteSearch = false;
+                  session.pendingBajaCliente = undefined;
+                } else {
+                  finalContent += `❌ Error dando de baja el cliente: ${bajaResult.error || 'desconocido'}`;
+                  actionsOut = [];
+                }
+              } else {
+                finalContent = `❌ No hay datos de usuario para buscar el producto WiFi.`;
+                actionsOut = [];
+              }
+            }
+          } catch (err: any) {
+            finalContent = `❌ Error procesando la baja: ${err?.message || 'error desconocido'}`;
+            actionsOut = [];
+            console.error('[chatController] Error en baja cliente:', err);
+          }
+        }
+      }
 
       // --- SELECCIONAR CLIENTE/INSTALACION ---
       else if (/^(seleccionar|select) (cliente|instalación|instalacion)/i.test(lower) || pickActionValue(req.body?.actions, ['select-client', 'select_client', 'seleccionar-cliente', 'seleccionar_cliente', 'select', 'seleccionar'])) {
@@ -3678,6 +3845,33 @@ export async function respond(req: any, res: any) {
                 }
               };
             }
+          } else if (isClient && (session.bajaClienteFlowMode || session.lastContextType === 'baja-cliente-search' || session.pendingBajaCliente || session.pendingBajaClienteSearch)) {
+            const clientName = displayName || `Cliente ${serviceId}`;
+            const rut = entity.cedula || entity.rut || 'N/A';
+            const plan = entity.plan_internet || entity.plan || pickPlanFromRaw(entity.raw) || 'Plan desconocido';
+            const address = entity.direccion || 'Sin dirección';
+            const ip = entity.ip || entity.ipv4_address || entity.ip_cliente || 'N/D';
+            const status = entity.estado || 'N/D';
+
+            session.bajaClienteFlowMode = true;
+            session.pendingBajaClienteSearch = false;
+            session.pendingBajaCliente = {
+              stage: 'selected',
+              clientIdServicio: serviceId,
+              clientName,
+              rut,
+              plan,
+              address,
+              ip,
+              estado: status
+            };
+            session.lastContextType = 'baja-cliente-selected';
+
+            finalContent = `🛑 **Dar de baja cliente**\n\n✅ Cliente seleccionado: **${clientName}** [ID: ${serviceId}]\n🪪 **RUT:** ${rut}\n📍 **Dirección:** ${address}\n🌍 **IP:** ${ip}\n🚀 **Plan:** ${plan}\n📶 **Estado actual:** ${status}\n\nSi confirmas, presiona el botón para eliminar/dar de baja este cliente.`;
+            actionsOut = [
+              { id: 'baja_cliente_submit', type: 'button', label: '🗑️ Dar de baja cliente (en desarrollo)', payload: `dar baja submit ${serviceId}` },
+              { id: 'baja_new_search', type: 'button', label: 'Buscar otro cliente', payload: 'dar de baja cliente' }
+            ];
           } else if (isClient && (session.changeOnuFlowMode || session.lastContextType === 'change-onu-client-search' || session.pendingChangeOnu || session.pendingChangeOnuClientSearch)) {
             // CHANGE-ONU flow: prepare pendingChangeOnu and show unconfigured ONUs table
             session.pendingChangeOnuClientSearch = false;

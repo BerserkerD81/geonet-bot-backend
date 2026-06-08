@@ -85,7 +85,8 @@ app.use(
     resave: false,
     saveUninitialized: false,
     cookie: {
-      secure: process.env.NODE_ENV === 'production', // true en producción (HTTPS)
+      secure: (process.env.SESSION_COOKIE_SECURE || '').toLowerCase() === 'true'
+        || process.env.NODE_ENV === 'production', // true en producción (HTTPS), configurable por env
       httpOnly: true, // Inmune a lectura mediante JavaScript (XSS)
       sameSite: 'strict', // Solo viaja si la petición ocurre dentro de tu dominio
       maxAge: 1000 * 60 * 60 * 24 // 1 día de duración

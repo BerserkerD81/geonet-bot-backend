@@ -705,6 +705,44 @@ export async function updateOnuSn(onuExternalId: string | number, newSn: string)
   return res.data;
 }
 
+export async function deleteOnuBySn(sn: string): Promise<{ ok: boolean; status?: number; error?: string }> {
+  if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
+  if (!SMARTOLT.apiKey) throw new Error('SMARTOLT_API_KEY not configured');
+
+  const onuExternalId = String(sn || '').trim();
+  if (!onuExternalId) return { ok: false, error: 'sn_required' };
+
+  const url = `${baseUrl}/api/onu/delete/${encodeURIComponent(onuExternalId)}`;
+  console.log(`[SmartOLT deleteOnuBySn] SN=${onuExternalId} method=POST endpoint=${url}`);
+
+  try {
+    const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(url, undefined, {
+      headers: getHeaders(),
+      timeout: 20000,
+      validateStatus: (status) => status >= 200 && status < 500
+    }));
+
+    if (res.status >= 200 && res.status < 300) {
+      console.log(`[SmartOLT deleteOnuBySn] SN=${onuExternalId} deleted successfully status=${res.status}`);
+      return { ok: true, status: res.status };
+    }
+
+    console.warn(`[SmartOLT deleteOnuBySn] SN=${onuExternalId} delete failed status=${res.status}`);
+    return {
+      ok: false,
+      status: res.status,
+      error: typeof res.data === 'string' ? res.data : JSON.stringify(res.data)
+    };
+  } catch (error: any) {
+    console.error(`[SmartOLT deleteOnuBySn] SN=${onuExternalId} error=${error?.response?.status || 'no-status'} ${error?.message || 'smartolt_delete_failed'}`);
+    return {
+      ok: false,
+      status: error?.response?.status,
+      error: error?.response?.data?.error || error?.message || 'smartolt_delete_failed'
+    };
+  }
+}
+
 export async function changeOnuType(onuExternalId: string | number, onuType: string) {
   if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
   if (!SMARTOLT.apiKey) throw new Error('SMARTOLT_API_KEY not configured');
@@ -1203,6 +1241,7 @@ export default {
   setOnuWanModeStaticIp,
   updateOnuLocation,
   updateOnuSn,
+  deleteOnuBySn,
   changeOnuType,
   getAvailablePortsForOdb,
   listAllUnconfiguredOnus,

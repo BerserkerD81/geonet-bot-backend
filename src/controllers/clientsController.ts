@@ -109,8 +109,8 @@ export async function listClients(req: Request, res: Response) {
 
 export async function syncAll(req: Request, res: Response) {
   try {
-    const { processed, lastFullSyncAt } = await fullSyncClients();
-    return res.json({ ok: true, processed, lastFullSyncAt });
+    const { processed, deleted, lastFullSyncAt } = await fullSyncClients();
+    return res.json({ ok: true, processed, deleted, lastFullSyncAt });
   } catch (err: any) {
     return res.status(500).json({ error: err?.message || 'Sync failed' });
   }
