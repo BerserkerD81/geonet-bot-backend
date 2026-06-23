@@ -1,4 +1,4 @@
-import fs from 'fs';
+       import fs from 'fs';
 import path from 'path';
 import { AppDataSource } from '../datasource';
 import { Installation } from '../models/Installation';
@@ -8,15 +8,20 @@ import { SmartoltOnuDetail } from '../models/SmartoltOnuDetail';
 import { listAllLocalInstallations, fullSyncInstallations } from '../services/wisphubInstallations';
 import { prepareAuthSession, buildAuthActions, resolveIsPyme, resolveGeonetInstallationUser, loadMonitorSmartoltData, classifyOnuSignalQuality } from './chatController';
 import {
-  getOdbs, getInternalOnuIdBySn, updateOnuWifi, getAllOnuTypes,
+  getOdbs, getInternalOnuIdBySn, getOnuIdAndIpBySn, getAllOnuTypes,
   listGlobalUnconfiguredOnus, changeOnuType, updateOnuSn,
-  rebootOnuByExternalId, resyncOnuConfigByExternalId,
+  rebootOnuByExternalId, resyncOnuConfigByExternalId, updateOnuMgmtIp, saveWifiStatus, getOltVlans,
+  continueAuthorize, getOnuSignalByExternalId, deleteOnuBySn,
 } from '../services/smartoltClient';
 import {
   activarInstalacionGeonet, processContractUpdate, getAutoLoginContractLink,
   refreshClientsByTerm, fullSyncClients, replaceOnuForClient,
   deleteWifiProductByName, darDeBajaClienteByServiceId, uploadDocumentoCliente,
+  getClientByServiceId, deleteGeonetTvProducts, liberarGeonetTvEquipos,
 } from '../services/wisphubClient';
+import { getGenieDeviceId, setGenieWifi } from '../services/genieacsClient';
+import { enqueueWifiTask, getWifiTask } from '../services/pendingWifiTasks';
+import { ApptvClient } from '../services/apptvVClient';
 
 // GET /wizard/auth/odbs?zone=Batallas
 export async function getOdbsByZone(req: any, res: any) {
@@ -49,9 +54,13 @@ export async function getOdbsByZone(req: any, res: any) {
   }
 }
 
-// GET /wizard/auth/installations
+// GET /wizard/auth/installations?sync=true
 export async function getAuthWizardInstallations(req: any, res: any) {
+  const forceSync = req.query.sync === 'true';
   try {
+    if (forceSync) {
+      await fullSyncInstallations(100, 50).catch((e: any) => console.warn('[wizard] sync warn:', e?.message));
+    }
     let items = await listAllLocalInstallations(0);
     if (!items.length) {
       await fullSyncInstallations(100, 3).catch(() => {});
@@ -72,11 +81,34 @@ export async function getAuthWizardInstallations(req: any, res: any) {
       sn_onu: i.sn_onu,
       usuario: i.usuario,
       fecha_instalacion: i.fecha_instalacion,
+      ip: i.ip,
     }));
     return res.json({ ok: true, results });
   } catch (e: any) {
     console.error('[wizard] getAuthWizardInstallations error:', e);
     return res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
+// GET /wizard/auth/wifi/task-status?sn=ZTEGDACC6FAC
+export async function getWifiTaskStatus(req: any, res: any) {
+  const sn = req.query.sn as string;
+  if (!sn) return res.status(400).json({ ok: false, error: 'sn requerido' });
+  const task = getWifiTask(String(sn).toUpperCase());
+  if (!task) return res.json({ ok: true, found: false });
+  return res.json({ ok: true, found: true, task });
+}
+
+// GET /wizard/auth/vlans?oltId=3
+export async function getVlansWizard(req: any, res: any) {
+  const oltId = req.query.oltId as string;
+  if (!oltId) return res.status(400).json({ ok: false, error: 'oltId requerido' });
+  try {
+    const vlans = await getOltVlans(oltId, { cacheTtlMs: 60000 });
+    return res.json({ ok: true, vlans });
+  } catch (e: any) {
+    console.error('[wizard] getVlansWizard error:', e);
+    return res.status(500).json({ ok: false, error: e.message, vlans: [] });
   }
 }
 
@@ -124,6 +156,7 @@ export async function prepareAuthWizard(req: any, res: any) {
           oltName: olt.oltName,
           ponType: onu.ponType,
           port: onu.port,
+          board: onu.board || '',
           model: onu.model,
         });
       }
@@ -153,34 +186,82 @@ export async function prepareAuthWizard(req: any, res: any) {
   }
 }
 
-// POST /wizard/auth/wifi  body: { sn, ssid, pass }
+// POST /wizard/auth/wifi  body: { sn, ssid, pass, clientIp?, board?, port?, olt_id? }
+// Activa TR069 perfil 3, desactiva WiFi en SmartOLT y configura SSID/pass via GenieACS.
 export async function applyWifiWizard(req: any, res: any) {
   const session = req.session || {};
   if (!session.userId) return res.status(401).json({ error: 'unauthenticated' });
 
-  const { sn, ssid, pass } = req.body;
-  if (!sn || !ssid || !pass) return res.status(400).json({ error: 'sn, ssid y pass son requeridos' });
+  const { sn, ssid, pass, clientIp, board, port, olt_id } = req.body;
+  if (!sn) return res.status(400).json({ error: 'sn requerido' });
+  if (!ssid || !pass) return res.status(400).json({ error: 'ssid y pass requeridos' });
 
   try {
-    const internalId = await getInternalOnuIdBySn(String(sn).toUpperCase());
-    if (!internalId) return res.status(404).json({ ok: false, error: `No se encontró ID interno para SN ${sn}` });
+    let { id: onuId, ip: smartoltIp } = await getOnuIdAndIpBySn(String(sn).toUpperCase());
+
+    // Si la ONU no aparece en configuradas, la autorización quedó incompleta.
+    // Intentar finalizar via scraping con los datos del formulario y reintentar.
+    if (!onuId && board && port && olt_id) {
+      console.log(`[applyWifi] ONU ${sn} no configurada → intentando continue_authorize board=${board} port=${port} olt=${olt_id}`);
+      try {
+        await continueAuthorize(board, port, String(sn).toUpperCase(), olt_id);
+        // Esperar brevemente para que SmartOLT procese
+        await new Promise(r => setTimeout(r, 2000));
+        const retry = await getOnuIdAndIpBySn(String(sn).toUpperCase());
+        onuId = retry.id;
+        if (retry.ip) smartoltIp = retry.ip;
+      } catch (e: any) {
+        console.warn(`[applyWifi] continue_authorize falló: ${e?.message}`);
+      }
+    }
+
+    if (!onuId) return res.status(404).json({ ok: false, error: `ONU ${sn} no encontrada en SmartOLT. Verifica que la autorización se completó.` });
+
+    // IP live de SmartOLT tiene prioridad; clientIp es fallback por si la respuesta no la incluye
+    const resolvedIp = smartoltIp || clientIp || null;
 
     const results: string[] = [];
+
+    // 1. Activate TR069 profile 3
     try {
-      await updateOnuWifi(internalId, '2.4GHz', ssid, pass, true);
-      results.push('✅ 2.4GHz configurado');
+      await updateOnuMgmtIp(onuId, { tr069_profile_id: 3 });
+      results.push('✅ TR069 perfil 3 activado');
     } catch (e: any) {
-      results.push(`❌ 2.4GHz: ${e.message}`);
+      results.push(`❌ TR069: ${e.message}`);
     }
+
+    // 2. Disable SmartOLT WiFi
     try {
-      await updateOnuWifi(internalId, '5GHz', `${ssid}_5G`, pass, true);
-      results.push('✅ 5GHz configurado');
+      await saveWifiStatus(onuId, false);
+      results.push('✅ WiFi SmartOLT desactivado');
     } catch (e: any) {
-      results.push(`⚠️ 5GHz: ${e.message || 'No disponible'}`);
+      results.push(`⚠️ WiFi SmartOLT: ${e.message}`);
+    }
+
+    // 3. Configure SSID/pass via GenieACS
+    let genieTaskQueued = false;
+    try {
+      const deviceId = await getGenieDeviceId(resolvedIp);
+      if (!deviceId) {
+        // ONU aún no se registró en GenieACS — encolar tarea en background
+        enqueueWifiTask(String(sn).toUpperCase(), String(ssid), String(pass), resolvedIp).catch(() => {});
+        genieTaskQueued = true;
+        results.push('⏳ GenieACS: dispositivo no encontrado aún — tarea creada para configurar WiFi automáticamente cuando la ONU conecte (cada 90s, hasta 15 min)');
+      } else {
+        const genieResult = await setGenieWifi(deviceId, String(ssid), String(pass));
+        const ssid5g = `${String(ssid)}_5G`;
+        if (genieResult?._queued) {
+          results.push(`✅ GenieACS: tarea guardada — se aplicará en la próxima sesión TR069 (2.4GHz: "${ssid}" | 5GHz: "${ssid5g}")`);
+        } else {
+          results.push(`✅ WiFi configurado vía GenieACS — 2.4GHz: "${ssid}" | 5GHz: "${ssid5g}"`);
+        }
+      }
+    } catch (e: any) {
+      results.push(`❌ GenieACS: ${e.message}`);
     }
 
     const allFailed = results.every(r => r.startsWith('❌'));
-    return res.json({ ok: !allFailed, results, ssid, pass });
+    return res.json({ ok: !allFailed, results, genieTaskQueued });
   } catch (e: any) {
     console.error('[wizard] applyWifiWizard error:', e);
     return res.status(500).json({ ok: false, error: e.message });
@@ -241,6 +322,28 @@ export async function activateWispHubWizard(req: any, res: any) {
     });
   } catch (e: any) {
     console.error('[wizard] activateWispHubWizard error:', e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
+// POST /wizard/auth/tr069  body: { sn }
+export async function activateTr069Wizard(req: any, res: any) {
+  const session = req.session || {};
+  if (!session.userId) return res.status(401).json({ error: 'unauthenticated' });
+
+  const { sn } = req.body;
+  if (!sn) return res.status(400).json({ error: 'sn requerido' });
+
+  try {
+    const onuId = await getInternalOnuIdBySn(String(sn).toUpperCase());
+    if (!onuId) {
+      return res.status(404).json({ ok: false, error: `No se encontró ID interno para SN ${sn}` });
+    }
+
+    const result = await updateOnuMgmtIp(onuId, { tr069_profile_id: 3 });
+    return res.json({ ok: true, onuId, result });
+  } catch (e: any) {
+    console.error('[wizard] activateTr069Wizard error:', e);
     return res.status(500).json({ ok: false, error: e.message });
   }
 }
@@ -513,6 +616,19 @@ export async function prepareMonitorWizard(req: any, res: any) {
       }
     }
 
+    // If client.sn_onu was updated after a swap, the snapshot may still point to the old ONU.
+    // Prefer client.sn_onu when it differs from the snapshot SN.
+    if (client.sn_onu) {
+      const currentSn = String(client.sn_onu).trim();
+      if (!resolvedOnu || (resolvedOnu.sn && resolvedOnu.sn !== currentSn)) {
+        resolvedOnu = {
+          sn: currentSn,
+          model: resolvedOnu?.model || '',
+          externalId: currentSn,
+        };
+      }
+    }
+
     if (!resolvedOnu?.externalId) {
       return res.json({
         ok: true,
@@ -635,7 +751,44 @@ export async function submitBajaWizard(req: any, res: any) {
       return res.json({ ok: false, steps, error: 'Baja cancelada por error en eliminación de producto WiFi' });
     }
 
-    // Step 2: dar de baja (Geonet acciones + local DB update)
+    // Step 2: delete ONU from SmartOLT (by SN resolved from client IP via local snapshot)
+    if (client.ip) {
+      try {
+        const detailRepo = AppDataSource.getRepository(SmartoltOnuDetail);
+        const detail = await detailRepo
+          .createQueryBuilder('o')
+          .where('o.ipAddress = :ip', { ip: client.ip })
+          .orderBy('o.capturedAt', 'DESC')
+          .limit(1)
+          .getOne();
+
+        if (detail) {
+          const p = detail.payload || {};
+          const snRaw = String(detail.sn || p.sn || p.serial || p.onu_sn || '').trim();
+          const externalId = String(detail.uniqueExternalId || p.onu_external_id || p.unique_external_id || p.external_id || snRaw).trim();
+          const sn = snRaw.toUpperCase();
+
+          if (externalId) {
+            const deleteResult = await deleteOnuBySn(externalId);
+            if (deleteResult.ok) {
+              steps.push({ step: 'smartolt', ok: true, msg: `✅ ONU eliminada de SmartOLT (SN: ${sn || externalId})` });
+            } else {
+              steps.push({ step: 'smartolt', ok: false, msg: `⚠️ No se pudo eliminar ONU de SmartOLT (SN: ${sn || externalId}): ${deleteResult.error || 'error desconocido'} — se continúa con la baja` });
+            }
+          } else {
+            steps.push({ step: 'smartolt', ok: false, msg: `⚠️ ONU encontrada en snapshot pero sin SN/ID para eliminar (IP: ${client.ip}) — se continúa` });
+          }
+        } else {
+          steps.push({ step: 'smartolt', ok: false, msg: `⚠️ No se encontró ONU en SmartOLT para IP ${client.ip} — se continúa con la baja` });
+        }
+      } catch (e: any) {
+        steps.push({ step: 'smartolt', ok: false, msg: `⚠️ Error buscando ONU en SmartOLT: ${e.message} — se continúa con la baja` });
+      }
+    } else {
+      steps.push({ step: 'smartolt', ok: false, msg: `⚠️ Cliente sin IP registrada, se omite eliminación de ONU en SmartOLT` });
+    }
+
+    // Step 3: dar de baja (TR-069 GenieACS + Geonet acciones + local DB update)
     try {
       const bajaResult = await darDeBajaClienteByServiceId(Number(clientId));
       if (bajaResult.ok) {
@@ -692,6 +845,169 @@ export async function uploadFotoWizard(req: any, res: any) {
     return res.json({ ok, usuario: clienteUsuario });
   } catch (e: any) {
     console.error('[wizard] uploadFotoWizard error:', e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
+// GET /wizard/signal?sn=X
+export async function getOnuSignalWizard(req: any, res: any) {
+  const sn = ((req.query.sn as string) || '').trim().toUpperCase();
+  if (!sn) return res.status(400).json({ ok: false, error: 'sn requerido' });
+  try {
+    const data = await getOnuSignalByExternalId(sn);
+    if (!data?.status) {
+      return res.json({ ok: false, error: data?.error || 'ONU no encontrada en SmartOLT' });
+    }
+    const signal1490 = String(data.onu_signal_1490 || '').trim();
+    const signal1310 = String(data.onu_signal_1310 || '').trim();
+    const signalValue = String(data.onu_signal_value || '').trim();
+    const statusSummary = String(data.onu_signal || '').trim();
+    const quality = classifyOnuSignalQuality({ signal1490, signalValue, statusSummary });
+    return res.json({ ok: true, signal1490, signal1310, signalValue, statusSummary, quality });
+  } catch (e: any) {
+    console.error('[wizard] getOnuSignalWizard error:', e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
+// GET /wizard/iptv/devices?ip=...
+export async function getIptvDevices(req: any, res: any) {
+  const session = req.session || {};
+  if (!session.userId) return res.status(401).json({ error: 'unauthenticated' });
+
+  const ip = ((req.query.ip as string) || '').trim();
+  console.log(`[wizard/iptv/devices] GET ip=${ip || '(vacío)'} userId=${session.userId}`);
+  if (!ip) return res.status(400).json({ ok: false, error: 'ip requerido' });
+
+  try {
+    const client = new ApptvClient();
+    const result = await client.getDevicesByIp(ip);
+    if (!result) {
+      console.warn(`[wizard/iptv/devices] Sin dispositivos para ip=${ip}`);
+      return res.status(404).json({ ok: false, error: 'No se encontraron dispositivos para esa IP' });
+    }
+    const devices = (result.data ?? []).map(d => ({
+      mac: d.mac,
+      serial: d.serial,
+      userid: d.userid,
+      last_ip: d.last_ip,
+      last_connection: d.last_connection,
+      created: d.created,
+    }));
+    console.log(`[wizard/iptv/devices] OK ip=${ip} total=${result.total} macs=[${devices.map(d => d.mac).join(', ')}]`);
+    return res.json({ ok: true, total: result.total, devices });
+  } catch (e: any) {
+    console.error(`[wizard/iptv/devices] Error ip=${ip}:`, e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
+// POST /wizard/iptv/link  body: { id_servicio, ip_address, overwrite? }
+export async function linkIptvDevices(req: any, res: any) {
+  const session = req.session || {};
+  if (!session.userId) return res.status(401).json({ error: 'unauthenticated' });
+
+  const id_servicio: string = String(req.body?.id_servicio || '').trim();
+  const ip_address: string = String(req.body?.ip_address || '').trim();
+
+  console.log(`[wizard/iptv/link] POST id_servicio=${id_servicio} ip=${ip_address} userId=${session.userId}`);
+  if (!id_servicio) return res.status(400).json({ ok: false, error: 'id_servicio requerido' });
+  if (!ip_address) return res.status(400).json({ ok: false, error: 'ip_address requerido' });
+
+  try {
+    // 1. Obtener datos completos del cliente desde WispHub
+    const whClient = await getClientByServiceId(id_servicio);
+    if (!whClient) {
+      console.warn(`[wizard/iptv/link] Cliente id_servicio=${id_servicio} no encontrado en WispHub`);
+      return res.status(404).json({ ok: false, error: 'Cliente no encontrado en WispHub' });
+    }
+
+    const usuario_rb: string = String(whClient.usuario_rb || whClient.usuario || id_servicio).trim();
+    const full_name: string = [whClient.nombre, whClient.apellidos].filter(Boolean).join(' ').trim() || usuario_rb;
+    const phone: string = String(whClient.telefono || '').trim();
+    const address: string = String(whClient.direccion || '').trim();
+    const ips: string[] = ip_address ? [ip_address] : [];
+
+    // Parsear coordenadas "lat,lng"
+    let lat = 0;
+    let lng = 0;
+    const coords = String(whClient.coordenadas || '').trim();
+    if (coords) {
+      const parts = coords.split(',').map((s: string) => parseFloat(s.trim()));
+      if (parts.length >= 2 && !isNaN(parts[0]) && !isNaN(parts[1])) {
+        lat = parts[0];
+        lng = parts[1];
+      }
+    }
+
+    console.log(`[wizard/iptv/link] WispHub → usuario_rb=${usuario_rb} nombre="${full_name}" coords=${lat},${lng}`);
+
+    // 2. Crear/actualizar usuario en AppTV
+    const apptv = new ApptvClient();
+    const createResult = await apptv.createUser(usuario_rb, full_name, phone, address, lat, lng, ips);
+    if (createResult) {
+      console.log(`[wizard/iptv/link] createUser OK user_id=${createResult.user_id}`);
+    } else {
+      console.warn(`[wizard/iptv/link] createUser falló o usuario ya existe, continuando con linkDevices`);
+    }
+
+    // 3. Vincular dispositivos por IP al usuario
+    const linkResult = await apptv.linkDevices(usuario_rb, ip_address, true);
+    if (!linkResult) {
+      console.warn(`[wizard/iptv/link] linkDevices sin resultado para usuario_rb=${usuario_rb} ip=${ip_address}`);
+      return res.status(400).json({ ok: false, error: 'No se pudo vincular los dispositivos' });
+    }
+    console.log(`[wizard/iptv/link] linkDevices OK linked=${linkResult.linked} skiped=${linkResult.skiped}`);
+    return res.json({ ok: true, usuario_rb, ...linkResult });
+  } catch (e: any) {
+    console.error(`[wizard/iptv/link] Error:`, e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
+// POST /wizard/iptv/unlink  body: { macs: string[], id_servicio?: string }
+export async function unlinkIptvDevices(req: any, res: any) {
+  const session = req.session || {};
+  if (!session.userId) return res.status(401).json({ error: 'unauthenticated' });
+
+  const macs: string[] = Array.isArray(req.body?.macs) ? req.body.macs : [];
+  const id_servicio: string = String(req.body?.id_servicio || '').trim();
+  console.log(`[wizard/iptv/unlink] POST macs=[${macs.join(', ')}] id_servicio=${id_servicio || '—'} userId=${session.userId}`);
+  if (!macs.length) return res.status(400).json({ ok: false, error: 'macs requerido' });
+
+  try {
+    // 1. Desvincular dispositivos en AppTV
+    const apptv = new ApptvClient();
+    const aptvResults = await Promise.all(
+      macs.map(async (mac) => {
+        const r = await apptv.deleteDeviceByMac(mac);
+        return { mac, ok: !!r, was_linked_to: r?.was_linked_to ?? null };
+      })
+    );
+    const aptvOk = aptvResults.every(r => r.ok);
+    const aptvOkCount = aptvResults.filter(r => r.ok).length;
+    console.log(`[wizard/iptv/unlink] AppTV ${aptvOkCount}/${aptvResults.length} desvinculados | ${JSON.stringify(aptvResults)}`);
+
+    // 2. Eliminar productos TV (decos) en Geonet admin si se proporcionó id_servicio
+    let geonetResult: { ok: boolean; deleted: { uuid: string; nombre: string; ok: boolean; error?: string }[] } | null = null;
+    if (id_servicio) {
+      const repo = AppDataSource.getRepository(require('../models/Client').Client);
+      const clientEntity = await repo.findOne({ where: { id_servicio: Number(id_servicio) } });
+      const usuario_rb = clientEntity?.usuario_rb || clientEntity?.usuario || null;
+      if (usuario_rb) {
+        console.log(`[wizard/iptv/unlink] Eliminando decos Geonet para usuario_rb=${usuario_rb}`);
+        geonetResult = await deleteGeonetTvProducts(usuario_rb, macs.length);
+        console.log(`[wizard/iptv/unlink] Geonet decos → ok=${geonetResult.ok} deleted=${JSON.stringify(geonetResult.deleted)}`);
+        const equiposResult = await liberarGeonetTvEquipos(usuario_rb, macs.length);
+        console.log(`[wizard/iptv/unlink] Geonet equipos → ok=${equiposResult.ok} liberated=${JSON.stringify(equiposResult.liberated)}`);
+      } else {
+        console.warn(`[wizard/iptv/unlink] Sin usuario_rb para id_servicio=${id_servicio}, se omite Geonet`);
+      }
+    }
+
+    return res.json({ ok: aptvOk, results: aptvResults, geonet: geonetResult });
+  } catch (e: any) {
+    console.error(`[wizard/iptv/unlink] Error:`, e);
     return res.status(500).json({ ok: false, error: e.message });
   }
 }

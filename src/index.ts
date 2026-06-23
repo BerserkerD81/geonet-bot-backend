@@ -19,6 +19,7 @@ import installationsRoutes from './routes/installations';
 import smartoltRoutes from './routes/smartolt';
 import odbRoutes from './routes/odb';
 import wizardRoutes from './routes/wizard';
+import testRoutes from './routes/test';
 
 // Servicios y Scripts
 import { ensureDefaultAdmin } from './services/adminBootstrap';
@@ -124,6 +125,12 @@ app.use('/installations', installationsRoutes);
 app.use('/wizard', wizardRoutes);
 
 app.get('/health', (req, res) => res.json({ ok: true }));
+
+// Rutas de prueba — habilitadas fuera de producción o con ENABLE_TEST_ROUTES=true
+if (process.env.NODE_ENV !== 'production' || process.env.ENABLE_TEST_ROUTES === 'true') {
+  app.use('/test', testRoutes);
+  console.log('🧪 Rutas de prueba habilitadas en /test');
+}
 
 const port = Number(process.env.PORT) || 3000;
 

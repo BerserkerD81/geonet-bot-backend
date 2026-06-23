@@ -1051,75 +1051,69 @@ export async function listAllUnconfiguredOnus(): Promise<any[]> {
  * Replica el comportamiento de curl + grep buscando el patrón "status_onu_{id}".
  * @param sn - El número de serie de la ONU (ej. HWTC4411D498)
  */
-export async function getInternalOnuIdBySn(sn: string): Promise<number | string | null> {
+export async function getOnuIdAndIpBySn(sn: string): Promise<{ id: string | null; ip: string | null }> {
   if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
 
-  // Endpoint interno usado en el panel web
   const endpoint = `${baseUrl}/onu/get_configured_list`;
 
-  // Función auxiliar para realizar la petición (mismo manejo de cookies que antes)
   const performRequest = async (forceCookie: boolean) => {
     const cookie = await getSmartoltSessionCookie(forceCookie);
     if (!cookie) throw new Error('No se pudo obtener la cookie de sesión de SmartOLT');
 
     return enqueueRequest(smartoltAxios, () => smartoltAxios.get(endpoint, {
-      params: {
-        free_text: sn // Parámetro de búsqueda
-      },
+      params: { free_text: sn },
       headers: {
         'Cookie': cookie,
-        'X-Requested-With': 'XMLHttpRequest', // Requerido para que el backend responda correctamente
+        'X-Requested-With': 'XMLHttpRequest',
         'X-Token': SMARTOLT.apiKey || '',
-        'Accept': 'application/json, text/plain, */*' // Aceptamos cualquier formato para poder hacer regex
+        'Accept': 'application/json, text/plain, */*',
       },
       timeout: 15000,
-      // Importante: No forzar JSON parse si la respuesta es HTML mezclado
-      transformResponse: [(data) => data] 
+      transformResponse: [(data) => data],
     }));
   };
 
-  // Lógica de extracción (El equivalente a tu grep -oP "status_onu_\K\d+")
-  const extractId = (data: any): string | null => {
-    // Aseguramos que data sea string (axios puede haberlo parseado parcialmente si era JSON)
+  const parse = (data: any): { id: string | null; ip: string | null } => {
     const stringData = typeof data === 'object' ? JSON.stringify(data) : String(data);
-    
-    // Buscamos el patrón status_onu_ seguido de dígitos
-    const match = stringData.match(/status_onu_(\d+)/);
-    
-    if (match && match[1]) {
-      return match[1]; // Retorna el grupo de captura (los dígitos)
-    }
-    return null;
+
+    const idMatch = stringData.match(/status_onu_(\d+)/);
+    const id = idMatch?.[1] || null;
+
+    let ip: string | null = null;
+    try {
+      const parsed = JSON.parse(stringData);
+      const list: any[] = Array.isArray(parsed) ? parsed
+        : Array.isArray(parsed?.data) ? parsed.data
+        : Array.isArray(parsed?.response) ? parsed.response
+        : [];
+      const snUpper = sn.toUpperCase();
+      const onu = list.find((o: any) =>
+        String(o.sn || o.serial || o.onu_sn || '').toUpperCase() === snUpper
+      );
+      if (onu) ip = onu.ip || onu.wan_ip || onu.ipAddress || onu.external_ip || null;
+    } catch { /* HTML response — no JSON to parse */ }
+
+    return { id, ip };
   };
 
   try {
-    // Intento 1: Con cookie actual
     const res = await performRequest(false);
-    const id = extractId(res.data);
-    
-    if (id) return id;
-
-    // Si no encontramos ID, podría ser que la cookie expiró y la respuesta fue una redirección al login
-    // o simplemente no hubo resultados. Intentamos regenerar cookie por si acaso.
-    // (Opcional: revisar si res.data incluye "login" o status 403 explícito)
-    
-    return null; 
-
+    const result = parse(res.data);
+    if (result.id) return result;
+    return result;
   } catch (err: any) {
     const status = err?.response?.status;
-    
-    // Si falla por Auth (403/401), regeneramos cookie y reintentamos una vez
     if (status === 403 || status === 401) {
-      try {
-        const retryRes = await performRequest(true);
-        return extractId(retryRes.data);
-      } catch (retryErr) {
-        throw retryErr;
-      }
+      const retryRes = await performRequest(true);
+      return parse(retryRes.data);
     }
-    
     throw err;
   }
+}
+
+export async function getInternalOnuIdBySn(sn: string): Promise<number | string | null> {
+  const { id } = await getOnuIdAndIpBySn(sn);
+  return id;
 }
 
 function unwrapSmartoltResponse(data: any): any {
@@ -1222,6 +1216,149 @@ export async function rebootOnuByExternalId(onuExternalId: string | number): Pro
   return unwrapSmartoltResponse(res.data);
 }
 
+function isLoginPage(html: string): boolean {
+  return typeof html === 'string' && (html.includes('/auth/login') || html.includes('id="login"'));
+}
+
+function extractCsrfToken(html: string): { name: string; value: string } | null {
+  // CodeIgniter CSRF: <input type="hidden" name="csrf_XXXX" value="YYYY" />
+  const m = html.match(/name=["'](csrf_[^"']+)["'][^>]*value=["']([^"']+)["']/);
+  if (m) return { name: m[1], value: m[2] };
+  const m2 = html.match(/value=["']([^"']+)["'][^>]*name=["'](csrf_[^"']+)["']/);
+  if (m2) return { name: m2[2], value: m2[1] };
+  return null;
+}
+
+/**
+ * Aplica un perfil TR069 a una ONU via scraping del panel web de SmartOLT.
+ * Flujo: GET /onu/update_mgmt_ip/{onuId} → extrae CSRF → POST con tr069_profile_id.
+ */
+export async function updateOnuMgmtIp(
+  onuId: string | number,
+  opts: { tr069_profile_id: number | string; mgmt_ip_mode?: string; voip_mode?: string }
+): Promise<any> {
+  if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
+  const { tr069_profile_id, mgmt_ip_mode = 'Inactive', voip_mode = 'Disabled' } = opts;
+  const path = `/onu/update_mgmt_ip/${encodeURIComponent(String(onuId))}`;
+
+  const doWithCookie = async (force?: boolean): Promise<any | null> => {
+    const cookie = await getSmartoltSessionCookie(force);
+    if (!cookie) return null;
+
+    const getRes = await enqueueRequest(smartoltAxios, () => smartoltAxios.get(`${baseUrl}${path}`, {
+      headers: { Cookie: cookie, Accept: 'text/html', 'X-Token': SMARTOLT.apiKey || '' },
+      timeout: 15000,
+      transformResponse: [(data) => data],
+    }));
+    const html = typeof getRes.data === 'string' ? getRes.data : String(getRes.data);
+    if (isLoginPage(html)) return null;
+
+    const csrf = extractCsrfToken(html);
+    const body = new URLSearchParams();
+    body.set('tr069_profile_id', String(tr069_profile_id));
+    body.set('mgmt_ip_mode', mgmt_ip_mode);
+    body.set('voip_mode', voip_mode);
+    if (csrf) body.set(csrf.name, csrf.value);
+
+    const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(`${baseUrl}${path}`, body.toString(), {
+      headers: {
+        Cookie: cookie,
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-Token': SMARTOLT.apiKey || '',
+      },
+      timeout: 20000,
+    }));
+    const resData = res.data;
+    if (typeof resData === 'string' && isLoginPage(resData)) return null;
+    return resData;
+  };
+
+  const result = await doWithCookie(false);
+  return result !== null ? result : doWithCookie(true);
+}
+
+/**
+ * Activa o desactiva el WiFi de una ONU en SmartOLT via scraping.
+ * Disable: POST /onu/save_wifi_status/{id} sin body.
+ * Enable:  POST /onu/save_wifi_status/{id} con body "1".
+ */
+export async function saveWifiStatus(onuId: string | number, enable: boolean = false): Promise<any> {
+  if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
+  const path = `/onu/save_wifi_status/${encodeURIComponent(String(onuId))}`;
+
+  const doWithCookie = async (force?: boolean): Promise<any | null> => {
+    const cookie = await getSmartoltSessionCookie(force);
+    if (!cookie) return null;
+
+    const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.post(
+      `${baseUrl}${path}`,
+      enable ? '1' : undefined,
+      {
+        headers: {
+          Cookie: cookie,
+          'X-Requested-With': 'XMLHttpRequest',
+          'X-Token': SMARTOLT.apiKey || '',
+          ...(enable ? { 'Content-Type': 'text/plain' } : {}),
+        },
+        timeout: 15000,
+      }
+    ));
+
+    const resData = res.data;
+    if (typeof resData === 'string' && isLoginPage(resData)) return null;
+    return resData;
+  };
+
+  const result = await doWithCookie(false);
+  return result !== null ? result : doWithCookie(true);
+}
+
+/**
+ * Finaliza una autorización incompleta vía scraping del panel web.
+ * GET /onu_authorization/continue_authorize?board=X&port=X&sn=X&olt=X
+ */
+export async function continueAuthorize(
+  board: string | number,
+  port: string | number,
+  sn: string,
+  oltId: string | number,
+): Promise<any> {
+  if (!baseUrl) throw new Error('SMARTOLT_BASE_URL not configured');
+
+  const params = new URLSearchParams({
+    board: String(board),
+    port: String(port),
+    sn: String(sn).toUpperCase(),
+    olt: String(oltId),
+  });
+  const endpoint = `${baseUrl}/onu_authorization/continue_authorize?${params.toString()}`;
+
+  const doWithCookie = async (force?: boolean): Promise<any> => {
+    const cookie = await getSmartoltSessionCookie(force);
+    if (!cookie) throw new Error('No se pudo obtener cookie de sesión para continue_authorize');
+
+    const res = await enqueueRequest(smartoltAxios, () => smartoltAxios.get(endpoint, {
+      headers: {
+        Cookie: cookie,
+        'X-Requested-With': 'XMLHttpRequest',
+        'X-Token': SMARTOLT.apiKey || '',
+        'Accept': 'application/json, text/plain, */*',
+      },
+      timeout: 20000,
+      transformResponse: [(data) => data],
+    }));
+
+    const raw = typeof res.data === 'string' ? res.data : JSON.stringify(res.data);
+    if (isLoginPage(raw)) return null;
+    try { return JSON.parse(raw); } catch { return raw; }
+  };
+
+  const result = await doWithCookie(false);
+  if (result === null) return doWithCookie(true);
+  return result;
+}
+
 export default {
   authorizeOnu,
   getOnuBySerial,
@@ -1246,6 +1383,7 @@ export default {
   getAvailablePortsForOdb,
   listAllUnconfiguredOnus,
   updateOnuWifi,
+  getOnuIdAndIpBySn,
   getInternalOnuIdBySn,
   getOnuFullStatusInfoByExternalId,
   getOnuDetailsByExternalId,
@@ -1254,5 +1392,8 @@ export default {
   getOnuSignalGraphByExternalId,
   getOnuTrafficGraphByExternalId,
   resyncOnuConfigByExternalId,
+  updateOnuMgmtIp,
+  saveWifiStatus,
+  continueAuthorize,
   rebootOnuByExternalId
 };

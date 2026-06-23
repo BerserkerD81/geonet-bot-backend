@@ -44,3 +44,10 @@ export const SMARTOLT = {
   baseUrl: process.env.SMARTOLT_BASE_URL || '',
   apiKey: process.env.SMARTOLT_API_KEY || ''
 };
+
+export const GENIEACS = {
+  url: process.env.GENIEACS_URL || 'http://100.113.62.3:7557',
+  wifi2gBase: process.env.GENIEACS_WIFI_2G_BASE || 'InternetGatewayDevice.LANDevice.1.WLANConfiguration.1',
+  wifi5gBase: process.env.GENIEACS_WIFI_5G_BASE || 'InternetGatewayDevice.LANDevice.1.WLANConfiguration.5',
+  wifiPassParam: process.env.GENIEACS_WIFI_PASS_PARAM || 'PreSharedKey.1.KeyPassphrase',
+};

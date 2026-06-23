@@ -49,7 +49,9 @@ import {
   getOnuTrafficGraphByExternalId,
   type SmartoltGraphType,
   resyncOnuConfigByExternalId,
-  rebootOnuByExternalId
+  rebootOnuByExternalId,
+  continueAuthorize,
+  updateOnuMgmtIp,
 } from '../services/smartoltClient';
 import { IsNull } from 'typeorm';
 
@@ -1195,9 +1197,10 @@ async function buildOltAndNetworkSection(serviceIdOrTerm?: number | string, opts
         const id = pickFirstString([o.sn, o.serial, o.onu_sn]) || `ONU${idx}`;
         const pon = (o.pon_type || 'gpon').toLowerCase();
         const port = pickFirstString([o.port, o.port_id, o.slot]) || '-';
+        const board = pickFirstString([o.board != null ? String(o.board) : undefined]) || '';
         const model = o.onu_type_name || o.onu_type || o.model || '-';
         const payload = `seleccionar onu ${id} olt ${olt.id} pon ${pon} port ${port}${model !== '-' ? ` model ${model}` : ''}`;
-        entry.onus.push({ id, label: id, ponType: pon, port, model, actionPayload: payload });
+        entry.onus.push({ id, label: id, ponType: pon, port, board, model, actionPayload: payload });
         onuActions.push({ id: `select-onu-${olt.id}-${idx}`, type: 'button', label: id, payload });
       });
       oltAvailability.push(entry);
@@ -3277,9 +3280,10 @@ export async function respond(req: any, res: any) {
                 const id = (o.sn || o.serial || o.onu_sn || `ONU${idx}`).toString();
                 const pon = (o.pon_type || o.pon || 'gpon').toLowerCase();
                 const port = o.port || o.port_id || o.slot || '-';
+                const board = o.board != null ? String(o.board) : '';
                 const model = o.onu_type_name || o.onu_type || o.model || '-';
                 const payload = `seleccionar onu ${id} olt ${oltId} pon ${pon} port ${port}${model !== '-' ? ` model ${model}` : ''}`;
-                entry.onus.push({ id, label: id, ponType: pon, port, model, actionPayload: payload });
+                entry.onus.push({ id, label: id, ponType: pon, port, board, model, actionPayload: payload });
                 onuActions.push({ id: `select-onu-${oltId}-${idx}`, type: 'button', label: id, payload });
               });
               if (entry.onus.length) oltAvailability.push(entry);
@@ -4408,6 +4412,20 @@ async function processPostAuthActions(data: any, targetId?: string | number) {
     } catch (err) { console.error('⚠️ Error consultando tabla Installation:', err); }
   }
 
+  // Activar TR069 perfil 3 antes de agregar el artículo al cliente
+  try {
+    const tr069InternalId = await getInternalOnuIdBySn(String(onuId).toUpperCase());
+    if (tr069InternalId) {
+      await updateOnuMgmtIp(tr069InternalId, { tr069_profile_id: 3 });
+      console.log(`[processPostAuthActions] TR069 perfil 3 activado para ONU ${onuId} (id=${tr069InternalId})`);
+      messages.push('✅ TR069 perfil 3 activado.');
+    } else {
+      console.warn(`[processPostAuthActions] No se encontró ID interno para TR069 de ONU ${onuId}`);
+    }
+  } catch (tr069Err: any) {
+    console.warn(`[processPostAuthActions] TR069 activación falló: ${tr069Err?.message}`);
+  }
+
   if (!skipGeonetRegistration) {
     const registered = await registrarOnuGeonet(data.onu_type, onuId);
     if (registered) messages.push(`✅ Registro ONU en Geonet (${onuId}) exitoso.`);
@@ -4734,8 +4752,8 @@ export async function submitAuth(req: any, res: any) {
           const errData = apiError.response?.data || {};
           const isDuplicate = errData.error_code === 'onu_external_id_not_unique' ||
             (typeof errData.error === 'string' && errData.error.includes('unique'));
-          if (apiError.response?.status === 400 && isDuplicate) {
-            console.log(`⚠️ ONU ${explicitSn} ya existe en SmartOLT. Ignorando error 400.`);
+          if (isDuplicate) {
+            console.log(`⚠️ ONU ${explicitSn} ya existe en SmartOLT (status ${apiError.response?.status ?? 'N/A'}). Ignorando error duplicado.`);
             result = { status: true, response_code: 'success' };
           } else {
             throw apiError;
@@ -4758,8 +4776,8 @@ export async function submitAuth(req: any, res: any) {
         const isDuplicate = errData.error_code === 'onu_external_id_not_unique' ||
           (typeof errData.error === 'string' && errData.error.includes('unique'));
 
-        if (apiError.response?.status === 400 && isDuplicate) {
-          console.log(`⚠️ ONU ${explicitSn} ya existe en SmartOLT (registrada por Puppeteer). Ignorando error 400 y continuando.`);
+        if (isDuplicate) {
+          console.log(`⚠️ ONU ${explicitSn} ya existe en SmartOLT (registrada por Puppeteer, status ${apiError.response?.status ?? 'N/A'}). Ignorando error duplicado y continuando.`);
           result = { status: true, response_code: 'success' };
         } else {
           throw apiError;
@@ -4771,7 +4789,43 @@ export async function submitAuth(req: any, res: any) {
     const success = result && (result.status === true || String(result.response_code) === 'success');
     if (!success) throw new Error(result?.error || result?.message || 'SmartOLT rechazó la solicitud.');
 
-    const postResult = await processPostAuthActions({
+    // Verificar que la ONU quedó configurada en SmartOLT.
+    // Si no aparece, completar vía scraping y luego activar TR069 perfil 3 automáticamente.
+    try {
+      let configuredId = await getInternalOnuIdBySn(String(explicitSn).toUpperCase());
+      if (!configuredId) {
+        console.log(`[submitAuth] ONU ${explicitSn} no encontrada en configuradas → llamando continue_authorize`);
+        const board = authPayload.board || merged.board || '';
+        const port  = authPayload.port  || merged.port  || '';
+        const oltId = authPayload.olt_id || merged.olt_id || '';
+        if (board && port && oltId) {
+          await continueAuthorize(board, port, String(explicitSn).toUpperCase(), oltId);
+          console.log(`[submitAuth] continue_authorize ejecutado, esperando registro en SmartOLT...`);
+          await new Promise(r => setTimeout(r, 2500));
+          configuredId = await getInternalOnuIdBySn(String(explicitSn).toUpperCase());
+        } else {
+          console.warn(`[submitAuth] Faltan datos para continue_authorize: board=${board} port=${port} olt=${oltId}`);
+        }
+      }
+
+      if (configuredId) {
+        console.log(`[submitAuth] ONU ${explicitSn} confirmada en SmartOLT (id=${configuredId}) → activando TR069 perfil 3`);
+        try {
+          await updateOnuMgmtIp(configuredId, { tr069_profile_id: 3 });
+          console.log(`[submitAuth] TR069 perfil 3 activado para ONU ${explicitSn}`);
+        } catch (tr069Err: any) {
+          console.warn(`[submitAuth] TR069 activación falló: ${tr069Err?.message}`);
+        }
+      } else {
+        console.warn(`[submitAuth] ONU ${explicitSn} sigue sin aparecer en SmartOLT tras continue_authorize`);
+      }
+    } catch (verifyErr: any) {
+      console.warn(`[submitAuth] No se pudo verificar/completar autorización: ${verifyErr?.message}`);
+    }
+
+    // Lanzar processPostAuthActions en background para no bloquear la respuesta HTTP.
+    // registrarOnuGeonet y agregarArticuloACliente usan Puppeteer y pueden tardar 2+ minutos.
+    const bgPayload = {
       ...merged,
       onu_external_id: explicitSn,
       vlan: cleanVlan,
@@ -4779,9 +4833,61 @@ export async function submitAuth(req: any, res: any) {
       odb_port: cleanOdbPort,
       onu_type: merged.onu_type,
       is_pyme: state.isPyme || state.defaults?.is_pyme,
-      _session: session,
-      _fixResultNewIp: fixResult?.newIp ?? undefined  // ✅ usa fixResult, no result
-    }, targetId);
+      _session: { ...session },
+      _fixResultNewIp: fixResult?.newIp ?? undefined
+    };
+    const bgUserId = Number(userId);
+    const bgSessionId = sessionId ? Number(sessionId) : undefined;
+    processPostAuthActions(bgPayload, targetId).then(async (bgResult) => {
+      const hasArticleError = bgResult.message.includes('Falló asignación') || bgResult.message.includes('Fallback también falló') || bgResult.message.includes('Error al intentar asignar ONU');
+      const bgMessage = hasArticleError
+        ? bgResult.message + '\n\n⚠️ No se pudo asociar la ONU al cliente en Geonet. Por favor contacte a soporte si el equipo no aparece asignado.'
+        : bgResult.message;
+      await msgRepo.save(msgRepo.create({
+        userId: bgUserId,
+        sessionId: bgSessionId,
+        role: 'assistant',
+        content: bgMessage,
+        actions: bgResult.actions
+      })).catch((e: any) => console.error('[submitAuth] Error guardando resultado background:', e?.message));
+    }).catch((e: any) => {
+      console.error('[submitAuth] processPostAuthActions background error:', e?.message);
+    });
+
+    // Construir respuesta inmediata con acciones según tipo de ONU / plan
+    const rawOnuType = String(merged.onu_type || '').toUpperCase().replace(/[- ]/g, '');
+    const wifiModelsList = ['ZTEF6600P', 'ZXHNF600P'];
+    const isWifiOnu = wifiModelsList.includes(rawOnuType);
+    const isPymeNow = !!(state.isPyme || state.defaults?.is_pyme);
+
+    let immediateMessage = '✅ ONU Autorizada. TR069 y WAN configurándose. Registro en Geonet en proceso...';
+    let immediateActions: any[] = [];
+
+    if (isWifiOnu) {
+      const skipPayload = targetId
+        ? (isPymeNow ? `wisphub activate ${targetId}` : `generar contrato activar ${targetId}`)
+        : undefined;
+      const skipLabel = isPymeNow ? 'Saltar configuración WiFi y Activar Instalación' : 'Saltar configuración WiFi y Generar Contrato';
+      immediateActions = [
+        { id: 'wifi_ssid', type: 'input', label: 'Nombre WiFi (SSID)', placeholder: 'Nuevo Nombre', payload: 'wifi set ssid {input}' },
+        { id: 'wifi_pass', type: 'input', label: 'Contraseña WiFi', placeholder: 'Nueva Clave (min 8)', payload: 'wifi set pass {input}' },
+        { id: 'wifi_submit', type: 'button', label: 'Aplicar Cambios WiFi', payload: `wifi apply sn ${explicitSn} ssid {wifi_ssid} pass {wifi_pass}` },
+        skipPayload
+          ? { id: 'wifi_skip_generate', type: 'button', label: skipLabel, payload: skipPayload }
+          : { id: 'wifi_skip_generate_disabled', type: 'button', label: skipLabel, disabled: true, helperText: 'No se detectó ID de cliente/instalación' },
+      ];
+      immediateMessage += '\n\n👇 Configura el WiFi o salta al siguiente paso:';
+    } else if (targetId) {
+      if (isPymeNow) {
+        immediateActions = [{ id: 'btn-activar-wisphub', type: 'button', label: '🚀 Activar en WispHub', payload: `wisphub activate ${targetId}` }];
+        immediateMessage += '\n\n👇 **Proceso finalizado (PYME).** Selecciona una acción:';
+      } else {
+        immediateActions = [{ id: 'btn-contrato', type: 'button', label: '📄 Generar Contrato y Activar en WispHub', payload: `generar contrato activar ${targetId}` }];
+        immediateMessage += '\n\n👇 **Proceso finalizado.** Selecciona una acción:';
+      }
+    } else {
+      immediateMessage += '\n(⚠️ No se detectó ID asociado para generar contrato)';
+    }
 
     cacheDelete('listOlts');
     if (merged.olt_id) cacheDelete(`onus:${merged.olt_id}`);
@@ -4791,13 +4897,13 @@ export async function submitAuth(req: any, res: any) {
       userId: Number(userId),
       sessionId: sessionId ? Number(sessionId) : undefined,
       role: 'assistant',
-      content: postResult.message,
-      actions: postResult.actions
+      content: immediateMessage,
+      actions: immediateActions
     }));
 
     if (sessionId) await saveChatContext(session, Number(sessionId));
 
-    return res.json({ ok: true, message: postResult.message, actions: postResult.actions });
+    return res.json({ ok: true, message: immediateMessage, actions: immediateActions });
   } catch (e: any) {
     console.error('❌ Error en submitAuth:', e);
     const errorMsg = e.response?.data?.error || e.message;

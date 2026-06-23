@@ -183,6 +183,39 @@ export async function listWizardSessions(req: any, res: any) {
   }
 }
 
+// GET /wizard/sessions/search — search with text query (own for users, all for admins)
+export async function searchWizardSessions(req: any, res: any) {
+  try {
+    const userId = Number(req.session?.userId);
+    const isAdmin = await resolveIsAdmin(req);
+    const { q = '', limit = 40, type, status } = req.query as any;
+
+    const repo = AppDataSource.getRepository(WizardSession);
+    let qb = repo.createQueryBuilder('s')
+      .select(['s.id', 's.userId', 's.userName', 's.type', 's.status', 's.clientId', 's.clientName', 's.summary', 's.errorMsg', 's.startedAt', 's.updatedAt', 's.completedAt'])
+      .orderBy('s.startedAt', 'DESC')
+      .take(Math.min(Number(limit) || 40, 100));
+
+    if (!isAdmin) qb = qb.andWhere('s.userId = :userId', { userId });
+    if (type) qb = qb.andWhere('s.type = :type', { type });
+    if (status) qb = qb.andWhere('s.status = :status', { status });
+
+    if (q && q.trim()) {
+      const searchTerm = `%${q.trim()}%`;
+      qb = qb.andWhere(
+        `(s.userName LIKE :term OR s.clientName LIKE :term OR s.summary LIKE :term OR s.type LIKE :term OR s.errorMsg LIKE :term)`,
+        { term: searchTerm }
+      );
+    }
+
+    const sessions = await qb.getMany();
+    return res.json({ ok: true, sessions, isAdmin });
+  } catch (e: any) {
+    console.error('[wizardSession] search error:', e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
 // GET /wizard/sessions/:id — detail (own or admin)
 export async function getWizardSession(req: any, res: any) {
   try {
